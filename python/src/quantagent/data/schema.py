@@ -1,0 +1,256 @@
+"""Bitemporal schemas for the normalized store (ADR 0005, ADR 0006).
+
+Every stored row carries three timestamps, all int64 nanoseconds since the
+Unix epoch, UTC:
+
+- ``event_ts``: when the venue says it happened.
+- ``recv_ts``: when our process received it.
+- ``knowledge_ts``: when the row became available in the store. Assigned by
+  the store's writer; callers never supply it.
+
+Prices and quantities are int64 mantissas at the instrument's ``price_exp``
+and ``qty_exp`` (see ``fixedpoint``). There are no floating-point columns.
+
+Venue, instrument and date are not columns. They are the store's partition
+directories, so a row's identity is (venue, instrument) plus the dataset's
+``key`` columns. A correction is a new row with the same key and a later
+``knowledge_ts``.
+"""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Any
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from quantagent.data.fixedpoint import MAX_EXP
+
+KNOWLEDGE_TS = "knowledge_ts"
+
+
+class SchemaError(ValueError):
+    """Rows do not match a dataset's schema."""
+
+
+class Side(IntEnum):
+    """Bid/ask for book levels; aggressor side for trades."""
+
+    SELL = -1
+    UNKNOWN = 0  # trades only, when the venue does not report the aggressor
+    BUY = 1
+
+
+class BookEventKind(IntEnum):
+    SNAPSHOT = 0  # one level of a full book image
+    DELTA = 1  # one level of an incremental update; qty 0 removes the level
+
+
+@dataclass(frozen=True, eq=False)
+class Dataset:
+    """A table in the normalized store.
+
+    ``schema`` is what callers supply. ``stored_schema`` adds ``knowledge_ts``.
+    ``allowed`` and ``bounds`` are structural rules (enum membership, inclusive
+    ranges). They are not data quality checks: implausible market values are
+    stored as received and flagged later by the quality checks.
+    """
+
+    name: str
+    version: int
+    schema: pa.Schema
+    key: tuple[str, ...]
+    allowed: Mapping[str, frozenset[int]] = field(default_factory=dict)
+    bounds: Mapping[str, tuple[int | None, int | None]] = field(default_factory=dict)
+
+    @property
+    def stored_schema(self) -> pa.Schema:
+        fields = list(self.schema)
+        position = self.schema.get_field_index("recv_ts") + 1
+        fields.insert(position, pa.field(KNOWLEDGE_TS, pa.int64(), nullable=False))
+        metadata = {"qa.dataset": self.name, "qa.schema_version": str(self.version)}
+        return pa.schema(fields, metadata=metadata)
+
+
+def _required(name: str, type_: pa.DataType) -> pa.Field:
+    return pa.field(name, type_, nullable=False)
+
+
+# Common leading columns. ``seq`` is the local sequence number assigned at
+# receipt; (recv_ts, seq) is the total order used for replay.
+_HEADER = [
+    _required("event_ts", pa.int64()),
+    _required("recv_ts", pa.int64()),
+    _required("seq", pa.uint64()),
+]
+_TIMESTAMP_BOUNDS = {"event_ts": (0, None), "recv_ts": (0, None)}
+
+TRADES = Dataset(
+    name="trades",
+    version=1,
+    schema=pa.schema(
+        [
+            *_HEADER,
+            _required("trade_id", pa.string()),  # the venue's trade identifier
+            _required("price", pa.int64()),
+            _required("qty", pa.int64()),
+            _required("side", pa.int8()),  # aggressor, a Side value
+        ]
+    ),
+    key=("trade_id",),
+    allowed={"side": frozenset(int(s) for s in Side)},
+    bounds=_TIMESTAMP_BOUNDS,
+)
+
+# One row per price level. A venue message with many levels becomes many rows
+# that share seq and the venue sequence columns.
+BOOK_EVENTS = Dataset(
+    name="book_events",
+    version=1,
+    schema=pa.schema(
+        [
+            *_HEADER,
+            _required("kind", pa.int8()),  # a BookEventKind value
+            # The venue's own sequence range for the message this level came
+            # from. Venues with a single sequence number leave "first" null.
+            pa.field("venue_seq_first", pa.int64(), nullable=True),
+            _required("venue_seq_last", pa.int64()),
+            _required("side", pa.int8()),  # Side.BUY (bid) or Side.SELL (ask)
+            _required("price", pa.int64()),
+            _required("qty", pa.int64()),
+        ]
+    ),
+    key=("kind", "venue_seq_last", "side", "price"),
+    allowed={
+        "kind": frozenset(int(k) for k in BookEventKind),
+        "side": frozenset({int(Side.BUY), int(Side.SELL)}),
+    },
+    bounds=_TIMESTAMP_BOUNDS,
+)
+
+# One row per version of an instrument's metadata. ``event_ts`` is when the
+# version takes effect, so it identifies the version.
+INSTRUMENTS = Dataset(
+    name="instruments",
+    version=1,
+    schema=pa.schema(
+        [
+            *_HEADER,
+            _required("price_exp", pa.int8()),
+            _required("qty_exp", pa.int8()),
+            _required("tick_size", pa.int64()),  # mantissa at price_exp
+            _required("lot_size", pa.int64()),  # mantissa at qty_exp
+        ]
+    ),
+    key=("event_ts",),
+    bounds={
+        **_TIMESTAMP_BOUNDS,
+        "price_exp": (0, MAX_EXP),
+        "qty_exp": (0, MAX_EXP),
+        "tick_size": (1, None),
+        "lot_size": (1, None),
+    },
+)
+
+DATASETS: Mapping[str, Dataset] = {d.name: d for d in (TRADES, BOOK_EVENTS, INSTRUMENTS)}
+
+
+def _integer_range(type_: pa.DataType) -> tuple[int, int]:
+    bits = type_.bit_width
+    if pa.types.is_unsigned_integer(type_):
+        return 0, 2**bits - 1
+    return -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+
+
+def _check_value(dataset: Dataset, column: pa.Field, value: Any, row: int) -> Any:
+    where = f"{dataset.name}.{column.name} (row {row})"
+    if value is None:
+        if not column.nullable:
+            raise SchemaError(f"{where}: null in a required column")
+        return None
+    if pa.types.is_integer(column.type):
+        # bool is an int subclass, and pyarrow would silently accept 1.0.
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise SchemaError(f"{where}: expected int, got {type(value).__name__} {value!r}")
+        low, high = _integer_range(column.type)
+        if not low <= value <= high:
+            raise SchemaError(f"{where}: {value} does not fit in {column.type}")
+        return int(value)
+    if pa.types.is_string(column.type):
+        if not isinstance(value, str):
+            raise SchemaError(f"{where}: expected str, got {type(value).__name__} {value!r}")
+        return value
+    raise SchemaError(f"{where}: unsupported column type {column.type}")
+
+
+def table_from_rows(dataset: Dataset, rows: Sequence[Mapping[str, Any]]) -> pa.Table:
+    """Build a table for ``dataset`` from row dicts, with strict type checks.
+
+    Unlike pyarrow's own conversion, this never coerces: a float, bool or
+    numeric string in an integer column is an error.
+    """
+    names = dataset.schema.names
+    expected = set(names)
+    columns: dict[str, list[Any]] = {name: [] for name in names}
+    for index, row in enumerate(rows):
+        given = set(row)
+        if KNOWLEDGE_TS in given:
+            raise SchemaError(
+                f"{dataset.name} (row {index}): {KNOWLEDGE_TS} is assigned by the store "
+                "and cannot be supplied"
+            )
+        if given != expected:
+            missing = sorted(expected - given)
+            unknown = sorted(given - expected)
+            raise SchemaError(
+                f"{dataset.name} (row {index}): missing columns {missing}, "
+                f"unknown columns {unknown}"
+            )
+        for column in dataset.schema:
+            columns[column.name].append(_check_value(dataset, column, row[column.name], index))
+
+    arrays = [pa.array(columns[column.name], type=column.type) for column in dataset.schema]
+    table = pa.Table.from_arrays(arrays, schema=dataset.schema)
+    validate_table(dataset, table)
+    return table
+
+
+def validate_table(dataset: Dataset, table: pa.Table) -> None:
+    """Raise SchemaError unless ``table`` has exactly ``dataset``'s caller columns
+    and types, no nulls in required columns, and satisfies the structural rules."""
+    if not isinstance(table, pa.Table):
+        raise TypeError(f"expected a pyarrow.Table, got {type(table).__name__}")
+
+    given = set(table.schema.names)
+    if KNOWLEDGE_TS in given:
+        raise SchemaError(
+            f"{dataset.name}: {KNOWLEDGE_TS} is assigned by the store and cannot be supplied"
+        )
+    expected = set(dataset.schema.names)
+    if given != expected or len(table.schema.names) != len(expected):
+        missing = sorted(expected - given)
+        unknown = sorted(given - expected)
+        raise SchemaError(f"{dataset.name}: missing columns {missing}, unknown columns {unknown}")
+
+    for column in dataset.schema:
+        actual = table.schema.field(column.name).type
+        if actual != column.type:
+            raise SchemaError(f"{dataset.name}.{column.name}: expected {column.type}, got {actual}")
+        if not column.nullable and table.column(column.name).null_count:
+            raise SchemaError(f"{dataset.name}.{column.name}: null in a required column")
+
+    if table.num_rows == 0:
+        return
+
+    for name, values in dataset.allowed.items():
+        value_set = pa.array(sorted(values), type=dataset.schema.field(name).type)
+        if not pc.all(pc.is_in(table.column(name), value_set=value_set)).as_py():
+            raise SchemaError(f"{dataset.name}.{name}: value not in {sorted(values)}")
+
+    for name, (low, high) in dataset.bounds.items():
+        extremes = pc.min_max(table.column(name)).as_py()
+        if low is not None and extremes["min"] < low:
+            raise SchemaError(f"{dataset.name}.{name}: {extremes['min']} is below {low}")
+        if high is not None and extremes["max"] > high:
+            raise SchemaError(f"{dataset.name}.{name}: {extremes['max']} is above {high}")

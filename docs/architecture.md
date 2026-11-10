@@ -1,6 +1,6 @@
 # Architecture
 
-Status: design. Only the skeleton exists (see `docs/roadmap.md`, Phase 0).
+Status: design. `docs/roadmap.md` records which parts are built.
 Decisions referenced here are recorded in `docs/adr/`.
 
 ## 1. Principles
