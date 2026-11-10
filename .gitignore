@@ -1,0 +1,44 @@
+# Secrets: never commit. .env.example is the only env file in git.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# C++ build output
+cpp/build/
+cpp/vcpkg_installed/
+CMakeUserPresets.json
+compile_commands.json
+.vs/
+
+# Compiled extension emitted into the Python package by cpp/bindings
+python/src/quantagent/*.pyd
+python/src/quantagent/*.so
+python/src/quantagent/*.pdb
+python/src/quantagent/*.lib
+python/src/quantagent/*.exp
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+
+# Market data, journals and experiment output live outside git
+data/
+journals/
+runs/
+*.parquet
+*.duckdb
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
