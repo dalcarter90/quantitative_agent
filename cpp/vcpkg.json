@@ -1,0 +1,9 @@
+{
+  "name": "quantagent",
+  "version-string": "0.1.0",
+  "builtin-baseline": "27560a5fe9ff2ba4a08a0d7a5800a679684fa733",
+  "dependencies": [
+    "gtest",
+    "benchmark"
+  ]
+}
