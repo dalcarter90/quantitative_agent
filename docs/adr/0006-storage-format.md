@@ -1,6 +1,6 @@
 # 0006: Raw binary log + Parquet/DuckDB normalized store
 
-Status: Proposed (reconcile with `quantlab` in Phase 1; needs owner sign-off)
+Status: Accepted (by the owner, as proposed)
 Date: 2026-11-10
 
 ## Context
@@ -13,13 +13,11 @@ Storage serves three different readers:
    normalized data.
 3. Audit needs an append-only record of what the system decided and did.
 
-The data core being imported (`quantlab`) already has a bitemporal schema and
-`PITSession`, so it already made a storage choice. That choice was not
-available when this ADR was written. Storage format is expensive to change
-once data has been collected, so this ADR is a proposal to be confirmed, not a
-mandate to migrate.
+The data core is built fresh in this repository, so there is no existing data
+or format to stay compatible with. Storage format is expensive to change once
+data has been collected.
 
-## Decision (proposed)
+## Decision
 
 | Tier | Format | Notes |
 |------|--------|-------|
@@ -29,12 +27,9 @@ mandate to migrate.
 | Experiment registry | A single DuckDB or SQLite file | Small, transactional |
 | Agent audit log | Append-only JSON lines | Human-readable, greppable |
 
-Default rule for Phase 1: **if `quantlab`'s existing format differs, keep
-`quantlab`'s** for the normalized store unless it has a concrete defect
-(cannot express knowledge time, cannot store integer mantissas, or cannot
-scale to tick data). Its 31 tests encode its behavior, and passing them
-unmodified is a Phase 1 acceptance criterion. The raw log and journal tiers
-are new either way.
+Every tier is append-only. The normalized store's writer has no update or
+delete operation, and readers go through `PITSession`, which exposes only
+views filtered by `knowledge_ts` (architecture section 3.2).
 
 ## Alternatives considered
 
@@ -66,6 +61,6 @@ are new either way.
   but means compaction is a periodic batch job.
 - Data directories are outside git (`data/`, `journals/` are ignored). Small
   recorded fixtures for tests are committed under a tests directory.
-- **Open item for Phase 1:** document `quantlab`'s actual storage, compare
-  against this table, and move this ADR to Accepted or supersede it. Ask the
-  owner before migrating any existing data.
+- DuckDB must read the Parquet files on the session's behalf while the
+  session's own SQL surface is barred from reading files. Phase 1b has to
+  enforce that split and test it.

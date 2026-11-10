@@ -7,7 +7,7 @@ Date: 2026-11-10
 
 The system has a C++ hot path and four Python layers that share types (events,
 prices, instrument metadata) and must be tested together: the C++ order book is
-verified against the Python reconstructor, and backtests drive C++ from Python.
+verified against the Python reference reconstructor, and backtests drive C++ from Python.
 
 ## Decision
 
@@ -21,15 +21,12 @@ cpp/                C++20 hot path. Own CMake project, presets, vcpkg manifest
   tests/            GoogleTest
   bench/            Google Benchmark
 python/             one installable distribution, src layout
-  src/quantagent/   signals, risk, agent, and the compiled _core module
-  src/quantlab/     data core, imported in Phase 1 under its original name
+  src/quantagent/   one package: data core (quantagent.data), signals, risk,
+                    agent, and the compiled _core module
   tests/            pytest
 docs/               architecture, roadmap, ADRs
 scripts/            check.ps1 (build + all tests)
 ```
-
-`quantlab` keeps its package name when imported so its 31 tests run without
-edits. Renaming or folding it into `quantagent` is a separate, later decision.
 
 Component subdirectories (`cpp/include/qa/book/`, `python/src/quantagent/risk/`
 and so on) are created by the phase that implements them, not in advance.
