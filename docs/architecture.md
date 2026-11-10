@@ -49,16 +49,16 @@ HFT, and nothing in the design assumes it is.
 | # | Layer | Language | Owns | Must never |
 |---|-------|----------|------|-----------|
 | 1 | Hot path | C++20 | Feed handlers, order book, incremental features, pre-trade risk, order state, execution gateway, replay engine | Allocate, lock, throw, or read the wall clock on the core thread |
-| 2 | Data core | Python | Raw capture ingestion, bitemporal store, `PITSession`, exchange adapters for history/backfill, quality checks | Return a row whose knowledge time is after the session's as-of time |
+| 2 | Data core | Python | Raw capture ingestion, append-only bitemporal store, `PITSession`, exchange adapters, quality checks, reference order book reconstructor | Return a row whose knowledge time is after the session's as-of time |
 | 3 | Signals | Python (features mirrored in C++) | Feature definitions, regime detection, the blended model, validation harness, cost model | Read data except through `PITSession`; report a result without costs |
 | 4 | Risk/portfolio | Python control plane + C++ enforcement | Position sizing, exposure limits, drawdown guard, pause/recall, the only route to the order path | Be bypassed; have limits changed at runtime by software |
 | 5 | Agent | Python | Research loop, monitoring, reports, pause requests, flags | Place orders, change limits, resume trading, touch exchange credentials |
 
-The data core is the earlier `quantlab` platform (bitemporal schema,
-`PITSession`, Binance/Coinbase adapters, order book reconstructor, quality
-checks, 31 tests). It is imported in Phase 1 as `python/src/quantlab/`, keeping
-its package name so its tests pass unmodified. Sections 5 and 6 describe the
-target; where `quantlab` differs, Phase 1 reconciles and updates the ADRs.
+The data core is built in this repository as `python/src/quantagent/data/`
+(roadmap Phase 1): bitemporal schema, append-only store, `PITSession`,
+Binance and Coinbase adapters, and quality checks. A simple Python reference
+order book reconstructor (roadmap Phase 2) lives beside it and is the oracle
+the C++ order book is verified against.
 
 ## 3. Interfaces between layers
 
@@ -73,7 +73,7 @@ thread.
 | Direction | Interface | Notes |
 |-----------|-----------|-------|
 | Python → C++ | `ReplayEngine(config).run(raw_log, strategy)` | Backtests. Runs the C++ core over a recorded log. `strategy` is called on decision-clock events (section 4.3). |
-| Python → C++ | `OrderBook`, `apply(event)`, `top(n)` | For verification against the Python reconstructor and for research. |
+| Python → C++ | `OrderBook`, `apply(event)`, `top(n)` | For verification against the Python reference reconstructor and for research. |
 | Python → C++ | `Engine.submit_targets(TargetSet)` | Live/paper. Enqueues onto the control SPSC queue. Non-blocking. |
 | Python → C++ | `Engine.pause(scope, reason)`, `Engine.flatten(scope, reason)` | Risk-reducing commands only. There is no binding that raises a limit or resumes. |
 | C++ → Python | `Engine.snapshot()` | Positions, open orders, PnL, book tops, feature values, health counters. Read through a seqlock, never blocks the core. |
@@ -89,10 +89,25 @@ with PITSession(as_of=t) as s:          # t is required, there is no default
     s.instrument(instrument)            # metadata as known at t
 ```
 
-`PITSession` is the only read path for layers 3 and 5. Direct file or SQL
-access to the store from those layers is forbidden by convention and checked
-by an import-lint test once the layers exist. Inside a backtest, the harness
-creates the session and advances `as_of` with simulated time; strategy code
+`PITSession` is the only read path for layers 3 and 5, and it blocks
+look-ahead structurally rather than by convention:
+
+- `as_of` is required and fixed for the life of the session.
+- Every query runs against views already filtered to `knowledge_ts <= as_of`.
+  The unfiltered tables are not reachable through the session.
+- The store is append-only. A correction or backfill is a new row with a later
+  `knowledge_ts`, so a session at an earlier `as_of` still sees what was known
+  then.
+- If SQL is offered, the session accepts exactly one `SELECT` statement. DDL,
+  DML, multi-statement input, and anything that reads a file path or URL
+  (`read_parquet` and similar) are rejected by parsing the statement against an
+  allow-list.
+- The session does not hand out its database connection or the store's file
+  paths.
+
+An import-lint test (added with the signal layer) additionally fails if layer
+3 or 5 code imports storage internals. Inside a backtest, the harness creates a
+session per decision time with `as_of` equal to simulated time; strategy code
 never constructs one.
 
 ### 3.3 Signals → Risk/portfolio
@@ -253,8 +268,7 @@ sees data when we would have had it, not when the venue produced it.
 
 ## 7. Storage
 
-Details and alternatives are in ADR 0006 (status: proposed, pending
-reconciliation with `quantlab` in Phase 1).
+Details and alternatives are in ADR 0006.
 
 | Tier | Content | Format | Used by |
 |------|---------|--------|---------|

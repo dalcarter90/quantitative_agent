@@ -10,9 +10,10 @@ A quantitative trading agent, built in phases. Five layers:
 1. **C++ hot path** (`cpp/`): feed handlers, order book, pre-trade risk,
    execution gateway, deterministic replay/backtest engine. Exposed to Python
    as `quantagent._core`.
-2. **Python data core** (`python/src/quantlab/`, imported in Phase 1):
-   bitemporal storage (event, receipt and knowledge time) queried only through
-   `PITSession(as_of=...)`.
+2. **Python data core** (`python/src/quantagent/data/`, built in Phase 1):
+   append-only bitemporal storage (event, receipt and knowledge time) queried
+   only through `PITSession(as_of=...)`, plus a reference order book
+   reconstructor (Phase 2) that the C++ book is verified against.
 3. **Signal layer**: order flow imbalance, technicals, regime detection, one
    blended model, validated walk-forward with purged CV and real costs.
 4. **Risk/portfolio**: sizing, exposure limits, drawdown guard that pauses
@@ -49,16 +50,18 @@ Most of this is not built yet. Read these before changing anything:
 8. **No secrets in git.** Keys go in `.env` (ignored). `.env.example` holds
    placeholders only. Do not print, log or commit key values.
 9. **Research reads data only through `PITSession`.** Signal and agent code
-   must not open store files or query the database directly.
-10. **The original `quantlab` directory is read-only.** Copy from it; never
-    modify, move or delete it.
+   must not open store files or query the database directly. Do not add a
+   way around the session's restrictions (raw file access, DDL,
+   multi-statement SQL, unfiltered tables, a mutable `as_of`).
+10. **The data store is append-only.** Corrections are new rows with a later
+    knowledge time. Do not add update or delete operations to the store.
 
 If a task seems to require breaking one of these, stop and ask the owner.
 
 ## How to work
 
-- **One roadmap phase per session**, in order. Start by reading the phase's
-  acceptance criteria. Do not begin a phase whose prerequisites are unmet.
+- **One roadmap phase per session**, in order (Phase 1 is split into 1a to
+  1d; each is one session). Start by reading the phase's acceptance criteria. Do not begin a phase whose prerequisites are unmet.
 - **Every phase ends with tests green.** Run `scripts/check.ps1` and confirm
   it prints `ALL GREEN` before you say a phase is done. If it fails, the
   phase is not done; report the failure with its output.
@@ -164,8 +167,8 @@ cpp/
   bench/          Google Benchmark (qa_bench)
 python/
   pyproject.toml
-  src/quantagent/ Python package (plus the compiled _core module)
-  src/quantlab/   data core (arrives in Phase 1)
+  src/quantagent/ Python package (plus the compiled _core module);
+                  the data core arrives in Phase 1 as quantagent/data/
   tests/          pytest
 docs/             architecture.md, roadmap.md, adr/
 scripts/check.ps1 build + all tests
