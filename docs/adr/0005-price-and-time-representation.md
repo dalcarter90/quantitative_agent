@@ -1,6 +1,6 @@
 # 0005: int64 mantissa with per-instrument exponent; int64 nanosecond timestamps
 
-Status: Proposed (reconcile with `quantlab` in Phase 1; needs owner sign-off)
+Status: Accepted (by the owner, as proposed)
 Date: 2026-11-10
 
 ## Context
@@ -12,8 +12,7 @@ replay comparisons fragile. Crypto spans a wide range: BTC near 10^5 with two
 decimals, and tokens priced near 10^-8 traded in quantities above 10^12.
 
 This choice is expensive to reverse once data is stored and code is written
-against it, which is why it stays Proposed until checked against what
-`quantlab` already stores.
+against it.
 
 ## Decision
 
@@ -78,6 +77,5 @@ against it, which is why it stays Proposed until checked against what
 - If a venue increases an instrument's precision beyond its `exp`, the
   instrument gets a new metadata version with a larger `exp`; readers rescale
   using the metadata in force at each row's time.
-- **Open item for Phase 1:** `quantlab` may store prices as `Decimal`, float
-  or strings, and timestamps at a different resolution. Phase 1 documents what
-  it does and either adopts this ADR at the storage boundary or supersedes it.
+- The Python data core is built to this representation from its first phase,
+  so there is no conversion layer between the store and the C++ types.

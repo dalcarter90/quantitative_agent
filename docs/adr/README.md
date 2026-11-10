@@ -13,12 +13,9 @@ checking), **Accepted**, **Superseded by NNNN**.
 | [0002](0002-bindings-library.md) | pybind11, installed from pip | Accepted |
 | [0003](0003-build-system.md) | CMake presets + vcpkg manifest | Accepted |
 | [0004](0004-queue-design.md) | In-house bounded SPSC ring buffer | Accepted |
-| [0005](0005-price-and-time-representation.md) | int64 mantissa with per-instrument exponent; int64 ns timestamps | Proposed |
-| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Proposed |
+| [0005](0005-price-and-time-representation.md) | int64 mantissa with per-instrument exponent; int64 ns timestamps | Accepted |
+| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted |
 | [0007](0007-agent-tool-permissions.md) | Allow-listed tool server, structurally enforced | Accepted |
-
-0005 and 0006 are Proposed because the imported data core (`quantlab`) already
-embodies choices for both. Phase 1 reconciles them with the owner's sign-off.
 
 ## Template
 
