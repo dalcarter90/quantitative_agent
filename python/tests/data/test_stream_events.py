@@ -348,14 +348,18 @@ def test_a_kraken_checksum_mismatch_is_one_event_until_the_next_snapshot():
 
 
 def test_a_bad_snapshot_checksum_is_an_event_and_probes_are_checked_independently():
+    wrong = UPDATE_CRC ^ 1
     normalized = kraken_session(
         kraken_book("snapshot", SNAP_BIDS, SNAP_ASKS, SNAP_CRC),
         kraken_book("snapshot", SNAP_BIDS, SNAP_ASKS, 1, channel="probe"),
-        kraken_book("update", UPDATE_BIDS, UPDATE_ASKS, UPDATE_CRC),  # the stream is unaffected
+        # A bad probe says nothing about the stream: its book is still trusted,
+        # so a fault on the stream right afterwards is still found.
+        kraken_book("update", UPDATE_BIDS, UPDATE_ASKS, wrong),
         kraken_book("snapshot", SNAP_BIDS, SNAP_ASKS, 2),
     )
     assert mismatches(normalized) == [
         (4, 0, K.CHECKSUM_MISMATCH, "probe", 1, SNAP_CRC),
+        (5, 0, K.CHECKSUM_MISMATCH, "ws", wrong, UPDATE_CRC),
         (6, 0, K.CHECKSUM_MISMATCH, "ws", 2, SNAP_CRC),
     ]
 

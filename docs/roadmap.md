@@ -26,7 +26,7 @@ before making it.
 | 1a | Data core: bitemporal schema and append-only store | Done |
 | 1b | Data core: point-in-time query session | Done |
 | 1c | Data core: raw capture, fixtures, Kraken and Coinbase adapters | Done |
-| 1d | Data core: quality checks | Not started |
+| 1d | Data core: quality checks | Done |
 | 2 | Python reference order book reconstructor | Not started |
 | 3 | C++ core types | Not started |
 | 4 | C++ order book, verified | Not started |
@@ -434,37 +434,110 @@ data before the adapters were written):
   Kraken placeholders for the later execution phases.
 - **Test time** is now about 75 seconds for the Python suite.
 
-#### Phase 1d: Quality checks
+#### Phase 1d: Quality checks (done)
 
 Each check is a function over data read through `PITSession` that returns
 structured findings (what, where, severity). Each has one test on clean
 fixture data that finds nothing and one on a deliberately corrupted copy
 that finds the planted defect.
 
-- [ ] **Stream integrity,** using each venue's own rule. Coinbase: missing,
-      repeated or out-of-order `sequence_num` on a connection. The adapter
-      detects these while normalizing, but they are not stored yet. **Ask
-      the owner** how to persist them (see the Phase 1c notes; proposal: a
-      `stream_events` dataset) before writing this check. Kraken has no
-      sequence numbers; its rule is the book checksum, which needs a
-      reconstructed book, so the Kraken part of this check is done by the
-      Phase 2 reconstructor.
-- [ ] **Clock skew:** `recv_ts - event_ts` outside a configured band,
+- [x] **Stream integrity,** using each venue's own rule, read from the
+      `stream_events` dataset (owner decision, ADR 0010; built first in this
+      phase). Coinbase: missing, repeated or out-of-order `sequence_num` on a
+      connection. Kraken: book checksum mismatches, which the adapter now
+      verifies while normalizing. Both venues: reconnects and messages that
+      could not be normalized.
+- [x] **Clock skew:** `recv_ts - event_ts` outside a configured band,
       including negative values (venue timestamp later than receipt), and
       `event_ts` going backwards within a stream. Only rows with
       `event_ts_source = "venue"` are considered (ADR 0008); a test shows
       that `"receipt"` rows are neither flagged nor counted as zero skew.
-- [ ] **Crossed books:** best bid at or above best ask in snapshot and
+- [x] **Crossed books:** best bid at or above best ask in snapshot and
       top-of-book data. (Phase 2 applies the same check to the reconstructed
-      book after every event.)
-- [ ] **Outliers:** trade prices far from a rolling reference, and zero or
+      book after every event.) No top-of-book quotes are stored, so this
+      checks every snapshot, the stream's own and the independent ones.
+- [x] **Outliers:** trade prices far from a rolling reference, and zero or
       negative prices and quantities. Thresholds are config, and a finding
       flags the row; it never deletes or alters it.
-- [ ] A report command runs all checks over a date range and prints a
+- [x] A report command runs all checks over a date range and prints a
       summary. It exits non-zero when a finding at or above a chosen
       severity exists.
-- [ ] `docs/data-core.md` written: schema, store layout, `PITSession` API
+- [x] `docs/data-core.md` written: schema, store layout, `PITSession` API
       and its restrictions, adapters, and what each quality check does.
+
+**What was built:**
+
+- `stream_events` (ADR 0010), done first: a fourth dataset with one row per
+  integrity event, written by the adapters in the same pass as the market
+  data and read through `PITSession.stream_events` and the SQL view of the
+  same name. Kinds: session start and stop, connect, disconnect, subscribe
+  request, subscription ack, trade backfill, the three sequence breaks,
+  checksum mismatch, and message rejected. Each row names its raw record.
+- The Kraken adapter now keeps the top of each connection's book and
+  verifies the venue's checksum after every message. After a mismatch the
+  connection's book is suspect, and nothing more is reported for it until
+  its next snapshot, so one fault is one event.
+- `quality.py`: `check_stream_integrity`, `check_clock_skew`,
+  `check_crossed_books`, `check_outliers`, `run_checks`, `QualityConfig`
+  (loadable from JSON) and the report command
+  `python -m quantagent.data.quality --store ... --start ... --end ...`.
+- `docs/data-core.md`, describing the whole data core.
+- ADR 0009 marked confirmed by the owner.
+
+**Verified:**
+
+- Every check finds nothing on both clean fixtures, and finds exactly the
+  planted defect on a damaged copy. Defects are planted in the raw log
+  (a lost Coinbase message, a corrupted Kraken checksum, an unparseable
+  message) so the adapters' events are part of the test, or in the
+  normalized rows (late, early and out-of-order timestamps, crossed,
+  locked and one-sided snapshots, outlying and impossible prices).
+- On the one-hour recordings, loaded into a fresh store, the report finds
+  nothing: 1.2 million book rows, 23,000 trades, 64 stream events, 14
+  snapshots.
+- 35 deliberate breakages of the new code; all 35 are caught by a test.
+- 899 Python tests and 2 C++ tests pass.
+
+**Notes for the next phases:**
+
+- **Ask the owner: the recording clock.** The machine that made the Phase
+  1c recordings has its Windows Time service stopped, and its clock ran
+  about 1.4 s ahead while recording (no Coinbase message arrived sooner than
+  1,398 ms after Coinbase sent it) and about 1.2 s ahead a day later (four
+  NTP servers agree, with 20 to 50 ms round trips). That is most of the
+  ~1.48 s median lag in the quality report. It causes no look-ahead (data
+  looks known later than it was), but it makes every lag and latency figure
+  wrong by a drifting amount, and the clock skew check cannot see it
+  because the band allows several seconds. Proposed: run recordings only on
+  a machine with time sync enabled (`w32tm` running, or NTP on Linux);
+  have the recorder measure its NTP offset at session start and store it
+  in the `SESSION_START` detail; and add a check that flags a session whose
+  offset exceeds a threshold. That changes the recorder and adds a check,
+  so it needs a decision. Until then, treat absolute lags on this data as
+  shifted by 1.2 to 1.4 s.
+- **Phase 2 and stream events.** The reconstructor must verify Kraken's
+  checksum itself and must also raise on a stored `CHECKSUM_MISMATCH` or
+  `SEQUENCE_GAP`; a test should show its own verification and the
+  adapter's events agree on the fixtures and on damaged copies (ADR 0010).
+  The helpers in `test_stream_events.py` (`copy_log` and the damaged-log
+  tests) are a starting point for the gap fixtures Phase 2 needs.
+- **What the checks cannot see:** a crossed book between snapshots (needs
+  the rebuilt book, Phase 2), a steadily wrong clock (above), lost Kraken
+  updates the checksum misses (36% of single losses on the fixture), and
+  anything during periods that were not recorded. `docs/data-core.md`
+  section 6 lists these.
+- **Backfilled trades.** Both venues send recent trades on subscribe.
+  `TRADE_BACKFILL` marks those records. Anything that treats a trade's
+  `recv_ts` as "when it became known live" (backtests, Phase 7 onward) must
+  exclude or handle them, as the clock skew check does.
+- **Thresholds** are defaults chosen from the recorded data (worst live
+  lag 2.3 s, worst trade move 2.8 bps against the median of the previous
+  50). They are untested on volatile markets; `outlier_bps` = 500 may need
+  tuning for small-cap pairs.
+- **Report speed.** About 2 seconds for the two one-hour recordings. The
+  checks pull per-instrument rows into Python for the outlier median; a
+  day of Coinbase trades is fine, months may need a per-day loop.
+- **Python test time** is now about 95 seconds.
 
 ---
 
@@ -484,8 +557,10 @@ optimization.
       it, cited in the code with a link to the venue documentation. Kraken:
       the CRC32 checksum after every message (the Phase 1c notes give the
       exact recipe). Coinbase: `sequence_num` continuity on the connection,
-      using the stored stream anomalies (this depends on the owner decision
-      listed under Phase 1d).
+      using the stored `stream_events` (ADR 0010). For both venues, a
+      stored `CHECKSUM_MISMATCH` or `SEQUENCE_GAP` also raises, and a test
+      shows the reconstructor's own checksum verification agrees with the
+      adapter's events.
 - [ ] **Raises on an integrity failure.** Kraken: a checksum that does not
       match raises a specific exception carrying the expected and computed
       checksums and the message's `(recv_ts, seq)`. Coinbase: a gap raises

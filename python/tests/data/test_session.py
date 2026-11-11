@@ -457,4 +457,5 @@ def test_the_data_package_exports_no_other_read_path():
         "rawlog",
         "recorder",
         "adapters",
+        "quality",  # reads only through PITSession (tested in test_quality.py)
     }
