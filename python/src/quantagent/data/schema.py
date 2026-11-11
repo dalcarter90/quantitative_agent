@@ -52,6 +52,28 @@ class BookEventKind(IntEnum):
     CHECK_SNAPSHOT = 2
 
 
+class StreamEventKind(IntEnum):
+    """What happened to a capture stream (ADR 0010)."""
+
+    SESSION_START = 0  # a recording session began
+    SESSION_STOP = 1
+    CONNECT = 2  # a connection was opened; a second one on "ws" is a reconnect
+    DISCONNECT = 3  # detail holds the reason
+    SUBSCRIBE_REQUEST = 4  # we asked for a channel; detail holds the request
+    SUBSCRIPTION_ACK = 5  # the venue confirmed a subscription change
+    # The trades in this record are history the venue sent on subscribe, not
+    # trades observed as they happened. Their receipt time says nothing about
+    # when they occurred.
+    TRADE_BACKFILL = 6
+    SEQUENCE_GAP = 10  # expected and observed hold the venue's sequence numbers
+    SEQUENCE_REPEAT = 11
+    SEQUENCE_OUT_OF_ORDER = 12
+    # expected is the venue's checksum, observed the one computed from the
+    # book rebuilt from the stream. The book is suspect until the next snapshot.
+    CHECKSUM_MISMATCH = 13
+    MESSAGE_REJECTED = 14  # the record could not be normalized; detail says why
+
+
 EVENT_TS_VENUE = "venue"
 EVENT_TS_RECEIPT = "receipt"
 
@@ -186,7 +208,35 @@ INSTRUMENTS = Dataset(
     },
 )
 
-DATASETS: Mapping[str, Dataset] = {d.name: d for d in (TRADES, BOOK_EVENTS, INSTRUMENTS)}
+# Integrity events for every venue, one row per event. Each refers to the raw
+# record it was noticed at (recv_ts, seq); event_index orders several events
+# from one record. These are our own observations, so event_ts is always the
+# receipt time (ADR 0008).
+STREAM_EVENTS = Dataset(
+    name="stream_events",
+    version=1,
+    schema=pa.schema(
+        [
+            *_HEADER,
+            _required("event_index", pa.int32()),
+            _required("kind", pa.int8()),  # a StreamEventKind value
+            pa.field("connection", pa.string(), nullable=True),  # "ws", "probe", ...
+            pa.field("expected", pa.int64(), nullable=True),
+            pa.field("observed", pa.int64(), nullable=True),
+            pa.field("detail", pa.string(), nullable=True),
+        ]
+    ),
+    key=("recv_ts", "seq", "event_index"),
+    allowed={
+        "event_ts_source": frozenset({EVENT_TS_RECEIPT}),
+        "kind": frozenset(int(k) for k in StreamEventKind),
+    },
+    bounds={**_TIMESTAMP_BOUNDS, "event_index": (0, None)},
+)
+
+DATASETS: Mapping[str, Dataset] = {
+    d.name: d for d in (TRADES, BOOK_EVENTS, INSTRUMENTS, STREAM_EVENTS)
+}
 
 
 def _integer_range(type_: pa.DataType) -> tuple[int, int]:

@@ -29,7 +29,14 @@ import duckdb
 import pyarrow as pa
 
 from quantagent.data.fixedpoint import INT64_MAX
-from quantagent.data.schema import BOOK_EVENTS, DATASETS, INSTRUMENTS, TRADES, Dataset
+from quantagent.data.schema import (
+    BOOK_EVENTS,
+    DATASETS,
+    INSTRUMENTS,
+    STREAM_EVENTS,
+    TRADES,
+    Dataset,
+)
 from quantagent.data.sqlguard import MAX_QUERY_LENGTH, QueryRejected, validate
 from quantagent.data.store import _PART, _check_name
 
@@ -177,6 +184,11 @@ class PITSession:
     def book_events(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
         """Book levels with ``start <= event_ts < end``, latest known version of each."""
         return self._range(BOOK_EVENTS, venue, instrument, start, end)
+
+    def stream_events(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
+        """Integrity events (gaps, reconnects, checksum mismatches, ...) with
+        ``start <= event_ts < end``. Their ``event_ts`` is the receipt time."""
+        return self._range(STREAM_EVENTS, venue, instrument, start, end)
 
     def instruments(self, venue: str, instrument: str) -> pa.Table:
         """Every known metadata version for an instrument, oldest first."""

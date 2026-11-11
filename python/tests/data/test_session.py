@@ -359,7 +359,16 @@ def test_sessions_cannot_be_copied_pickled_or_subclassed(history):
 
 def test_public_surface_is_exactly_the_query_methods(history):
     public = {name for name in dir(PITSession) if not name.startswith("_")}
-    assert public == {"as_of", "trades", "book_events", "instruments", "instrument", "sql", "close"}
+    assert public == {
+        "as_of",
+        "trades",
+        "book_events",
+        "stream_events",
+        "instruments",
+        "instrument",
+        "sql",
+        "close",
+    }
 
 
 def _holds_connection_or_path(value, root: Path, depth=0) -> bool:

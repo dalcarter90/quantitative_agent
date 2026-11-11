@@ -20,10 +20,12 @@ from quantagent.data.adapters import Normalizer, normalize, parse_rfc3339_ns
 from quantagent.data.rawlog import RawRecord
 from quantagent.data.schema import (
     BOOK_EVENTS,
+    DATASETS,
     INSTRUMENTS,
     TRADES,
     BookEventKind,
     Side,
+    StreamEventKind,
     table_from_rows,
 )
 
@@ -128,14 +130,14 @@ KRAKEN_SNAPSHOT = (
     '{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD",'
     '"bids":[{"price":73468.5,"qty":0.20416909},{"price":73466.9,"qty":3.40289101}],'
     '"asks":[{"price":73468.6,"qty":0.89472056},{"price":73470.0,"qty":0.00208204}],'
-    '"checksum":362523281,"timestamp":"2026-11-11T03:06:47.006069Z"}]}',
+    '"checksum":2937112725,"timestamp":"2026-11-11T03:06:47.006069Z"}]}',
 )
 KRAKEN_UPDATE = (
     "ws",
     '{"channel":"book","type":"update","data":[{"symbol":"BTC/USD",'
     '"bids":[{"price":73466.9,"qty":0.00000000},{"price":73468.5,"qty":0.20467952},'
     '{"price":73468.5,"qty":0.00006120}],"asks":[],'
-    '"checksum":2694076524,"timestamp":"2026-11-11T03:06:47.064192Z"}]}',
+    '"checksum":1401313711,"timestamp":"2026-11-11T03:06:47.064192Z"}]}',
 )
 KRAKEN_TRADES = (
     "ws",
@@ -177,7 +179,10 @@ def test_kraken_instrument_metadata_has_no_venue_timestamp_so_it_is_a_receipt_ro
         }
     ]
     # Pairs that are not being recorded are not stored.
-    assert set(normalized.rows) == {("instruments", "kraken", "BTC-USD")}
+    assert set(normalized.rows) == {
+        ("instruments", "kraken", "BTC-USD"),
+        ("stream_events", "kraken", "BTC-USD"),  # the session start and the subscription ack
+    }
 
 
 def test_kraken_book_snapshot_rows_are_exact():
@@ -191,7 +196,7 @@ def test_kraken_book_snapshot_rows_are_exact():
         "kind": BookEventKind.SNAPSHOT,
         "venue_seq_first": None,
         "venue_seq_last": None,
-        "checksum": 362523281,
+        "checksum": 2937112725,
         "depth": 10,
     }
     assert rows_of(normalized, BOOK_EVENTS, "kraken") == [
@@ -211,7 +216,7 @@ def test_kraken_book_update_keeps_message_order_removals_and_repeated_prices():
         (2, Side.BUY, 734685, 6120),  # the same price again, later in the message
     ]
     assert {r["kind"] for r in update} == {BookEventKind.DELTA}
-    assert {r["checksum"] for r in update} == {2694076524}
+    assert {r["checksum"] for r in update} == {1401313711}
     assert {r["event_ts"] for r in update} == {BASE + 64_192_000}
     assert {r["event_ts_source"] for r in update} == {"venue"}
     assert {r["venue_seq_last"] for r in update} == {None}
@@ -488,9 +493,7 @@ def test_every_receipt_row_holds_recv_ts_and_rows_pass_the_schema(normalized):
     normalized = normalized()
     sources = set()
     for (dataset_name, _, _), rows in normalized.rows.items():
-        dataset = {"trades": TRADES, "book_events": BOOK_EVENTS, "instruments": INSTRUMENTS}[
-            dataset_name
-        ]
+        dataset = DATASETS[dataset_name]
         table_from_rows(dataset, rows)  # raises if a row breaks the schema
         for row in rows:
             sources.add((dataset_name, row["event_ts_source"]))
@@ -621,8 +624,15 @@ def test_a_bad_message_is_rejected_with_a_reason_and_nothing_else_is_lost(venue,
     assert isinstance(reject.detail, str) and reject.detail
     # The messages on either side are intact, and no row came from the bad one.
     assert len(rows_of(normalized, dataset, venue)) == 2
-    for rows in normalized.rows.values():
-        assert all(row["seq"] != reject.seq for row in rows)
+    for (dataset_name, _, _), rows in normalized.rows.items():
+        from_bad_record = [row for row in rows if row["seq"] == reject.seq]
+        if dataset_name == "stream_events":
+            # The hole in the stream is itself recorded (ADR 0010).
+            kinds = [StreamEventKind(row["kind"]) for row in from_bad_record]
+            assert kinds.count(StreamEventKind.MESSAGE_REJECTED) == 1
+            assert from_bad_record[-1]["detail"].startswith(reason)
+        else:
+            assert from_bad_record == []
     assert normalized.report.outcomes["rejected"] == 1
     assert sum(normalized.report.outcomes.values()) == normalized.report.records == len(records)
     assert normalized.report.rejected == {reason: 1}
@@ -659,7 +669,8 @@ def test_a_partly_bad_message_produces_no_rows_at_all():
 def test_data_without_its_prerequisites_is_rejected_not_guessed(venue, entries, reason):
     normalized = normalize(log(venue, *entries))
     assert [r.reason for r in normalized.report.rejects] == [reason]
-    assert not any(normalized.rows.values())
+    # Nothing but stream events (the session start, the reject) may be produced.
+    assert {key[0] for key in normalized.rows} <= {"stream_events"}
 
 
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
@@ -698,10 +709,7 @@ def test_random_damage_never_crashes_and_every_record_is_accounted_for(venue):
     assert report.outcomes["data"] > 100
     # Whatever survived is still valid against the schema.
     for (dataset_name, _, _), rows in normalized.rows.items():
-        dataset = {"trades": TRADES, "book_events": BOOK_EVENTS, "instruments": INSTRUMENTS}[
-            dataset_name
-        ]
-        table_from_rows(dataset, rows)
+        table_from_rows(DATASETS[dataset_name], rows)
 
 
 def test_the_normalizer_can_be_fed_and_drained_in_pieces():

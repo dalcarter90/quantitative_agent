@@ -1,6 +1,6 @@
 # 0009: Venue-neutral book events, with Kraken as the second venue
 
-Status: Accepted (venue choice: owner decision; schema: made in Phase 1c, see "Review")
+Status: Accepted (confirmed by the owner as written, 2026-11-11), amended by 0010
 Date: 2026-11-11
 Amends: 0006
 
@@ -104,5 +104,8 @@ with the stream.
 
 The venue choice was the owner's. The schema rework was made while
 implementing Phase 1c, on the strength of the Phase 1a note that the book
-event key was provisional until checked against real venues. It is recorded
-here so the owner can confirm or revise it before more data is collected.
+event key was provisional until checked against real venues. The owner
+confirmed it as written on 2026-11-11.
+
+The open decision named under Consequences, where Coinbase's numbering breaks
+are persisted, was settled by ADR 0010 (`stream_events`).

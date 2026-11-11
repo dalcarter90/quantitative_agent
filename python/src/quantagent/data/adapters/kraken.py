@@ -18,8 +18,19 @@ before this was written:
 - Prices and quantities arrive as JSON numbers, always printed with the pair's
   full precision. They are read as text so no digit is lost; the checksum is
   defined over those digits.
+
+Because the checksum is Kraken's only protection for the book, this adapter
+verifies it while normalizing, the way it checks Coinbase's sequence numbers:
+it keeps the top of each connection's book, applies every message, and writes
+a CHECKSUM_MISMATCH stream event when the venue's checksum and its own differ
+(ADR 0010). After a mismatch the book is suspect, so nothing more is reported
+for that connection until its next snapshot. The checksum covers only the ten
+best levels per side: a lost update below them goes unnoticed unless its level
+later reaches the top ten.
 """
 
+import json
+import zlib
 from typing import Any
 
 from quantagent.data.adapters.base import (
@@ -42,7 +53,7 @@ from quantagent.data.adapters.base import (
 )
 from quantagent.data.fixedpoint import to_mantissa
 from quantagent.data.rawlog import RawRecord
-from quantagent.data.schema import BookEventKind, Side
+from quantagent.data.schema import BookEventKind, Side, StreamEventKind
 
 _BOOK_KINDS = {
     (STREAM_CHANNEL, "snapshot"): BookEventKind.SNAPSHOT,
@@ -51,6 +62,37 @@ _BOOK_KINDS = {
 }
 _TAKER_SIDES = {"buy": Side.BUY, "sell": Side.SELL}
 _MAX_CHECKSUM = 2**32 - 1
+_CHECKSUM_LEVELS = 10
+
+Book = dict[Side, dict[int, int]]  # side -> price mantissa -> quantity mantissa
+
+
+def _apply(book: Book, levels: list[tuple[Side, int, int]], depth: int | None) -> None:
+    """Apply levels in message order, then keep ``depth`` levels per side."""
+    for side, price, qty in levels:
+        if qty == 0:
+            book[side].pop(price, None)
+        else:
+            book[side][price] = qty
+    if depth is not None:
+        # The venue sends no removal for a level pushed out of the subscribed depth.
+        for side, best_first in ((Side.BUY, True), (Side.SELL, False)):
+            if len(book[side]) > depth:
+                kept = sorted(book[side], reverse=best_first)[:depth]
+                book[side] = {price: book[side][price] for price in kept}
+
+
+def book_checksum(book: Book) -> int:
+    """Kraken's CRC32 over the ten best asks (ascending) then bids (descending).
+
+    Each level contributes its price digits then its quantity digits, with the
+    decimal point and leading zeros removed. Kraken prints both at the pair's
+    full precision, so those digits are exactly the stored mantissas.
+    https://docs.kraken.com/api/docs/guides/spot-ws-book-v2
+    """
+    asks = sorted(book[Side.SELL].items())[:_CHECKSUM_LEVELS]
+    bids = sorted(book[Side.BUY].items(), reverse=True)[:_CHECKSUM_LEVELS]
+    return zlib.crc32("".join(f"{price}{qty}" for price, qty in (*asks, *bids)).encode())
 
 
 class KrakenAdapter(VenueAdapter):
@@ -59,9 +101,13 @@ class KrakenAdapter(VenueAdapter):
     def __init__(self) -> None:
         super().__init__()
         self._depth: dict[str, int] = {}  # subscribed book depth per connection
+        self._books: dict[str, Book] = {}  # the book rebuilt from each connection's stream
+        self._suspect: set[str] = set()  # connections whose book failed its checksum
 
     def on_connect(self, connection: str) -> None:
         self._depth.pop(connection, None)
+        self._books.pop(connection, None)
+        self._suspect.discard(connection)
 
     def handle_venue(self, record: RawRecord) -> Handled:
         if record.channel not in (STREAM_CHANNEL, PROBE_CHANNEL):
@@ -96,6 +142,13 @@ class KrakenAdapter(VenueAdapter):
         result = as_object(message.get("result", {}), "result")
         if method == "subscribe" and result.get("channel") == "book":
             self._depth[record.channel] = checked_depth(text_int(result["depth"], "depth"))
+        # Parsed again without number-as-text, so the detail holds ordinary JSON.
+        confirmed = {"method": method, **load_json(record.payload).get("result", {})}
+        self.note(
+            StreamEventKind.SUBSCRIPTION_ACK,
+            connection=record.channel,
+            detail=json.dumps(confirmed, separators=(",", ":"), sort_keys=True),
+        )
         return ignored(f"{method}.ack")
 
     def _instrument(self, record: RawRecord, message: dict, kind: str) -> Handled:
@@ -130,6 +183,7 @@ class KrakenAdapter(VenueAdapter):
         depth = self._depth.get(record.channel, self.start_depth)
 
         rows: list[tuple[str, Row]] = []
+        parsed: list[tuple[int, list[tuple[Side, int, int]]]] = []  # (checksum, levels) per entry
         index = 0
         for entry in entries:
             self.require_symbol(as_object(entry, "book entry")["symbol"])
@@ -137,6 +191,7 @@ class KrakenAdapter(VenueAdapter):
             checksum = text_int(entry["checksum"], "checksum")
             if not 0 <= checksum <= _MAX_CHECKSUM:
                 raise ValueError(f"checksum {checksum} is not an unsigned 32-bit value")
+            parsed.append((checksum, []))
             header = {
                 **venue_time(entry["timestamp"]),
                 "recv_ts": record.recv_ts,
@@ -157,13 +212,48 @@ class KrakenAdapter(VenueAdapter):
                         "qty": to_mantissa(level["qty"], qty_exp),
                     }
                     rows.append(("book_events", row))
+                    parsed[-1][1].append((side, row["price"], row["qty"]))
                     index += 1
+        # Only now, with the whole message known to be well formed.
+        for checksum, levels in parsed:
+            self._verify(record.channel, book_kind, levels, checksum, depth)
         return data(f"book.{kind}", rows, empty=f"book.{kind}.empty")
+
+    def _verify(
+        self,
+        connection: str,
+        book_kind: BookEventKind,
+        levels: list[tuple[Side, int, int]],
+        checksum: int,
+        depth: int | None,
+    ) -> None:
+        if book_kind == BookEventKind.DELTA:
+            book = self._books.get(connection)
+            if book is None or connection in self._suspect:
+                return  # no trusted book to check against until the next snapshot
+        else:
+            book = {Side.BUY: {}, Side.SELL: {}}
+            if book_kind == BookEventKind.SNAPSHOT:
+                self._books[connection] = book
+                self._suspect.discard(connection)
+        _apply(book, levels, depth)
+        computed = book_checksum(book)
+        if computed != checksum:
+            if book_kind != BookEventKind.CHECK_SNAPSHOT:
+                self._suspect.add(connection)
+            self.note(
+                StreamEventKind.CHECKSUM_MISMATCH,
+                connection=connection,
+                expected=checksum,
+                observed=computed,
+            )
 
     def _trade(self, record: RawRecord, message: dict, kind: str) -> Handled:
         entries = as_list(message["data"], "data")
         self.require_session()
         rows: list[tuple[str, Row]] = []
+        if kind == "snapshot":
+            self.note(StreamEventKind.TRADE_BACKFILL, connection=record.channel)
         for trade in entries:
             self.require_symbol(as_object(trade, "trade")["symbol"])
             price_exp, qty_exp = self.require_exponents()

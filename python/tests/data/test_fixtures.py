@@ -57,11 +57,17 @@ def independent_counts(venue, records):
         if record.channel == "rest:product":
             expected["instruments"] += 1
             continue
+        if record.channel == "recorder":
+            # Session and connection events (ADR 0010); a REST request is not one.
+            expected["stream_events"] += json.loads(record.payload)["event"] != "rest"
+            continue
         if record.channel not in ("ws", "probe"):
             continue
         message = json.loads(record.payload)
         if venue == "kraken":
             channel, kind = message.get("channel"), message.get("type")
+            expected["stream_events"] += message.get("method") == "subscribe"  # an ack
+            expected["stream_events"] += (channel, kind) == ("trade", "snapshot")  # backfill
             if channel == "instrument":
                 pairs = [p for p in message["data"]["pairs"] if p["symbol"] == "BTC/USD"]
                 expected["instruments"] += len(pairs)
@@ -74,9 +80,11 @@ def independent_counts(venue, records):
                 kinds[f"book.{kind}"] += 1 if levels else 0
         else:
             channel = message.get("channel")
+            expected["stream_events"] += channel == "subscriptions"  # an ack
             for event in message.get("events", []):
                 if channel == "market_trades":
                     expected["trades"] += len(event["trades"])
+                    expected["stream_events"] += event["type"] == "snapshot"  # backfill
                 elif channel == "l2_data" and (
                     record.channel == "ws" or event["type"] == "snapshot"
                 ):
@@ -510,6 +518,8 @@ def test_command_line_load_into_a_store(tmp_path, capsys):
     from quantagent.data.adapters.__main__ import main
 
     assert main([str(fixture_path("kraken")), "--store", str(tmp_path / "store")]) == 0
-    assert "rows: book_events 18605, instruments 1, trades 254" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "rows: book_events 18605, instruments 1, stream_events 15, trades 254" in output
+    assert "checksum mismatches: 0" in output
     with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
         assert session.sql("SELECT count(*) AS n FROM trades").to_pylist() == [{"n": 254}]
