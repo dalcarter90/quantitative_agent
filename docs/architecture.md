@@ -82,12 +82,17 @@ thread.
 ### 3.2 Data core → everything above it
 
 ```python
-with PITSession(as_of=t) as s:          # t is required, there is no default
-    s.trades(instrument, start, end)    # only rows with knowledge_ts <= t
-    s.book_events(instrument, start, end)
-    s.bars(instrument, freq, start, end)
-    s.instrument(instrument)            # metadata as known at t
+with PITSession(store_root, as_of=t) as s:   # as_of is a required keyword, no default
+    s.trades(venue, instrument, start, end)  # only rows with knowledge_ts <= t
+    s.book_events(venue, instrument, start, end)
+    s.instruments(venue, instrument)         # every metadata version known at t
+    s.instrument(venue, instrument, at=u)    # the version in effect at u, as known at t
+    s.sql("SELECT ... FROM trades ...")      # one SELECT over the same views
 ```
+
+`start` and `end` are a half-open range on `event_ts`. Each method returns the
+latest version of each record known at `as_of`. A `bars` method is planned but
+not built; it belongs with the bar features in the signal layer.
 
 `PITSession` is the only read path for layers 3 and 5, and it blocks
 look-ahead structurally rather than by convention:
@@ -98,12 +103,18 @@ look-ahead structurally rather than by convention:
 - The store is append-only. A correction or backfill is a new row with a later
   `knowledge_ts`, so a session at an earlier `as_of` still sees what was known
   then.
-- If SQL is offered, the session accepts exactly one `SELECT` statement. DDL,
-  DML, multi-statement input, and anything that reads a file path or URL
-  (`read_parquet` and similar) are rejected by parsing the statement against an
-  allow-list.
+- `sql` accepts exactly one `SELECT` statement over those views. DDL, DML,
+  multi-statement input, and anything that reads a file path or URL
+  (`read_parquet` and similar) are rejected. The check is an allow-list applied
+  to DuckDB's own parse tree, and the session then executes that tree, so there
+  is no second parser to disagree with the engine. Tables, functions, types and
+  expression kinds not on the list are refused, as are `WITH` clauses.
+- Independently of that check, each session's database is locked so it can
+  open only the data files written at or before `as_of`, cannot write, attach
+  or load anything, and cannot be reconfigured. A hole in the statement check
+  would still not reach later data.
 - The session does not hand out its database connection or the store's file
-  paths.
+  paths, and error messages have store paths removed.
 
 An import-lint test (added with the signal layer) additionally fails if layer
 3 or 5 code imports storage internals. Inside a backtest, the harness creates a
@@ -256,7 +267,8 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 
 | Field | Meaning | Set by |
 |-------|---------|--------|
-| `event_ts` | When the venue says it happened | The venue (its precision varies; stored as given, scaled to ns) |
+| `event_ts` | When the venue says it happened | The venue (its precision varies; stored as given, scaled to ns). If the message has no venue timestamp, it holds `recv_ts` (ADR 0008) |
+| `event_ts_source` | Where `event_ts` came from: `"venue"` or `"receipt"` | The adapter, from the message type (ADR 0008; arrives with Phase 1c) |
 | `recv_ts` | When our process received the bytes | Feed thread, wall clock |
 | `knowledge_ts` | When the record became available to queries in the store | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
 | `seq` | Local monotonic sequence number at receipt | Feed thread. Total order for replay is `(recv_ts, seq)` |

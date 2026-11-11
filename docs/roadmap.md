@@ -24,7 +24,7 @@ before making it.
 |-------|-------|--------|
 | 0 | Skeleton and design docs | Done |
 | 1a | Data core: bitemporal schema and append-only store | Done |
-| 1b | Data core: point-in-time query session | Not started |
+| 1b | Data core: point-in-time query session | Done |
 | 1c | Data core: raw capture, fixtures, Binance and Coinbase adapters | Not started |
 | 1d | Data core: quality checks | Not started |
 | 2 | Python reference order book reconstructor | Not started |
@@ -124,12 +124,11 @@ sessions, in order.
   negative timestamps, invalid instrument metadata.
 - **`pyarrow` silently converts `1.0` to an integer.** Always build tables
   with `table_from_rows`, which refuses floats, bools and numeric strings.
-- **1c, ask the owner: snapshots without a venue timestamp.** `event_ts` is a
-  required column, as the architecture specifies, but Binance's spot REST
-  depth snapshot carries only `lastUpdateId` and no timestamp. The adapter
-  needs a rule (for example: make `event_ts` nullable for such rows, or
-  store `recv_ts` in it with a marker column). Either changes the schema, so
-  it needs a decision before the Binance adapter is written.
+- **1c: snapshots without a venue timestamp (decided, ADR 0008).** Binance's
+  spot REST depth snapshot carries only `lastUpdateId` and no timestamp. The
+  owner decided: `event_ts` stays required and holds `recv_ts` for such
+  rows, and a required `event_ts_source` column records `"venue"` or
+  `"receipt"`. Phase 1c implements it.
 - **1c: confirm the book event key** against each venue's real sequence
   semantics; it was chosen before any recorded data existed.
 - **1c: batch appends.** Each append creates one file per date partition.
@@ -146,21 +145,21 @@ sessions, in order.
   `*.duckdb` are still ignored everywhere, which matters if a later phase
   wants to commit such a file as a fixture.
 
-#### Phase 1b: Point-in-time query session
+#### Phase 1b: Point-in-time query session (done)
 
-- [ ] `PITSession(as_of=...)` is the only public read path. `as_of` is a
+- [x] `PITSession(as_of=...)` is the only public read path. `as_of` is a
       required keyword with no default; constructing a session without it is
       an error (tested).
-- [ ] Typed query methods for trades, book events and instrument metadata.
+- [x] Typed query methods for trades, book events and instrument metadata.
       Every one filters on `knowledge_ts <= as_of`, and returns the latest
       known version of each record as of that time.
-- [ ] Look-ahead property test: rows are inserted with random
+- [x] Look-ahead property test: rows are inserted with random
       `knowledge_ts`, sessions opened at random `as_of`, and no returned row
       ever has `knowledge_ts > as_of`, through any method.
-- [ ] Correction test: a corrected record is visible only to sessions with
+- [x] Correction test: a corrected record is visible only to sessions with
       `as_of` at or after the correction's `knowledge_ts`; earlier sessions
       see the original.
-- [ ] If the session offers SQL, it accepts exactly one `SELECT` statement
+- [x] If the session offers SQL, it accepts exactly one `SELECT` statement
       over the session's as-of-filtered views and nothing else. Each of
       these is rejected with a test per case:
   - DDL and DML (`CREATE`, `DROP`, `ALTER`, `INSERT`, `UPDATE`, `DELETE`,
@@ -171,14 +170,94 @@ sessions, in order.
     or URL (`read_parquet`, `read_csv`, a quoted file name used as a table,
     and similar);
   - references to the unfiltered base tables.
-- [ ] Rejection is by parsing the statement and allow-listing what it may
+- [x] Rejection is by parsing the statement and allow-listing what it may
       contain, not by searching the text for forbidden words.
-- [ ] The session does not expose its database connection, the store's file
+- [x] The session does not expose its database connection, the store's file
       paths, or any object from which they can be reached through public
       attributes.
-- [ ] A session's `as_of` cannot be changed after construction. (The
+- [x] A session's `as_of` cannot be changed after construction. (The
       backtest harness, in a later phase, creates a new session per decision
       time.)
+
+**What was built** (`python/src/quantagent/data/`):
+
+- `session.py`: `PITSession(root, *, as_of)` with `trades`, `book_events`,
+  `instruments`, `instrument`, `sql`, `close` and the read-only `as_of`.
+  Results are `pyarrow` tables (or an `InstrumentMeta`), never database
+  objects. Errors: `QueryRejected` (not allowed, not run) and `QueryError`
+  (allowed, failed while running).
+- `sqlguard.py`: the allow-list applied to DuckDB's parse tree.
+
+**How look-ahead is blocked, in three independent layers:**
+
+1. Views keep rows with `knowledge_ts <= as_of`, then the latest version per
+   record. Typed methods and `sql` read only these views.
+2. `sql` validates DuckDB's own parse tree (`json_serialize_sql`) against an
+   allow-list and executes that same tree (`json_execute_serialized_sql`).
+3. Each session's DuckDB instance may open only the files written at or
+   before `as_of` (`allowed_paths`), with external access off and the
+   configuration locked.
+
+Each layer was checked by breaking it on purpose and confirming a test
+fails (16 breakages; 13 are caught). The other three make no difference the
+tests can observe, because something else produces the same outcome: turning
+Python replacement scans back on, dropping one of the two
+qualified-table-name checks, and executing the query text instead of the
+validated tree.
+
+**Notes for the next phases:**
+
+- **Views.** `trades`, `book_events` and `instruments` have the columns
+  `venue`, `instrument`, `date`, then the dataset's stored columns. They show
+  only the latest known version of each record. Superseded versions are not
+  queryable. If 1d needs them (for example to report how often records are
+  corrected), add a separate history view deliberately; it is still as-of
+  filtered, so it is not a look-ahead risk.
+- **SQL limits.** No `WITH` (a CTE name can stand in for a catalog object in
+  one scope and not another, which defeats the table allow-list; use a
+  subquery). No table functions, `VALUES`, parameters, sampling, lambdas,
+  lists or structs. Functions and cast types are a short allow-list in
+  `sqlguard.py`. CLAUDE.md says how to extend it.
+- **Bare `current_date`, `current_user`, `localtime` and the like** parse as
+  column names but run as functions. They are refused as unqualified column
+  names and as aliases, so a real column could not be given one of those
+  names.
+- **A session is a snapshot** of the files present when it was opened. An
+  `as_of` later than the store's latest knowledge time is not repeatable:
+  the same `as_of` can return more rows once more data is appended. Backtests
+  always use a past `as_of`. The agent tool server must cap `as_of` at the
+  current time, as the architecture already requires.
+- **`instrument(venue, instrument, at=...)`** defaults `at` to `as_of`. It
+  compares `at` with `event_ts`, and `as_of` with `knowledge_ts`.
+- **Cost.** Opening a session lists every data file in the store. A range
+  query resolves the latest version of every record of that instrument
+  before filtering on `event_ts`, because a correction can move a record's
+  `event_ts`. Both grow with history and file count. That is fine for
+  fixtures and weeks of data; it is one more reason for 1c to batch appends,
+  and compaction is still unbuilt.
+- **One record twice in one batch** gets the same `knowledge_ts`, so "latest"
+  is decided by an arbitrary but deterministic tie-break. Adapters should not
+  emit the same key twice in a batch.
+- **No retraction.** A record can be corrected but not withdrawn. If a venue
+  can cancel a trade, that needs a schema decision.
+- **Limits of the guarantee.** The session's private connection is reachable
+  by Python code that deliberately reads underscore attributes. Layer 3
+  still holds then, but superseded versions and file paths become visible.
+  The import-lint planned for Phase 12 should also forbid reaching into
+  private attributes of the data package, and forbid opening store files
+  directly.
+- **Other.** Sessions are not thread-safe. A store path containing `=` is
+  refused. DuckDB is pinned to 2.0.x (see CLAUDE.md for the upgrade rule).
+  `hypothesis` was added as a dev dependency. The Python tests now take about
+  35 seconds, mostly from building a small store for each SQL case.
+- **1c: test builders.** `python/tests/data/_builders.py` and `conftest.py`
+  build the rows that the session tests use. When 1c adds `event_ts_source`,
+  update the builders there; the session picks up new columns from the
+  schema automatically.
+- **`bars` has no phase.** The architecture sketched a `bars` method on the
+  session. It was not in the 1b criteria and is not built. It needs an
+  owner: Phase 12 is the natural place, since that is where bar features
+  first need it.
 
 #### Phase 1c: Raw capture, fixtures, Binance and Coinbase adapters
 
@@ -194,10 +273,21 @@ sessions, in order.
 - [ ] A small fixture per venue (a few minutes, a few MB at most,
       compressed) committed under `python/tests/fixtures/`, with a README
       giving venue, instrument, time range and how it was captured.
-- [ ] Binance and Coinbase adapters parse raw payloads into the Phase 1a
-      schemas: exact integer prices and quantities, `event_ts` from the
-      venue, `recv_ts` from the raw record, and each venue's sequence fields
-      preserved.
+- [ ] Schema change per ADR 0008, done before the adapters: a required
+      string column `event_ts_source` (`"venue"` or `"receipt"`, any other
+      value rejected) added to `trades`, `book_events` and `instruments`,
+      and each dataset's schema version raised from 1 to 2. Existing schema
+      and store tests updated to carry the column.
+- [ ] Binance and Coinbase adapters parse raw payloads into those schemas:
+      exact integer prices and quantities, `recv_ts` from the raw record,
+      and each venue's sequence fields preserved.
+- [ ] `event_ts` and `event_ts_source` follow ADR 0008. A message with a
+      venue timestamp stores it with source `"venue"`. A message type that
+      has none (Binance spot REST depth snapshots, and any other found while
+      recording) stores `recv_ts` in `event_ts` with source `"receipt"`.
+      The source is decided by message type, not by comparing timestamps.
+      Tested with a hand-checked example of each kind per venue, and with a
+      test that every `"receipt"` row has `event_ts == recv_ts`.
 - [ ] Adapter tests run against the committed fixtures, offline: every
       fixture message parses, row counts match message counts, and a set of
       hand-checked messages produce exactly the expected rows.
@@ -219,7 +309,9 @@ that finds the planted defect.
       numbers, using each venue's own continuity rule.
 - [ ] **Clock skew:** `recv_ts - event_ts` outside a configured band,
       including negative values (venue timestamp later than receipt), and
-      `event_ts` going backwards within a stream.
+      `event_ts` going backwards within a stream. Only rows with
+      `event_ts_source = "venue"` are considered (ADR 0008); a test shows
+      that `"receipt"` rows are neither flagged nor counted as zero skew.
 - [ ] **Crossed books:** best bid at or above best ask in snapshot and
       top-of-book data. (Phase 2 applies the same check to the reconstructed
       book after every event.)

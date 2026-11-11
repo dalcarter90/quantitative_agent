@@ -10,12 +10,16 @@ requires-python = ">=3.11"
 dependencies = [
     # Normalized store and its query engine, see ADR 0006.
     "pyarrow>=17",
-    "duckdb>=1.1",
+    # Pinned to one minor series: quantagent.data.sqlguard allow-lists the shape
+    # of DuckDB's parse tree, and PITSession relies on its lockdown settings.
+    # To upgrade, raise the bound and run the tests (see CLAUDE.md).
+    "duckdb>=2.0,<2.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "hypothesis>=6",
     "ruff>=0.6",
     # Build-time dependency of the C++ extension (cpp/bindings), see ADR 0002.
     "pybind11>=2.13",

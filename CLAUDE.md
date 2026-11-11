@@ -217,6 +217,17 @@ and `.env` are git-ignored.
   conversion to float for research is explicit.
 - Add runtime dependencies to `python/pyproject.toml`; do not `pip install`
   ad hoc.
+- **`PITSession.sql` is an allow-list** (`python/src/quantagent/data/sqlguard.py`).
+  To permit a new function, type or SQL construct, add it to the list with a
+  test showing it is accepted, and only if it is pure and deterministic: it
+  must not read files, settings, the catalog, the clock or random state, or
+  run SQL from a string. Never loosen a check to make a query pass.
+- **DuckDB is pinned to one minor series.** `sqlguard` depends on the shape of
+  DuckDB's parse tree and `PITSession` on its lockdown settings. Upgrading
+  means raising the bound in `pyproject.toml`, running the tests, and reading
+  the release notes for new SQL syntax, table functions and settings. Tests
+  under `python/tests/data/test_session_sql.py` must all still pass
+  unmodified.
 
 ## Research integrity
 
