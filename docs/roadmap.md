@@ -23,7 +23,7 @@ before making it.
 | Phase | Title | Status |
 |-------|-------|--------|
 | 0 | Skeleton and design docs | Done |
-| 1a | Data core: bitemporal schema and append-only store | Not started |
+| 1a | Data core: bitemporal schema and append-only store | Done |
 | 1b | Data core: point-in-time query session | Not started |
 | 1c | Data core: raw capture, fixtures, Binance and Coinbase adapters | Not started |
 | 1d | Data core: quality checks | Not started |
@@ -67,27 +67,84 @@ Built from scratch per `docs/architecture.md` sections 3.2, 6 and 7 and ADRs
 0005 and 0006, as the subpackage `python/src/quantagent/data/`. Four
 sessions, in order.
 
-#### Phase 1a: Bitemporal schema and append-only store
+#### Phase 1a: Bitemporal schema and append-only store (done)
 
-- [ ] Schemas for trades, book events (snapshots and deltas) and instrument
+- [x] Schemas for trades, book events (snapshots and deltas) and instrument
       metadata. Every row carries `event_ts`, `recv_ts` and `knowledge_ts` as
       `int64` nanoseconds, and prices and quantities as `int64` mantissas
       (ADR 0005).
-- [ ] Parquet store partitioned by venue/instrument/date (ADR 0006), with a
+- [x] Parquet store partitioned by venue/instrument/date (ADR 0006), with a
       writer whose only operation is append. `knowledge_ts` is assigned by
       the writer, not supplied by the caller, and never decreases.
-- [ ] The writer API has no update, overwrite or delete. A test shows that
+- [x] The writer API has no update, overwrite or delete. A test shows that
       appending never changes the bytes of an existing data file.
-- [ ] A correction is a new row with the same key and a later
+- [x] A correction is a new row with the same key and a later
       `knowledge_ts`; the original row is still on disk afterwards (tested).
-- [ ] Instrument metadata (price and quantity exponents, tick size, lot
+- [x] Instrument metadata (price and quantity exponents, tick size, lot
       size) is stored the same bitemporal way.
-- [ ] Decimal string to mantissa conversion is exact and never goes through
+- [x] Decimal string to mantissa conversion is exact and never goes through
       `float`; it rejects values with more precision than the instrument's
       exponent. Tested with edge cases, including very small prices and very
       large quantities.
-- [ ] Runtime dependencies (proposal: `pyarrow`, `duckdb`) added to
+- [x] Runtime dependencies (proposal: `pyarrow`, `duckdb`) added to
       `python/pyproject.toml`.
+
+**What was built** (`python/src/quantagent/data/`):
+
+- `fixedpoint.py`: `to_mantissa(text, exp)` and `to_decimal_str(mantissa, exp)`.
+- `schema.py`: datasets `TRADES`, `BOOK_EVENTS`, `INSTRUMENTS`, each with a
+  caller `schema`, a `stored_schema` (adds `knowledge_ts`), a `key` and a
+  `version`; `table_from_rows` and `validate_table`.
+- `store.py`: `AppendOnlyStore(root, clock=...)` with one public method,
+  `append(dataset, venue, instrument, rows)`.
+
+**Notes for the next phases:**
+
+- **Layout.** `<root>/<dataset>/venue=<v>/instrument=<i>/date=<YYYY-MM-DD>/part-<knowledge_ts, 20 digits>.parquet`.
+  `date` is the UTC date of `event_ts`. Venue, instrument and date exist only
+  as directory names, not as columns in the files. A test confirms DuckDB
+  reads this with `hive_partitioning = true` and types the timestamps and
+  mantissas as `BIGINT`.
+- **Knowledge time.** One append is one batch with one `knowledge_ts`, shared
+  by every file it writes. It is strictly greater than any issued before,
+  including by earlier processes (recovered from file names when the store
+  is opened).
+- **Keys (for 1b's "latest version of each record").** A row's identity is
+  (venue, instrument) plus `Dataset.key`: trades `trade_id`; book events
+  `(kind, venue_seq_last, side, price)`; instruments `event_ts`, which is the
+  time the metadata version takes effect. A correction can change `event_ts`
+  and so land in a different date partition, so 1b must pick the latest
+  version across dates, not within one file or partition.
+- **Instrument metadata as of a time** is two steps: the latest known row per
+  version (`knowledge_ts <= as_of`), then the version with the greatest
+  `event_ts` at or before the time asked about.
+- **The store accepts implausible values on purpose** (zero or negative
+  prices and quantities), so 1d can flag them. It rejects only structural
+  errors: wrong types, nulls in required columns, unknown enum values,
+  negative timestamps, invalid instrument metadata.
+- **`pyarrow` silently converts `1.0` to an integer.** Always build tables
+  with `table_from_rows`, which refuses floats, bools and numeric strings.
+- **1c, ask the owner: snapshots without a venue timestamp.** `event_ts` is a
+  required column, as the architecture specifies, but Binance's spot REST
+  depth snapshot carries only `lastUpdateId` and no timestamp. The adapter
+  needs a rule (for example: make `event_ts` nullable for such rows, or
+  store `recv_ts` in it with a marker column). Either changes the schema, so
+  it needs a decision before the Binance adapter is written.
+- **1c: confirm the book event key** against each venue's real sequence
+  semantics; it was chosen before any recorded data existed.
+- **1c: batch appends.** Each append creates one file per date partition.
+  Appending message by message would create a very large number of small
+  files. There is no compaction yet.
+- **Known limits.** Single writer per store root (not enforced by a lock).
+  Publishing uses hard links, which NTFS and ext4 support but exFAT and some
+  network shares do not. A crash can leave a hidden `.part-*.parquet.tmp`
+  file; readers that glob `*.parquet` do not see it. Names differing only by
+  case (`BTCUSDT`, `btcusdt`) are one directory on Windows and two on Linux;
+  adapters should use one canonical spelling per venue.
+- **`.gitignore`.** The `data/` rule was anchored to `/data/`. Unanchored, it
+  hid `python/src/quantagent/data/` from git and ruff. `*.parquet` and
+  `*.duckdb` are still ignored everywhere, which matters if a later phase
+  wants to commit such a file as a fixture.
 
 #### Phase 1b: Point-in-time query session
 

@@ -29,10 +29,11 @@ __pycache__/
 .mypy_cache/
 dist/
 
-# Market data, journals and experiment output live outside git
-data/
-journals/
-runs/
+# Market data, journals and experiment output live outside git. Anchored to
+# the repo root so they do not match source packages such as quantagent/data.
+/data/
+/journals/
+/runs/
 *.parquet
 *.duckdb
 
