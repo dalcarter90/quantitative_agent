@@ -1,0 +1,376 @@
+"""Shared machinery for venue adapters: raw records in, normalized rows out.
+
+An adapter turns the raw messages of one venue into rows for the normalized
+store. The rules that hold for every venue live here:
+
+- Every raw record ends in exactly one outcome: ``data`` (it produced rows),
+  ``ignored`` (a known kind of message that carries no market data, such as a
+  heartbeat) or ``rejected`` (malformed or unknown). Nothing is dropped
+  without being counted, and a bad message never stops the run.
+- A message is all or nothing. If any part of it is malformed, none of its
+  rows are kept.
+- Prices and quantities become int64 mantissas through ``fixedpoint`` and never
+  pass through ``float``.
+- ``event_ts`` and ``event_ts_source`` follow ADR 0008: the source is decided
+  by the kind of message, never by comparing timestamps.
+"""
+
+import calendar
+import json
+import re
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
+from os import PathLike
+from typing import Any
+
+from quantagent.data.fixedpoint import to_mantissa
+from quantagent.data.rawlog import RawRecord, read_raw_log
+from quantagent.data.schema import DATASETS, EVENT_TS_RECEIPT, EVENT_TS_VENUE, table_from_rows
+from quantagent.data.store import AppendOnlyStore, _check_name
+
+Row = dict[str, Any]
+RowKey = tuple[str, str, str]  # (dataset name, venue, instrument)
+
+CONTROL_CHANNEL = "recorder"
+STREAM_CHANNEL = "ws"
+PROBE_CHANNEL = "probe"
+_CONTROL_EVENTS = {"start", "connect", "subscribe", "disconnect", "rest", "stop"}
+_MAX_DEPTH = 100_000
+
+_RFC3339 = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z"
+)
+_PLAIN_DECIMAL = re.compile(r"[0-9]+(?:\.([0-9]+))?")
+_INTEGER = re.compile(r"-?[0-9]+")
+
+
+@lru_cache(maxsize=8192)
+def parse_rfc3339_ns(text: str) -> int:
+    """Convert a UTC RFC 3339 timestamp ("...Z") to nanoseconds since the epoch, exactly."""
+    if not isinstance(text, str):
+        raise TypeError(f"timestamp must be str, got {type(text).__name__}")
+    match = _RFC3339.fullmatch(text)
+    if match is None:
+        raise ValueError(f"not a UTC RFC 3339 timestamp: {text!r}")
+    year, month, day, hour, minute, second = (int(g) for g in match.groups()[:6])
+    # datetime() validates the calendar and clock fields.
+    seconds = calendar.timegm(datetime(year, month, day, hour, minute, second).timetuple())
+    if seconds < 0:
+        raise ValueError(f"timestamp before 1970: {text!r}")
+    return seconds * 1_000_000_000 + int((match.group(7) or "").ljust(9, "0"))
+
+
+class Rejected(Exception):
+    """Raised by an adapter to refuse a message for a stated reason."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class Reject:
+    seq: int
+    recv_ts: int
+    channel: str
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class SequenceAnomaly:
+    """A break in a venue's per-connection message numbering."""
+
+    kind: str  # "gap", "repeat" or "out_of_order"
+    connection: str
+    expected: int
+    received: int
+    seq: int
+    recv_ts: int
+
+
+@dataclass
+class Report:
+    records: int = 0
+    outcomes: Counter = field(default_factory=Counter)  # data / ignored / rejected
+    messages: Counter = field(default_factory=Counter)  # kinds that produced rows
+    ignored: Counter = field(default_factory=Counter)  # kinds that carry no data
+    rows: Counter = field(default_factory=Counter)  # rows per dataset
+    rejects: list[Reject] = field(default_factory=list)
+    sequence_anomalies: list[SequenceAnomaly] = field(default_factory=list)
+    truncated: bool = False  # the raw log ended in a partial record
+
+    @property
+    def rejected(self) -> Counter:
+        return Counter(reject.reason for reject in self.rejects)
+
+    def summary(self) -> str:
+        def listed(counts: Counter) -> str:
+            return ", ".join(f"{name} {count}" for name, count in sorted(counts.items())) or "none"
+
+        lines = [
+            f"records {self.records}: {listed(self.outcomes)}",
+            f"rows: {listed(self.rows)}",
+            f"rejected: {listed(self.rejected)}",
+            f"sequence anomalies: {len(self.sequence_anomalies)}",
+        ]
+        if self.truncated:
+            lines.append("the raw log ended in a partial record")
+        return "\n".join(lines)
+
+
+@dataclass
+class Normalized:
+    rows: dict[RowKey, list[Row]]
+    report: Report
+
+
+# --- helpers for adapters ---------------------------------------------------------
+
+
+def _refuse_constant(name: str) -> None:
+    raise Rejected("malformed_message", f"{name} is not a number")
+
+
+def load_json(payload: bytes, *, numbers_as_text: bool = False) -> Any:
+    """Decode a JSON payload.
+
+    With ``numbers_as_text`` every JSON number is returned as the exact text
+    the venue sent, so prices written as numbers keep every digit.
+    """
+    try:
+        text = payload.decode("utf-8")
+        if numbers_as_text:
+            return json.loads(text, parse_float=str, parse_int=str, parse_constant=_refuse_constant)
+        return json.loads(text, parse_constant=_refuse_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Rejected("invalid_json", f"{type(error).__name__}: {error}") from None
+
+
+def as_object(value: Any, what: str = "message") -> dict:
+    if not isinstance(value, dict):
+        raise TypeError(f"{what} is not a JSON object")
+    return value
+
+
+def as_list(value: Any, what: str) -> list:
+    if not isinstance(value, list):
+        raise TypeError(f"{what} is not a JSON array")
+    return value
+
+
+def text_int(value: Any, what: str) -> int:
+    """An integer that arrived as number text (see ``load_json``)."""
+    if not isinstance(value, str) or _INTEGER.fullmatch(value) is None:
+        raise ValueError(f"{what} is not an integer: {value!r}")
+    return int(value)
+
+
+def checked_depth(value: int) -> int:
+    if not 1 <= value <= _MAX_DEPTH:
+        raise ValueError(f"book depth {value} is out of range")
+    return value
+
+
+def increment(text: Any, what: str) -> tuple[int, int]:
+    """Decimal places and mantissa of a tick or lot size given as a decimal string.
+
+    "0.01" is two places with mantissa 1; "0.050" is two places with mantissa 5.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"{what} must be a decimal string, got {type(text).__name__}")
+    match = _PLAIN_DECIMAL.fullmatch(text)
+    if match is None:
+        raise ValueError(f"{what} is not a plain decimal: {text!r}")
+    exponent = len((match.group(1) or "").rstrip("0"))
+    return exponent, positive(to_mantissa(text, exponent), what)
+
+
+def positive(value: int, what: str) -> int:
+    if value <= 0:
+        raise ValueError(f"{what} must be positive, got {value}")
+    return value
+
+
+def venue_time(text: Any) -> dict[str, Any]:
+    """Timestamp columns for a message that carries the venue's own timestamp."""
+    return {"event_ts": parse_rfc3339_ns(text), "event_ts_source": EVENT_TS_VENUE}
+
+
+def receipt_time(record: RawRecord) -> dict[str, Any]:
+    """Timestamp columns for a kind of message that has no venue timestamp (ADR 0008)."""
+    return {"event_ts": record.recv_ts, "event_ts_source": EVENT_TS_RECEIPT}
+
+
+Handled = tuple[str, str, list[tuple[str, Row]]]  # (outcome, message kind, (dataset, row) pairs)
+
+
+def ignored(kind: str) -> Handled:
+    return "ignored", kind, []
+
+
+def data(kind: str, rows: list[tuple[str, Row]], *, empty: str) -> Handled:
+    """``kind`` with its rows, or ignored as ``empty`` if the message had none."""
+    return ("data", kind, rows) if rows else ignored(empty)
+
+
+class VenueAdapter:
+    """State and control-record handling common to every venue."""
+
+    venue: str
+
+    def __init__(self) -> None:
+        self.instrument: str | None = None  # our name, used for the store partition
+        self.symbol: str | None = None  # the venue's name for it
+        self.start_depth: int | None = None
+        self.exponents: tuple[int, int] | None = None  # (price_exp, qty_exp) in force
+        self.anomalies: list[SequenceAnomaly] = []
+
+    def handle(self, record: RawRecord) -> Handled:
+        if record.channel == CONTROL_CHANNEL:
+            return self._control(record)
+        return self.handle_venue(record)
+
+    def handle_venue(self, record: RawRecord) -> Handled:
+        raise NotImplementedError
+
+    def on_connect(self, connection: str) -> None:
+        """A new connection was opened; per-connection state starts again."""
+
+    def _control(self, record: RawRecord) -> Handled:
+        message = as_object(load_json(record.payload), "control record")
+        event = message.get("event")
+        if event not in _CONTROL_EVENTS:
+            raise Rejected("unknown_message", f"control event {event!r}")
+        if event == "start":
+            if message["venue"] != self.venue:
+                raise ValueError(f"session is for venue {message['venue']!r}")
+            _check_name("instrument", message["instrument"])
+            symbol, depth = message["symbol"], message["depth"]
+            if not isinstance(symbol, str) or type(depth) is not int:
+                raise TypeError("start record has a malformed symbol or depth")
+            self.instrument, self.symbol = message["instrument"], symbol
+            self.start_depth = checked_depth(depth)
+            self.exponents = None
+        elif event == "connect":
+            self.on_connect(str(message["connection"]))
+        return ignored(f"recorder.{event}")
+
+    def require_session(self) -> None:
+        if self.symbol is None:
+            raise Rejected("no_session_start", "no recorder start record before this message")
+
+    def require_symbol(self, symbol: Any) -> None:
+        self.require_session()
+        if symbol != self.symbol:
+            raise Rejected("unexpected_symbol", f"expected {self.symbol!r}")
+
+    def require_exponents(self) -> tuple[int, int]:
+        if self.exponents is None:
+            raise Rejected("no_instrument_metadata", "no instrument metadata before this message")
+        return self.exponents
+
+
+# --- driver ------------------------------------------------------------------------
+
+
+class Normalizer:
+    """Feed raw records in order; take the rows out whenever convenient."""
+
+    def __init__(self) -> None:
+        from quantagent.data.adapters import ADAPTERS  # the registry imports this module
+
+        self._registry = ADAPTERS
+        self._adapters: dict[str, VenueAdapter] = {}
+        self._rows: dict[RowKey, list[Row]] = {}
+        self.pending_rows = 0  # rows produced and not yet taken
+        self.report = Report()
+
+    def feed(self, record: RawRecord) -> None:
+        report = self.report
+        report.records += 1
+        try:
+            adapter = self._adapters.get(record.venue)
+            if adapter is None:
+                if record.venue not in self._registry:
+                    raise Rejected("unknown_venue", record.venue)
+                adapter = self._adapters[record.venue] = self._registry[record.venue]()
+            try:
+                outcome, kind, rows = adapter.handle(record)
+            finally:
+                if adapter.anomalies:
+                    report.sequence_anomalies.extend(adapter.anomalies)
+                    adapter.anomalies.clear()
+        except Rejected as refused:
+            self._reject(record, refused.reason, refused.detail)
+            return
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+            self._reject(record, "malformed_message", f"{type(error).__name__}: {error}")
+            return
+
+        report.outcomes[outcome] += 1
+        if outcome == "ignored":
+            report.ignored[kind] += 1
+            return
+        report.messages[kind] += 1
+        instrument = adapter.instrument
+        for dataset_name, row in rows:
+            self._rows.setdefault((dataset_name, record.venue, instrument), []).append(row)
+            report.rows[dataset_name] += 1
+        self.pending_rows += len(rows)
+
+    def _reject(self, record: RawRecord, reason: str, detail: str) -> None:
+        self.report.outcomes["rejected"] += 1
+        self.report.rejects.append(
+            Reject(record.seq, record.recv_ts, record.channel, reason, detail or reason)
+        )
+
+    def take_rows(self) -> dict[RowKey, list[Row]]:
+        """Return the rows produced since the last call and forget them."""
+        rows, self._rows = self._rows, {}
+        self.pending_rows = 0
+        return rows
+
+
+def normalize(records: Iterable[RawRecord]) -> Normalized:
+    """Normalize a whole sequence of raw records in memory."""
+    normalizer = Normalizer()
+    for record in records:
+        normalizer.feed(record)
+    return Normalized(rows=normalizer.take_rows(), report=normalizer.report)
+
+
+_APPEND_ORDER = {"instruments": 0, "trades": 1, "book_events": 2}
+
+
+def ingest(
+    path: str | PathLike[str], store: AppendOnlyStore, *, batch_rows: int = 200_000
+) -> Report:
+    """Normalize a raw log into ``store`` and return what happened to every record.
+
+    Rows are appended whenever ``batch_rows`` of them are pending, one append
+    per dataset and instrument. That bounds memory (a single book snapshot can
+    be tens of thousands of rows, so the limit is on rows, not messages) and
+    keeps the store from filling with one small file per message.
+    """
+    reader = read_raw_log(path)
+    normalizer = Normalizer()
+
+    def flush() -> None:
+        pending = normalizer.take_rows()
+        for key in sorted(pending, key=lambda k: (_APPEND_ORDER[k[0]], k)):
+            dataset_name, venue, instrument = key
+            dataset = DATASETS[dataset_name]
+            store.append(dataset, venue, instrument, table_from_rows(dataset, pending[key]))
+
+    for record in reader:
+        normalizer.feed(record)
+        if normalizer.pending_rows >= batch_rows:
+            flush()
+    flush()
+    normalizer.report.truncated = reader.truncated
+    return normalizer.report

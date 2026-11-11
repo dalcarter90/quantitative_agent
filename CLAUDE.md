@@ -139,7 +139,19 @@ cd ..
 .venv\Scripts\python -m pytest python\tests\test_binding.py -k hello   # one test
 .venv\Scripts\python -m ruff check python
 .venv\Scripts\python -m ruff format python
+
+# Tests that talk to the venues are excluded by default. To run them:
+.venv\Scripts\python -m pytest python -m network
+
+# Record public market data (no API keys), then load it into a store
+.venv\Scripts\python -m quantagent.data.recorder --venue kraken --instrument BTC-USD --out data\raw --duration 3600
+.venv\Scripts\python -c "from quantagent.data.adapters import ingest; from quantagent.data.store import AppendOnlyStore; import sys; print(ingest(sys.argv[1], AppendOnlyStore('data/normalized')).summary())" data\raw\kraken\BTC-USD\<file>.qaraw.zst
 ```
+
+Crypto venues are Kraken and Coinbase. Binance.com refuses API access from US
+addresses, so it is not used. Recorded data and stores live under `data/`,
+which is git-ignored; small recorded fixtures are committed under
+`python/tests/fixtures/raw/`.
 
 Things that commonly go wrong:
 

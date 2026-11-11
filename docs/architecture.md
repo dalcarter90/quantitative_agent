@@ -56,7 +56,7 @@ HFT, and nothing in the design assumes it is.
 
 The data core is built in this repository as `python/src/quantagent/data/`
 (roadmap Phase 1): bitemporal schema, append-only store, `PITSession`,
-Binance and Coinbase adapters, and quality checks. A simple Python reference
+Kraken and Coinbase adapters, and quality checks. A simple Python reference
 order book reconstructor (roadmap Phase 2) lives beside it and is the oracle
 the C++ order book is verified against.
 
@@ -148,11 +148,14 @@ Tool calls only, listed exhaustively in section 8.
    the source of truth for replay and for the data core.
 3. **Normalize.** The feed thread parses the message into a fixed-size
    `MarketEvent` (book snapshot/delta, trade) with integer prices and
-   quantities, and checks venue sequence continuity. A gap marks the book
+   quantities, and checks the venue's message numbering where it has one
+   (Coinbase numbers every message on a connection). A gap marks the book
    stale and triggers a resync; a stale book produces no orders.
 4. **Hand off.** The event goes onto that feed's SPSC queue to the core thread.
 5. **Book update.** The core thread applies the event to the instrument's
-   order book.
+   order book. Where the venue protects the book with a checksum instead of
+   message numbers (Kraken), it is verified here, after the update; a
+   mismatch marks the book stale in the same way.
 6. **Features.** Incremental features (order flow imbalance, spread,
    microprice, rolling volatility) update in place.
 7. **Order management.** The core compares current position and working
@@ -201,7 +204,7 @@ fitted model is exported to a C++ evaluator on the core thread; the interface
 | Control | Python threads | Targets, pause/flatten, snapshots | Free to block; not on the hot path |
 
 ```
- feed[binance] ──SPSC──┐                         ┌──SPSC──▶ exec[binance]
+ feed[kraken] ───SPSC──┐                         ┌──SPSC──▶ exec[kraken]
  feed[coinbase] ─SPSC──┼──▶  CORE (single owner) ┼──SPSC──▶ exec[coinbase]
  exec acks/fills ─SPSC─┤     books, risk, orders │
  control cmds ───SPSC──┘                         └──SPSC──▶ journal ──▶ disk

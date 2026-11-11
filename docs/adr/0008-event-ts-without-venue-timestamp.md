@@ -10,11 +10,12 @@ ADR 0005 and the architecture give every stored row an `event_ts`, "when the
 venue says it happened", and the Phase 1a schemas make it a required column.
 The store also partitions by the UTC date of `event_ts`.
 
-Some venue messages carry no venue timestamp at all. The case that forced the
-question is Binance's spot REST depth snapshot, which returns only
-`lastUpdateId`, bids and asks. Instrument metadata fetched over REST is
-similar: the venue often does not say when a tick size took effect. These rows
-still have to be stored, partitioned and ordered.
+Some venue messages carry no venue timestamp at all. Instrument metadata is
+the common case: Kraken's `instrument` channel and Coinbase's product endpoint
+both list tick and lot sizes without saying when they took effect. Some
+venues' REST order book snapshots are another (the question first came up for
+one that returns only an update id, bids and asks). These rows still have to
+be stored, partitioned and ordered.
 
 ## Decision
 
