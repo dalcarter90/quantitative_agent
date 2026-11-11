@@ -4,15 +4,15 @@
 by a fake clock so tests can open sessions before, at and after each batch.
 
     kts   batch
-    1000  instruments binance/BTCUSDT   version effective T0 - 1 day, tick 1
-    2000  trades      binance/BTCUSDT   a @100 (T0), b @101 (T0 + 1s)
+    1000  instruments kraken/ETH-USD   version effective T0 - 1 day, tick 1
+    2000  trades      kraken/ETH-USD   a @100 (T0), b @101 (T0 + 1s)
     3000  trades      coinbase/BTC-USD  a @200 (T0)
-    4000  trades      binance/BTCUSDT   a @150            (correction of a)
-    5000  book_events binance/BTCUSDT   seq 10 bid 99 x5, seq 10 ask 102 x7
-    6000  instruments binance/BTCUSDT   version effective T0 + 30 days, tick 10
-    7000  instruments binance/BTCUSDT   first version again, tick 5 (correction)
-    8000  trades      binance/BTCUSDT   c @103 (T0 + 1 day + 2s)
-    9000  book_events binance/BTCUSDT   seq 10 bid 99 x6  (correction)
+    4000  trades      kraken/ETH-USD   a @150            (correction of a)
+    5000  book_events kraken/ETH-USD   seq 10 bid 99 x5, seq 10 ask 102 x7
+    6000  instruments kraken/ETH-USD   version effective T0 + 30 days, tick 10
+    7000  instruments kraken/ETH-USD   first version again, tick 5 (correction)
+    8000  trades      kraken/ETH-USD   c @103 (T0 + 1 day + 2s)
+    9000  book_events kraken/ETH-USD   seq 10 bid 99 x6  (correction)
 """
 
 from dataclasses import dataclass
@@ -54,17 +54,17 @@ def root(tmp_path):
 @pytest.fixture
 def history(root):
     store = AppendOnlyStore(root, clock=FakeClock(*range(1000, 10000, 1000)))
-    bnc = ("binance", "BTCUSDT")
+    krk = ("kraken", "ETH-USD")
     batches = [
-        (INSTRUMENTS, bnc, instrument_table(V1_EFFECTIVE, tick_size=1)),
-        (TRADES, bnc, trades(("a", T0, 100), ("b", T0 + NS_PER_SECOND, 101))),
+        (INSTRUMENTS, krk, instrument_table(V1_EFFECTIVE, tick_size=1)),
+        (TRADES, krk, trades(("a", T0, 100), ("b", T0 + NS_PER_SECOND, 101))),
         (TRADES, ("coinbase", "BTC-USD"), trades(("a", T0, 200))),
-        (TRADES, bnc, trades(("a", T0, 150))),
-        (BOOK_EVENTS, bnc, book_table((10, T0, Side.BUY, 99, 5), (10, T0, Side.SELL, 102, 7))),
-        (INSTRUMENTS, bnc, instrument_table(V2_EFFECTIVE, tick_size=10)),
-        (INSTRUMENTS, bnc, instrument_table(V1_EFFECTIVE, tick_size=5)),
-        (TRADES, bnc, trades(("c", T0 + NS_PER_DAY + 2 * NS_PER_SECOND, 103))),
-        (BOOK_EVENTS, bnc, book_table((10, T0, Side.BUY, 99, 6))),
+        (TRADES, krk, trades(("a", T0, 150))),
+        (BOOK_EVENTS, krk, book_table((10, T0, Side.BUY, 99, 5), (10, T0, Side.SELL, 102, 7))),
+        (INSTRUMENTS, krk, instrument_table(V2_EFFECTIVE, tick_size=10)),
+        (INSTRUMENTS, krk, instrument_table(V1_EFFECTIVE, tick_size=5)),
+        (TRADES, krk, trades(("c", T0 + NS_PER_DAY + 2 * NS_PER_SECOND, 103))),
+        (BOOK_EVENTS, krk, book_table((10, T0, Side.BUY, 99, 6))),
     ]
     files_by_kts = {}
     for dataset, (venue, instrument), table in batches:

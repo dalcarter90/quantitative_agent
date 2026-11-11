@@ -18,7 +18,7 @@ from quantagent.data.schema import table_from_rows as build
 from quantagent.data.session import PITSession
 from quantagent.data.store import AppendOnlyStore
 
-VENUES = ["binance", "coinbase"]
+VENUES = ["kraken", "coinbase"]
 INSTRUMENT_NAMES = ["AAA", "BBB"]
 EVENT_TIMES = [T0, T0 + 1, T0 + NS_PER_DAY, T0 + 2 * NS_PER_DAY + 7]
 DATASETS = {"trades": TRADES, "book_events": BOOK_EVENTS, "instruments": INSTRUMENTS}
@@ -26,15 +26,26 @@ DATASETS = {"trades": TRADES, "book_events": BOOK_EVENTS, "instruments": INSTRUM
 
 def _row(dataset_name: str, key: int, event_ts: int, value: int) -> dict:
     """A row whose identity is ``key`` and whose payload is ``value``."""
-    header = {"event_ts": event_ts, "recv_ts": event_ts + 1, "seq": key}
+    header = {
+        "event_ts": event_ts,
+        "event_ts_source": "venue",
+        "recv_ts": event_ts + 1,
+        "seq": key,
+    }
     if dataset_name == "trades":
         return {**header, "trade_id": f"t{key}", "price": value, "qty": 1, "side": Side.BUY}
     if dataset_name == "book_events":
+        # Book events are keyed by (recv_ts, seq, level_index), so recv_ts is
+        # fixed here: a later batch with the same seq is then a correction.
         return {
             **header,
+            "recv_ts": 5,
             "kind": BookEventKind.DELTA,
             "venue_seq_first": None,
             "venue_seq_last": key,
+            "checksum": None,
+            "depth": None,
+            "level_index": 0,
             "side": Side.BUY,
             "price": 100,
             "qty": value,
@@ -42,6 +53,7 @@ def _row(dataset_name: str, key: int, event_ts: int, value: int) -> dict:
     # Instrument versions are keyed by event_ts, so the key picks the event time.
     return {
         "event_ts": EVENT_TIMES[key % len(EVENT_TIMES)],
+        "event_ts_source": "venue",
         "recv_ts": 1,
         "seq": 0,
         "price_exp": 2,

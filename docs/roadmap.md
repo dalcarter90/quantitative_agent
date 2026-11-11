@@ -25,7 +25,7 @@ before making it.
 | 0 | Skeleton and design docs | Done |
 | 1a | Data core: bitemporal schema and append-only store | Done |
 | 1b | Data core: point-in-time query session | Done |
-| 1c | Data core: raw capture, fixtures, Binance and Coinbase adapters | Not started |
+| 1c | Data core: raw capture, fixtures, Kraken and Coinbase adapters | Done |
 | 1d | Data core: quality checks | Not started |
 | 2 | Python reference order book reconstructor | Not started |
 | 3 | C++ core types | Not started |
@@ -124,11 +124,11 @@ sessions, in order.
   negative timestamps, invalid instrument metadata.
 - **`pyarrow` silently converts `1.0` to an integer.** Always build tables
   with `table_from_rows`, which refuses floats, bools and numeric strings.
-- **1c: snapshots without a venue timestamp (decided, ADR 0008).** Binance's
-  spot REST depth snapshot carries only `lastUpdateId` and no timestamp. The
-  owner decided: `event_ts` stays required and holds `recv_ts` for such
-  rows, and a required `event_ts_source` column records `"venue"` or
-  `"receipt"`. Phase 1c implements it.
+- **1c: messages without a venue timestamp (decided, ADR 0008).** Some
+  venue messages carry no timestamp. The owner decided: `event_ts` stays
+  required and holds `recv_ts` for such rows, and a required
+  `event_ts_source` column records `"venue"` or `"receipt"`. Phase 1c
+  implemented it.
 - **1c: confirm the book event key** against each venue's real sequence
   semantics; it was chosen before any recorded data existed.
 - **1c: batch appends.** Each append creates one file per date partition.
@@ -138,7 +138,7 @@ sessions, in order.
   Publishing uses hard links, which NTFS and ext4 support but exFAT and some
   network shares do not. A crash can leave a hidden `.part-*.parquet.tmp`
   file; readers that glob `*.parquet` do not see it. Names differing only by
-  case (`BTCUSDT`, `btcusdt`) are one directory on Windows and two on Linux;
+  case (`BTC-USD`, `btc-usd`) are one directory on Windows and two on Linux;
   adapters should use one canonical spelling per venue.
 - **`.gitignore`.** The `data/` rule was anchored to `/data/`. Unanchored, it
   hid `python/src/quantagent/data/` from git and ruff. `*.parquet` and
@@ -254,49 +254,185 @@ validated tree.
   build the rows that the session tests use. When 1c adds `event_ts_source`,
   update the builders there; the session picks up new columns from the
   schema automatically.
-- **`bars` has no phase.** The architecture sketched a `bars` method on the
-  session. It was not in the 1b criteria and is not built. It needs an
-  owner: Phase 12 is the natural place, since that is where bar features
-  first need it.
+- **`bars`.** The architecture sketched a `bars` method on the session. It
+  was not in the 1b criteria and is not built. The owner has since added it
+  to the Phase 12 criteria.
 
-#### Phase 1c: Raw capture, fixtures, Binance and Coinbase adapters
+#### Phase 1c: Raw capture, fixtures, Kraken and Coinbase adapters (done)
 
-- [ ] Raw log writer and reader per ADR 0006 (length-prefixed records with
+The second venue is Kraken, not Binance: Binance.com refuses API access from
+US addresses (HTTP 451). Owner decision.
+
+- [x] Raw log writer and reader per ADR 0006 (length-prefixed records with
       `recv_ts`, `seq`, venue, channel, payload bytes). Round-trip test,
       including a truncated final record.
-- [ ] A recorder CLI captures Binance and Coinbase public L2 depth (the
+- [x] A recorder CLI captures Kraken and Coinbase public L2 depth (the
       initial snapshot plus diffs) and trades into raw logs. Public market
       data only; no API keys.
-- [ ] Recorded: at least one continuous hour for one instrument per venue,
+- [x] Recorded: at least one continuous hour for one instrument per venue,
       including the snapshot needed to seed a book and at least one later
       venue snapshot for verification. Stored outside git.
-- [ ] A small fixture per venue (a few minutes, a few MB at most,
+- [x] A small fixture per venue (a few minutes, a few MB at most,
       compressed) committed under `python/tests/fixtures/`, with a README
       giving venue, instrument, time range and how it was captured.
-- [ ] Schema change per ADR 0008, done before the adapters: a required
+- [x] Schema change per ADR 0008, done before the adapters: a required
       string column `event_ts_source` (`"venue"` or `"receipt"`, any other
       value rejected) added to `trades`, `book_events` and `instruments`,
       and each dataset's schema version raised from 1 to 2. Existing schema
       and store tests updated to carry the column.
-- [ ] Binance and Coinbase adapters parse raw payloads into those schemas:
+- [x] Kraken and Coinbase adapters parse raw payloads into those schemas:
       exact integer prices and quantities, `recv_ts` from the raw record,
-      and each venue's sequence fields preserved.
-- [ ] `event_ts` and `event_ts_source` follow ADR 0008. A message with a
+      and each venue's integrity fields preserved (Coinbase's sequence
+      number, Kraken's checksum and subscribed depth).
+- [x] `event_ts` and `event_ts_source` follow ADR 0008. A message with a
       venue timestamp stores it with source `"venue"`. A message type that
-      has none (Binance spot REST depth snapshots, and any other found while
-      recording) stores `recv_ts` in `event_ts` with source `"receipt"`.
+      has none (Kraken instrument metadata and Coinbase product metadata are
+      the ones found while recording) stores `recv_ts` in `event_ts` with source `"receipt"`.
       The source is decided by message type, not by comparing timestamps.
       Tested with a hand-checked example of each kind per venue, and with a
       test that every `"receipt"` row has `event_ts == recv_ts`.
-- [ ] Adapter tests run against the committed fixtures, offline: every
+- [x] Adapter tests run against the committed fixtures, offline: every
       fixture message parses, row counts match message counts, and a set of
       hand-checked messages produce exactly the expected rows.
-- [ ] Malformed or unknown messages are counted and reported, never
+- [x] Malformed or unknown messages are counted and reported, never
       silently dropped and never a crash.
-- [ ] End to end: fixture raw log through adapter into the store, then read
+- [x] End to end: fixture raw log through adapter into the store, then read
       back through `PITSession`, gives the same rows.
-- [ ] Tests that need the network (the recorder against live endpoints) are
+- [x] Tests that need the network (the recorder against live endpoints) are
       marked and excluded from the default run.
+
+**What was built** (`python/src/quantagent/data/`):
+
+- `rawlog.py`: `RawLogWriter` (append-only, `seal()` compresses to
+  `.qaraw.zst`) and `read_raw_log`. Each record has `recv_ts`, `seq`, venue,
+  channel, payload and a CRC32. A partial final record in an unsealed log is
+  dropped and reported; any other damage raises.
+- `recorder.py`: `python -m quantagent.data.recorder --venue kraken
+  --instrument BTC-USD --out data/raw --duration 3600`. Channels in the log:
+  `ws` (the stream), `probe` (a fresh book snapshot from a second connection
+  every `--probe-interval` seconds), `rest:product` (Coinbase metadata) and
+  `recorder` (JSON control records: start, connect, subscribe, disconnect,
+  rest, stop).
+- `adapters/`: `normalize(records)`, `Normalizer` (streaming) and
+  `ingest(path, store)`, with `KrakenAdapter` and `CoinbaseAdapter`. Every
+  raw record ends as `data`, `ignored` or `rejected` in the returned
+  `Report`, which also lists each reject with a reason and each Coinbase
+  sequence anomaly.
+- Fixtures: `python/tests/fixtures/raw/<venue>/BTC-USD/*.qaraw.zst` (150
+  seconds each, 0.4 MB and 1.0 MB) with a README.
+- `python -m quantagent.data.adapters <log>` checks a raw log without
+  writing anything (exit code 1 on any reject, sequence anomaly or partial
+  record); with `--store <dir>` it loads the log.
+- Recordings (not in git): `data/raw/<venue>/BTC-USD/*.qaraw.zst` on the
+  machine that ran this phase, with a store built from them in
+  `data/normalized`.
+
+**The one-hour recordings** (BTC-USD on both venues, 2026-11-11 03:09 to
+04:10 UTC, recorded at the same time):
+
+| | Kraken | Coinbase |
+|---|---|---|
+| Sealed log | 6.4 MB | 9.2 MB |
+| Raw records | 245,094 | 76,715 |
+| Rejected messages | 0 | 0 |
+| Reconnects | 0 | 0 |
+| Sequence anomalies | not applicable | 0 |
+| Book update messages | 239,447 | 62,172 |
+| Rows: book / trades / metadata | 319,421 / 4,569 / 2 | 871,546 / 18,372 / 1 |
+| Venue checksum matches | 239,448 of 239,448 | not applicable |
+| Check snapshots equal to the rebuilt book | 6 of 6 | 6 of 6 |
+| Book crossed after any message | never | never |
+| Time to load into a store | 10 s | 22 s |
+
+The checksum and check-snapshot rows were produced by a one-off script using
+the same small book as `test_fixtures.py`, not by code in the repository.
+Phase 2 turns that into the reference reconstructor and a proper test.
+
+**Schema changes (all datasets are now version 2):**
+
+- `event_ts_source` added everywhere (ADR 0008). The schema also enforces
+  that a `"receipt"` row has `event_ts == recv_ts`.
+- `book_events` was reworked, because the Phase 1a version assumed every
+  venue numbers its book messages and Kraken does not:
+  - `venue_seq_first` and `venue_seq_last` are both optional;
+  - new optional `checksum` (the venue's checksum after the message) and
+    `depth` (levels per side the venue keeps; null means the full book);
+  - new required `level_index`, the position of the level in its message.
+    Order matters: Kraken can change one price twice in a message;
+  - the key is now `(recv_ts, seq, level_index)`: which raw record and where
+    in it. Normalizing the same raw log again therefore corrects rows
+    instead of duplicating them (tested);
+  - a third kind, `CHECK_SNAPSHOT`, marks the independent snapshots from the
+    probe connection. They are not part of the update stream.
+
+**What the venues actually do** (checked in the documentation and in recorded
+data before the adapters were written):
+
+- **Kraken, WebSocket v2.** The book channel has no sequence numbers. Every
+  snapshot and update carries a CRC32 of the top 10 levels per side. The
+  subscription has a depth (25 here) and the client must cut the book to it
+  after each update. Prices and quantities are JSON numbers printed at the
+  pair's full precision, so the adapter reads them as text. Trade `side` is
+  the taker's. Venue symbol `BTC/USD` is stored as instrument `BTC-USD`.
+- **Coinbase, Advanced Trade.** `level2`, `market_trades` and `heartbeats`
+  need no authentication; no key is read or sent. `sequence_num` counts
+  every message on one connection across all channels, from 0. The book
+  snapshot is the full book (about 38,000 levels, 4 MB). Trade `side` is the
+  maker's, so the adapter stores the opposite as the aggressor.
+- **Aggressor side was checked empirically** on both fixtures: trades print
+  on the aggressor's side of the mid about 80% of the time on both venues,
+  which is what a correct mapping gives with this rough method (an inverted
+  one gives about 20%).
+
+**Notes for the next phases:**
+
+- **Matching a check snapshot to the stream (Phase 2 and Phase 4).** A
+  snapshot from another connection shares no sequence numbering with the
+  stream. It is matched by venue time instead: rebuild the book from the
+  stream up to and including the last message whose `event_ts` is at or
+  before the snapshot's `event_ts`. On both fixtures the result equals the
+  snapshot on every level (38,532 levels on Coinbase, 50 on Kraken). A test
+  in `test_fixtures.py` does this with a 20-line book; Phase 2 should replace
+  that helper with the real reconstructor.
+- **Kraken's checksum is reproduced from the stored integers** for all 13,782
+  book messages in the fixture: concatenate, for the 10 best asks ascending
+  then the 10 best bids descending, the decimal digits of the price mantissa
+  and the quantity mantissa, and take CRC32. This works because Kraken
+  prints full precision, so the mantissa's digits are the venue's digits.
+- **Kraken's checksum only covers the top 10 levels.** A lost update that
+  touches only levels 11 to 25 is not detectable until it reaches the top
+  10. Applying the same update twice changes nothing and is also invisible.
+- **Ask the owner before 1d: where Coinbase stream gaps are stored.** The
+  adapter detects gaps, repeats and out-of-order messages
+  (`Report.sequence_anomalies`), but nothing persists them. They cannot be
+  recovered from `book_events` afterwards, because heartbeats and trades
+  use the same numbering and are not stored with it. The 1d check and the
+  Phase 2 "raise on a gap" rule both need them through `PITSession`.
+  Proposal: a small fourth dataset, `stream_events`, holding connects,
+  disconnects and anomalies with `recv_ts` and `seq`. It would also record
+  Kraken reconnects. This adds a dataset and a view, so it needs a decision.
+- **Instrument metadata rows.** Each recording session adds a metadata
+  version effective from its receipt time, even when nothing changed. The
+  recorder requests metadata before market data, so a version is always in
+  effect for the data that follows it. Kraken's metadata message lists
+  about 1,400 pairs; only the recorded pair is stored.
+- **Trade snapshots.** Both venues send recent trades on subscribe. A trade
+  seen again in a later session has the same `trade_id` and is treated as a
+  correction, not a duplicate.
+- **`ingest` batches by rows** (200,000 pending rows per append by
+  default), not by messages: one Coinbase snapshot message is about 38,000
+  rows. A one-hour log becomes a handful of files per dataset, and memory
+  stays bounded.
+- **Reading raw logs is not point-in-time.** `read_raw_log` returns
+  everything in a file. It is for capture, adapters and the replay engine.
+  Signal and agent code must not use it; the Phase 12 import-lint should
+  forbid `quantagent.data.rawlog` and `quantagent.data.adapters` there.
+- **New dependency:** `websockets` (the recorder only). Network tests are
+  marked `network` and excluded by default; run them with
+  `pytest python -m network`.
+- **No API keys are needed** for anything built so far. `.env.example` has
+  Kraken placeholders for the later execution phases.
+- **Test time** is now about 75 seconds for the Python suite.
 
 #### Phase 1d: Quality checks
 
@@ -305,8 +441,14 @@ structured findings (what, where, severity). Each has one test on clean
 fixture data that finds nothing and one on a deliberately corrupted copy
 that finds the planted defect.
 
-- [ ] **Sequence gaps:** missing, duplicated or out-of-order venue sequence
-      numbers, using each venue's own continuity rule.
+- [ ] **Stream integrity,** using each venue's own rule. Coinbase: missing,
+      repeated or out-of-order `sequence_num` on a connection. The adapter
+      detects these while normalizing, but they are not stored yet. **Ask
+      the owner** how to persist them (see the Phase 1c notes; proposal: a
+      `stream_events` dataset) before writing this check. Kraken has no
+      sequence numbers; its rule is the book checksum, which needs a
+      reconstructed book, so the Kraken part of this check is done by the
+      Phase 2 reconstructor.
 - [ ] **Clock skew:** `recv_ts - event_ts` outside a configured band,
       including negative values (venue timestamp later than receipt), and
       `event_ts` going backwards within a stream. Only rows with
@@ -335,21 +477,29 @@ optimization.
 
 - [ ] Builds a book from a venue snapshot and applies deltas, with integer
       prices and quantities. A level with zero quantity is removed.
-- [ ] Enforces each venue's sequence rules exactly as that venue documents
-      them (for Binance: which buffered diffs to discard after the snapshot,
-      which diff must come first, and continuity between consecutive diffs;
-      for Coinbase: its sequence continuity rule). The rules are cited in the
-      code with a link to the venue documentation.
-- [ ] **Raises on a gap.** A missing, duplicated or out-of-order update
-      raises a specific exception carrying the expected and received
-      sequence numbers. It never skips, repairs or continues silently.
-      Tested with fixtures that have a message removed, duplicated and
-      swapped.
+- [ ] Applies the levels of a message in `level_index` order, and after each
+      message cuts the book to `depth` levels per side when the venue sends
+      a truncated book (Kraken).
+- [ ] Enforces each venue's integrity rule exactly as that venue documents
+      it, cited in the code with a link to the venue documentation. Kraken:
+      the CRC32 checksum after every message (the Phase 1c notes give the
+      exact recipe). Coinbase: `sequence_num` continuity on the connection,
+      using the stored stream anomalies (this depends on the owner decision
+      listed under Phase 1d).
+- [ ] **Raises on an integrity failure.** Kraken: a checksum that does not
+      match raises a specific exception carrying the expected and computed
+      checksums and the message's `(recv_ts, seq)`. Coinbase: a gap raises
+      one carrying the expected and received sequence numbers. It never
+      skips, repairs or continues silently. Tested with fixtures that have
+      a message removed, duplicated and swapped. For Kraken the removed
+      message must be one that changes the top 10 levels; the tests also
+      document what the checksum cannot see (a lost update below the top
+      10, and a repeated update).
 - [ ] Applying a delta before a snapshot raises.
-- [ ] Verified against exchange snapshots: over the Phase 1c recordings, the
-      reconstructed book equals each later venue snapshot in the recording
-      at the matching sequence point, on every level the snapshot contains.
-      Any venue-provided checksum is also validated.
+- [ ] Verified against exchange snapshots: over the Phase 1c fixtures and
+      the one-hour recordings, the reconstructed book equals every
+      `CHECK_SNAPSHOT` on every level, matched by venue time (the stream
+      up to the last message with `event_ts` at or before the snapshot's).
 - [ ] The book is never crossed after any event on the fixtures (the Phase
       1d check, run per event).
 - [ ] Unit tests on small hand-built sequences with hand-computed expected
@@ -378,17 +528,18 @@ optimization.
 ### Phase 4: C++ order book, verified
 
 - [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
-      stale flag on sequence gap.
+      truncation to a subscribed depth, and a stale flag on an integrity
+      failure (a sequence gap on Coinbase, a checksum mismatch on Kraken).
 - [ ] Driven in tests from Python through the bindings, with events
       normalized by the Phase 1c adapters (C++ feed handlers come in
       Phase 6).
 - [ ] Matches the Python reference reconstructor: top-of-book and top-20
       depth equal the Phase 2 golden files after every event, for both
       venues, with zero differences.
-- [ ] Matches exchange snapshots: over the Phase 1c recordings, the book
-      equals each later venue snapshot in the recording at the matching
-      sequence point, and any venue checksum is validated where the venue
-      provides one.
+- [ ] Matches exchange snapshots: over the Phase 1c fixtures, the book
+      equals every `CHECK_SNAPSHOT` on every level, matched by venue time
+      as in Phase 2, and Kraken's checksum is computed and validated after
+      every message.
 - [ ] Both comparisons run as tests in `scripts/check.ps1` on the committed
       fixtures.
 - [ ] Gap handling tested: on the Phase 2 gap fixtures (message removed,
@@ -418,10 +569,12 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 
 - [ ] **Ask the owner** to confirm the JSON parser dependency (proposal:
       simdjson via vcpkg). Record in a new ADR.
-- [ ] Binance and Coinbase handlers turn raw payloads into `MarketEvent`s
-      with integer prices, never passing through `double`.
-- [ ] Sequence continuity rules per venue, with gap detection and resync
-      state machine, tested with gapped fixtures.
+- [ ] Kraken and Coinbase handlers turn raw payloads into `MarketEvent`s
+      with integer prices, never passing through `double`. Kraken sends
+      prices as JSON numbers, so the handler must parse the digits itself.
+- [ ] Integrity rules per venue (Coinbase sequence continuity, Kraken
+      checksum), with detection and a resync state machine, tested with
+      damaged fixtures.
 - [ ] Feeding the Phase 1c fixtures through handler then book gives the same
       Phase 2 golden result as Phase 4, and the handlers' events equal the
       Python adapters' rows for every message.
@@ -489,7 +642,7 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 
 - [ ] **Ask the owner** to confirm the WebSocket/TLS dependency (proposal:
       Boost.Beast with OpenSSL via vcpkg). Record in a new ADR.
-- [ ] Feed threads connect to Binance and Coinbase public streams, with
+- [ ] Feed threads connect to Kraken and Coinbase public streams, with
       reconnect, resubscribe and resync.
 - [ ] Threads wired per architecture section 5: feed, core, journal, with
       pinning and wait strategy from config.
@@ -509,8 +662,17 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 - [ ] Feature library with a registry: OFI (at least top-of-book and
       multi-level), spread, microprice, realized volatility, and a small set
       of bar technicals. Each feature declares its inputs and lookback.
+- [ ] `PITSession.bars(venue, instrument, freq, start, end)`: OHLCV bars
+      computed on demand from the trades visible at `as_of`, with integer
+      prices and quantities. Intervals are half-open and aligned to the
+      epoch. A bar whose interval has not ended by `as_of` is not returned.
+      Tested on hand-computed bars, on an interval with no trades, and for
+      look-ahead: a trade that arrives late changes its bar only for
+      sessions opened at or after the trade's knowledge time. The bar
+      technicals above read bars only through this method.
 - [ ] Features read data only through `PITSession`. Import-lint test added
-      that fails if signal code imports storage internals.
+      that fails if signal code imports storage internals, the raw log or
+      the adapters, or reaches into private attributes of the data package.
 - [ ] Each feature has a test on hand-computed values.
 - [ ] Look-ahead test per feature: its value at time t is unchanged when all
       data after t is deleted.

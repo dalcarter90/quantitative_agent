@@ -14,6 +14,8 @@ dependencies = [
     # of DuckDB's parse tree, and PITSession relies on its lockdown settings.
     # To upgrade, raise the bound and run the tests (see CLAUDE.md).
     "duckdb>=2.0,<2.1",
+    # WebSocket client for the market data recorder (quantagent.data.recorder).
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +35,10 @@ quantagent = ["*.pyd", "*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not network'"
+markers = [
+    "network: needs internet access to a venue; excluded from the default run",
+]
 
 [tool.ruff]
 line-length = 100

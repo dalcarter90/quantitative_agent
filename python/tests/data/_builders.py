@@ -36,6 +36,7 @@ def trade_table(*specs):
     rows = [
         {
             "event_ts": event_ts,
+            "event_ts_source": "venue",
             "recv_ts": event_ts + 5_000_000,
             "seq": i,
             "trade_id": trade_id,
@@ -49,15 +50,23 @@ def trade_table(*specs):
 
 
 def book_table(*specs):
-    """Each spec is (venue_seq_last, event_ts, side, price, qty); all are deltas."""
+    """Each spec is (venue_seq_last, event_ts, side, price, qty).
+
+    The rows are the levels of one delta message: they share ``seq`` and are
+    numbered by ``level_index``.
+    """
     rows = [
         {
             "event_ts": event_ts,
+            "event_ts_source": "venue",
             "recv_ts": event_ts + 5_000_000,
-            "seq": i,
+            "seq": 0,
             "kind": BookEventKind.DELTA,
             "venue_seq_first": None,
             "venue_seq_last": venue_seq_last,
+            "checksum": None,
+            "depth": None,
+            "level_index": i,
             "side": side,
             "price": price,
             "qty": qty,
@@ -70,6 +79,7 @@ def book_table(*specs):
 def instrument_table(event_ts, *, price_exp=2, qty_exp=5, tick_size=1, lot_size=1):
     row = {
         "event_ts": event_ts,
+        "event_ts_source": "venue",
         "recv_ts": event_ts + 5_000_000,
         "seq": 0,
         "price_exp": price_exp,

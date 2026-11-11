@@ -29,10 +29,10 @@ from quantagent.data.session import InstrumentMeta, PITSession, QueryError, Quer
 from quantagent.data.store import AppendOnlyStore
 
 ALL_TIME = (0, INT64_MAX)
-BNC = ("binance", "BTCUSDT")
+KRK = ("kraken", "ETH-USD")
 
 
-def trade_view(session, venue="binance", instrument="BTCUSDT", start=0, end=INT64_MAX):
+def trade_view(session, venue="kraken", instrument="ETH-USD", start=0, end=INT64_MAX):
     table = session.trades(venue, instrument, start, end)
     return [(r["trade_id"], r["price"], r["knowledge_ts"]) for r in table.to_pylist()]
 
@@ -75,17 +75,17 @@ def test_missing_store_is_an_error(tmp_path):
 
 def test_empty_store_gives_empty_typed_results(tmp_path):
     with PITSession(tmp_path, as_of=5000) as session:
-        trades = session.trades(*BNC, *ALL_TIME)
+        trades = session.trades(*KRK, *ALL_TIME)
         assert trades.num_rows == 0
         assert trades.schema.equals(TRADES.stored_schema)
-        assert session.book_events(*BNC, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
-        assert session.instruments(*BNC).schema.equals(INSTRUMENTS.stored_schema)
-        assert session.instrument(*BNC) is None
+        assert session.book_events(*KRK, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
+        assert session.instruments(*KRK).schema.equals(INSTRUMENTS.stored_schema)
+        assert session.instrument(*KRK) is None
         assert session.sql("SELECT count(*) AS n FROM trades").to_pylist() == [{"n": 0}]
 
 
 def test_a_stray_parquet_file_in_the_store_is_an_error(history):
-    stray = history.root / "trades" / "venue=binance" / "instrument=BTCUSDT" / "extra.parquet"
+    stray = history.root / "trades" / "venue=kraken" / "instrument=ETH-USD" / "extra.parquet"
     stray.write_bytes(b"x")
     with pytest.raises(ValueError, match="unexpected file"):
         PITSession(history.root, as_of=5000)
@@ -101,12 +101,12 @@ def test_a_store_path_containing_an_equals_sign_is_refused(tmp_path):
 
 def test_session_is_a_context_manager_and_unusable_after_close(history):
     with PITSession(history.root, as_of=5000) as session:
-        assert session.trades(*BNC, *ALL_TIME).num_rows == 2
+        assert session.trades(*KRK, *ALL_TIME).num_rows == 2
     for call in (
-        lambda: session.trades(*BNC, *ALL_TIME),
-        lambda: session.book_events(*BNC, *ALL_TIME),
-        lambda: session.instruments(*BNC),
-        lambda: session.instrument(*BNC),
+        lambda: session.trades(*KRK, *ALL_TIME),
+        lambda: session.book_events(*KRK, *ALL_TIME),
+        lambda: session.instruments(*KRK),
+        lambda: session.instrument(*KRK),
         lambda: session.sql("SELECT 1 AS x FROM trades"),
     ):
         with pytest.raises(RuntimeError, match="closed"):
@@ -120,9 +120,9 @@ def test_session_is_a_context_manager_and_unusable_after_close(history):
 def test_nothing_is_visible_before_the_first_batch(history):
     with PITSession(history.root, as_of=999) as session:
         assert trade_view(session) == []
-        assert session.instrument(*BNC) is None
-        assert session.instruments(*BNC).num_rows == 0
-        assert session.book_events(*BNC, *ALL_TIME).num_rows == 0
+        assert session.instrument(*KRK) is None
+        assert session.instruments(*KRK).num_rows == 0
+        assert session.book_events(*KRK, *ALL_TIME).num_rows == 0
 
 
 def test_as_of_is_inclusive(history):
@@ -149,7 +149,7 @@ def test_a_correction_is_visible_only_from_its_knowledge_time(history):
 def test_book_event_correction_is_visible_only_from_its_knowledge_time(history):
     def levels(as_of):
         with PITSession(history.root, as_of=as_of) as session:
-            rows = session.book_events(*BNC, *ALL_TIME).to_pylist()
+            rows = session.book_events(*KRK, *ALL_TIME).to_pylist()
         return sorted((r["side"], r["price"], r["qty"], r["knowledge_ts"]) for r in rows)
 
     assert levels(4999) == []
@@ -161,8 +161,8 @@ def test_book_event_correction_is_visible_only_from_its_knowledge_time(history):
 def test_venues_and_instruments_are_separate(history):
     with PITSession(history.root, as_of=9000) as session:
         assert trade_view(session, "coinbase", "BTC-USD") == [("a", 200, 3000)]
-        assert trade_view(session, "coinbase", "BTCUSDT") == []
-        assert trade_view(session, "binance", "BTC-USD") == []
+        assert trade_view(session, "coinbase", "ETH-USD") == []
+        assert trade_view(session, "kraken", "BTC-USD") == []
 
 
 def test_time_range_is_half_open_on_event_ts(history):
@@ -181,8 +181,8 @@ def test_time_range_is_half_open_on_event_ts(history):
 
 def test_a_correction_that_moves_event_ts_leaves_the_old_time_range(root):
     store = AppendOnlyStore(root, clock=FakeClock(1000, 2000))
-    store.append(TRADES, *BNC, trade_table(("a", T0, 100)))
-    store.append(TRADES, *BNC, trade_table(("a", T0 + NS_PER_DAY, 100)))  # other partition
+    store.append(TRADES, *KRK, trade_table(("a", T0, 100)))
+    store.append(TRADES, *KRK, trade_table(("a", T0 + NS_PER_DAY, 100)))  # other partition
 
     with PITSession(root, as_of=1000) as before:
         assert [t[0] for t in trade_view(before, start=T0, end=T0 + 1)] == ["a"]
@@ -194,28 +194,28 @@ def test_a_correction_that_moves_event_ts_leaves_the_old_time_range(root):
 
 def test_typed_results_use_the_stored_schema_and_replay_order(history):
     with PITSession(history.root, as_of=9000) as session:
-        trades = session.trades(*BNC, *ALL_TIME)
+        trades = session.trades(*KRK, *ALL_TIME)
         assert isinstance(trades, pa.Table)
         assert trades.schema.equals(TRADES.stored_schema)
         order = [(r["recv_ts"], r["seq"]) for r in trades.to_pylist()]
         assert order == sorted(order)
-        assert session.book_events(*BNC, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
-        assert session.instruments(*BNC).schema.equals(INSTRUMENTS.stored_schema)
+        assert session.book_events(*KRK, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
+        assert session.instruments(*KRK).schema.equals(INSTRUMENTS.stored_schema)
 
 
 @pytest.mark.parametrize("method", ["trades", "book_events"])
 @pytest.mark.parametrize(
     "arguments",
     [
-        ("../x", "BTCUSDT", 0, 1),
-        ("binance", "a/b", 0, 1),
-        ("binance", "x' OR '1'='1", 0, 1),
-        ("binance", "BTCUSDT", 0.0, 1),
-        ("binance", "BTCUSDT", 0, "1"),
-        ("binance", "BTCUSDT", None, 1),
-        ("binance", "BTCUSDT", True, 1),
-        ("binance", "BTCUSDT", -1, 1),
-        ("binance", "BTCUSDT", 0, 2**63),
+        ("../x", "ETH-USD", 0, 1),
+        ("kraken", "a/b", 0, 1),
+        ("kraken", "x' OR '1'='1", 0, 1),
+        ("kraken", "ETH-USD", 0.0, 1),
+        ("kraken", "ETH-USD", 0, "1"),
+        ("kraken", "ETH-USD", None, 1),
+        ("kraken", "ETH-USD", True, 1),
+        ("kraken", "ETH-USD", -1, 1),
+        ("kraken", "ETH-USD", 0, 2**63),
     ],
 )
 def test_typed_methods_validate_their_arguments(history, method, arguments):
@@ -230,7 +230,7 @@ def test_typed_methods_validate_their_arguments(history, method, arguments):
 def test_instrument_versions_as_known(history):
     def versions(as_of):
         with PITSession(history.root, as_of=as_of) as session:
-            rows = session.instruments(*BNC).to_pylist()
+            rows = session.instruments(*KRK).to_pylist()
         return [(r["event_ts"], r["tick_size"], r["knowledge_ts"]) for r in rows]
 
     assert versions(999) == []
@@ -241,41 +241,41 @@ def test_instrument_versions_as_known(history):
 
 def test_instrument_in_effect_is_the_latest_known_version_at_or_before_the_time(history):
     with PITSession(history.root, as_of=5999) as session:
-        meta = session.instrument(*BNC, at=T0)
+        meta = session.instrument(*KRK, at=T0)
         assert isinstance(meta, InstrumentMeta)
-        assert (meta.venue, meta.instrument) == BNC
+        assert (meta.venue, meta.instrument) == KRK
         assert (meta.event_ts, meta.tick_size, meta.knowledge_ts) == (V1_EFFECTIVE, 1, 1000)
         assert (meta.price_exp, meta.qty_exp, meta.lot_size) == (2, 5, 1)
         # The later version is not known yet, whatever time is asked about.
-        assert session.instrument(*BNC, at=V2_EFFECTIVE + 1).tick_size == 1
+        assert session.instrument(*KRK, at=V2_EFFECTIVE + 1).tick_size == 1
         # Nothing was in effect before the first version.
-        assert session.instrument(*BNC, at=V1_EFFECTIVE - 1) is None
-        assert session.instrument(*BNC, at=V1_EFFECTIVE).tick_size == 1
+        assert session.instrument(*KRK, at=V1_EFFECTIVE - 1) is None
+        assert session.instrument(*KRK, at=V1_EFFECTIVE).tick_size == 1
 
     with PITSession(history.root, as_of=6000) as session:
         # Known now, but it only takes effect in the future.
-        assert session.instrument(*BNC, at=T0).tick_size == 1
-        assert session.instrument(*BNC, at=V2_EFFECTIVE - 1).tick_size == 1
-        assert session.instrument(*BNC, at=V2_EFFECTIVE).tick_size == 10
+        assert session.instrument(*KRK, at=T0).tick_size == 1
+        assert session.instrument(*KRK, at=V2_EFFECTIVE - 1).tick_size == 1
+        assert session.instrument(*KRK, at=V2_EFFECTIVE).tick_size == 10
 
     with PITSession(history.root, as_of=7000) as session:
-        assert session.instrument(*BNC, at=T0).tick_size == 5
+        assert session.instrument(*KRK, at=T0).tick_size == 5
         assert session.instrument("coinbase", "BTC-USD") is None
 
 
 def test_instrument_defaults_to_the_version_in_effect_at_as_of(root):
     store = AppendOnlyStore(root, clock=FakeClock(100, 200))
-    store.append(INSTRUMENTS, *BNC, instrument_table(1_000, tick_size=1))
-    store.append(INSTRUMENTS, *BNC, instrument_table(5_000, tick_size=2))
+    store.append(INSTRUMENTS, *KRK, instrument_table(1_000, tick_size=1))
+    store.append(INSTRUMENTS, *KRK, instrument_table(5_000, tick_size=2))
     with PITSession(root, as_of=4_999) as session:
-        assert session.instrument(*BNC).tick_size == 1
+        assert session.instrument(*KRK).tick_size == 1
     with PITSession(root, as_of=5_000) as session:
-        assert session.instrument(*BNC).tick_size == 2
+        assert session.instrument(*KRK).tick_size == 2
 
 
 def test_instrument_meta_is_immutable(history):
     with PITSession(history.root, as_of=9000) as session:
-        meta = session.instrument(*BNC, at=T0)
+        meta = session.instrument(*KRK, at=T0)
     assert meta is not None
     with pytest.raises(AttributeError):
         meta.tick_size = 99
@@ -287,7 +287,7 @@ def test_instrument_meta_is_immutable(history):
 def test_later_appends_are_invisible_to_an_open_session(history):
     with PITSession(history.root, as_of=8000) as session:
         before = trade_view(session)
-        history.store.append(TRADES, *BNC, trade_table(("a", T0, 999), ("z", T0, 1)))
+        history.store.append(TRADES, *KRK, trade_table(("a", T0, 999), ("z", T0, 1)))
         assert trade_view(session) == before
         assert session.sql("SELECT max(knowledge_ts) AS k FROM trades").to_pylist() == [{"k": 8000}]
 
@@ -383,10 +383,10 @@ def test_public_attributes_and_results_hold_no_connection_and_no_path(history):
             "as_of": session.as_of,
             "repr": repr(session),
             "str": str(session),
-            "trades": session.trades(*BNC, *ALL_TIME),
-            "book_events": session.book_events(*BNC, *ALL_TIME),
-            "instruments": session.instruments(*BNC),
-            "instrument": session.instrument(*BNC, at=T0),
+            "trades": session.trades(*KRK, *ALL_TIME),
+            "book_events": session.book_events(*KRK, *ALL_TIME),
+            "instruments": session.instruments(*KRK),
+            "instrument": session.instrument(*KRK, at=T0),
             "sql": session.sql("SELECT * FROM trades"),
         }
         for name, value in values.items():
@@ -435,4 +435,17 @@ def test_the_data_package_exports_no_other_read_path():
     modules = {
         name for name in dir(data_package) if not name.startswith("_") and name != "annotations"
     }
-    assert modules <= {"fixedpoint", "schema", "store", "session", "sqlguard"}
+    # rawlog, recorder and adapters are the capture side: they feed the store.
+    # The raw log is readable (the replay engine needs it), but it is not a
+    # research read path; the import-lint planned for the signal layer must
+    # keep layers 3 and 5 away from it. Adding a module here is a deliberate act.
+    assert modules <= {
+        "fixedpoint",
+        "schema",
+        "store",
+        "session",
+        "sqlguard",
+        "rawlog",
+        "recorder",
+        "adapters",
+    }

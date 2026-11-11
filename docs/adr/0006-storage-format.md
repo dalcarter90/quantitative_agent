@@ -1,6 +1,6 @@
 # 0006: Raw binary log + Parquet/DuckDB normalized store
 
-Status: Accepted (by the owner, as proposed)
+Status: Accepted (by the owner, as proposed), amended by 0009
 Date: 2026-11-10
 
 ## Context

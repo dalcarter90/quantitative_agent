@@ -37,8 +37,8 @@ __all__ = ["InstrumentMeta", "PITSession", "QueryError", "QueryRejected"]
 
 _PARTITION_COLUMNS = {"venue": "VARCHAR", "instrument": "VARCHAR", "date": "DATE"}
 _VIEW_NAMES = frozenset(DATASETS)
-_DUCKDB_TYPES = {pa.int8(): "TINYINT", pa.int64(): "BIGINT", pa.uint64(): "UBIGINT",
-                 pa.string(): "VARCHAR"}  # fmt: skip
+_DUCKDB_TYPES = {pa.int8(): "TINYINT", pa.int32(): "INTEGER", pa.int64(): "BIGINT",
+                 pa.uint64(): "UBIGINT", pa.string(): "VARCHAR"}  # fmt: skip
 _PARTITION_DIRECTORY = re.compile(r"(venue|instrument|date)=[^=]+")
 
 

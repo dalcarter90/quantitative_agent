@@ -3,7 +3,9 @@
 Every stored row carries three timestamps, all int64 nanoseconds since the
 Unix epoch, UTC:
 
-- ``event_ts``: when the venue says it happened.
+- ``event_ts``: when the venue says it happened. If the venue's message has
+  no timestamp, it holds ``recv_ts`` and ``event_ts_source`` is ``"receipt"``
+  (ADR 0008).
 - ``recv_ts``: when our process received it.
 - ``knowledge_ts``: when the row became available in the store. Assigned by
   the store's writer; callers never supply it.
@@ -43,8 +45,15 @@ class Side(IntEnum):
 
 
 class BookEventKind(IntEnum):
-    SNAPSHOT = 0  # one level of a full book image
+    SNAPSHOT = 0  # one level of a book image that starts or restarts the stream
     DELTA = 1  # one level of an incremental update; qty 0 removes the level
+    # One level of an independent book image taken on another connection. It
+    # is not part of the update stream; it exists to check a reconstruction.
+    CHECK_SNAPSHOT = 2
+
+
+EVENT_TS_VENUE = "venue"
+EVENT_TS_RECEIPT = "receipt"
 
 
 @dataclass(frozen=True, eq=False)
@@ -61,7 +70,7 @@ class Dataset:
     version: int
     schema: pa.Schema
     key: tuple[str, ...]
-    allowed: Mapping[str, frozenset[int]] = field(default_factory=dict)
+    allowed: Mapping[str, frozenset[int] | frozenset[str]] = field(default_factory=dict)
     bounds: Mapping[str, tuple[int | None, int | None]] = field(default_factory=dict)
 
     @property
@@ -81,14 +90,16 @@ def _required(name: str, type_: pa.DataType) -> pa.Field:
 # receipt; (recv_ts, seq) is the total order used for replay.
 _HEADER = [
     _required("event_ts", pa.int64()),
+    _required("event_ts_source", pa.string()),  # "venue" or "receipt", ADR 0008
     _required("recv_ts", pa.int64()),
     _required("seq", pa.uint64()),
 ]
 _TIMESTAMP_BOUNDS = {"event_ts": (0, None), "recv_ts": (0, None)}
+_EVENT_TS_SOURCES = {"event_ts_source": frozenset({EVENT_TS_VENUE, EVENT_TS_RECEIPT})}
 
 TRADES = Dataset(
     name="trades",
-    version=1,
+    version=2,
     schema=pa.schema(
         [
             *_HEADER,
@@ -99,15 +110,24 @@ TRADES = Dataset(
         ]
     ),
     key=("trade_id",),
-    allowed={"side": frozenset(int(s) for s in Side)},
+    allowed={**_EVENT_TS_SOURCES, "side": frozenset(int(s) for s in Side)},
     bounds=_TIMESTAMP_BOUNDS,
 )
 
 # One row per price level. A venue message with many levels becomes many rows
-# that share seq and the venue sequence columns.
+# that share recv_ts, seq and the venue's integrity columns, and are numbered
+# by level_index in the order the venue listed them. That order matters: a
+# venue may update the same price twice in one message.
+#
+# Venues protect the stream in different ways, so the integrity columns are
+# all optional: Coinbase numbers its messages (venue_seq_last), Kraken sends a
+# checksum of the top of the book and no sequence number at all.
+#
+# A level's identity is which raw record it came from and where in it, so
+# normalizing the same raw log again produces corrections, not duplicates.
 BOOK_EVENTS = Dataset(
     name="book_events",
-    version=1,
+    version=2,
     schema=pa.schema(
         [
             *_HEADER,
@@ -115,25 +135,37 @@ BOOK_EVENTS = Dataset(
             # The venue's own sequence range for the message this level came
             # from. Venues with a single sequence number leave "first" null.
             pa.field("venue_seq_first", pa.int64(), nullable=True),
-            _required("venue_seq_last", pa.int64()),
+            pa.field("venue_seq_last", pa.int64(), nullable=True),
+            # The venue's checksum of its book after this message (unsigned 32-bit).
+            pa.field("checksum", pa.int64(), nullable=True),
+            # Levels per side the venue keeps for this subscription, when it
+            # sends a truncated book. Null means the full book.
+            pa.field("depth", pa.int32(), nullable=True),
+            _required("level_index", pa.int32()),
             _required("side", pa.int8()),  # Side.BUY (bid) or Side.SELL (ask)
             _required("price", pa.int64()),
             _required("qty", pa.int64()),
         ]
     ),
-    key=("kind", "venue_seq_last", "side", "price"),
+    key=("recv_ts", "seq", "level_index"),
     allowed={
+        **_EVENT_TS_SOURCES,
         "kind": frozenset(int(k) for k in BookEventKind),
         "side": frozenset({int(Side.BUY), int(Side.SELL)}),
     },
-    bounds=_TIMESTAMP_BOUNDS,
+    bounds={
+        **_TIMESTAMP_BOUNDS,
+        "level_index": (0, None),
+        "checksum": (0, 2**32 - 1),
+        "depth": (1, None),
+    },
 )
 
 # One row per version of an instrument's metadata. ``event_ts`` is when the
 # version takes effect, so it identifies the version.
 INSTRUMENTS = Dataset(
     name="instruments",
-    version=1,
+    version=2,
     schema=pa.schema(
         [
             *_HEADER,
@@ -144,6 +176,7 @@ INSTRUMENTS = Dataset(
         ]
     ),
     key=("event_ts",),
+    allowed=_EVENT_TS_SOURCES,
     bounds={
         **_TIMESTAMP_BOUNDS,
         "price_exp": (0, MAX_EXP),
@@ -250,7 +283,18 @@ def validate_table(dataset: Dataset, table: pa.Table) -> None:
 
     for name, (low, high) in dataset.bounds.items():
         extremes = pc.min_max(table.column(name)).as_py()
+        if extremes["min"] is None:
+            continue  # the column is entirely null
         if low is not None and extremes["min"] < low:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['min']} is below {low}")
         if high is not None and extremes["max"] > high:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['max']} is above {high}")
+
+    # ADR 0008: a row without a venue timestamp carries its receipt time.
+    receipt = pc.equal(table.column("event_ts_source"), EVENT_TS_RECEIPT)
+    mismatch = pc.and_(receipt, pc.not_equal(table.column("event_ts"), table.column("recv_ts")))
+    if pc.any(mismatch).as_py():
+        raise SchemaError(
+            f"{dataset.name}: a row with event_ts_source 'receipt' must have "
+            "event_ts equal to recv_ts"
+        )

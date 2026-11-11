@@ -48,6 +48,7 @@ def test_views_have_partition_columns_and_stored_columns(session):
         "instrument",
         "date",
         "event_ts",
+        "event_ts_source",
         "recv_ts",
         "knowledge_ts",
         "seq",
@@ -58,9 +59,9 @@ def test_views_have_partition_columns_and_stored_columns(session):
     ]
     assert [(r["venue"], r["instrument"], str(r["date"]), r["trade_id"], r["price"]) for r in
             table.to_pylist()] == [
-        ("binance", "BTCUSDT", "2023-11-14", "a", 150),
-        ("binance", "BTCUSDT", "2023-11-14", "b", 101),
         ("coinbase", "BTC-USD", "2023-11-14", "a", 200),
+        ("kraken", "ETH-USD", "2023-11-14", "a", 150),
+        ("kraken", "ETH-USD", "2023-11-14", "b", 101),
     ]  # fmt: skip
     assert table.schema.field("price").type == pa.int64()
     assert table.schema.field("knowledge_ts").type == pa.int64()
@@ -91,11 +92,11 @@ def test_all_three_views_exist_and_future_rows_are_absent(session):
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
-        ("SELECT price FROM trades WHERE venue = 'binance' ORDER BY price DESC LIMIT 1", [(150,)]),
+        ("SELECT price FROM trades WHERE venue = 'kraken' ORDER BY price DESC LIMIT 1", [(150,)]),
         ("SELECT venue, count(*) FROM trades GROUP BY venue ORDER BY venue",
-         [("binance", 2), ("coinbase", 1)]),
+         [("coinbase", 1), ("kraken", 2)]),
         ("SELECT venue, sum(price * qty) FROM trades GROUP BY ALL HAVING count(*) > 1",
-         [("binance", 25100)]),
+         [("kraken", 25100)]),
         ("SELECT t.trade_id, i.tick_size FROM trades t JOIN instruments i "
          "ON t.venue = i.venue AND t.instrument = i.instrument ORDER BY 1",
          [("a", 1), ("b", 1)]),
@@ -104,14 +105,14 @@ def test_all_three_views_exist_and_future_rows_are_absent(session):
         ("SELECT trade_id FROM trades WHERE price = (SELECT max(price) FROM trades)", [("a",)]),
         ("SELECT count(*) FROM trades WHERE EXISTS (SELECT 1 FROM instruments)", [(3,)]),
         ("SELECT trade_id, row_number() OVER (PARTITION BY venue ORDER BY price) FROM trades "
-         "WHERE venue = 'binance' ORDER BY 2", [("b", 1), ("a", 2)]),
+         "WHERE venue = 'kraken' ORDER BY 2", [("b", 1), ("a", 2)]),
         ("SELECT price FROM trades WHERE venue = 'coinbase' UNION ALL "
          "SELECT tick_size FROM instruments ORDER BY 1", [(1,), (200,)]),
         ("SELECT CASE WHEN price > 120 THEN 'hi' ELSE 'lo' END, CAST(price AS DOUBLE) / 100 "
          "FROM trades WHERE venue = 'coinbase'", [("hi", 2.0)]),
         ("SELECT price FROM trades WHERE price BETWEEN 101 AND 150 AND trade_id IN ('a', 'b') "
          "AND venue IS NOT NULL AND NOT (qty <> 100) ORDER BY price", [(101,), (150,)]),
-        ("SELECT DISTINCT venue FROM trades ORDER BY venue", [("binance",), ("coinbase",)]),
+        ("SELECT DISTINCT venue FROM trades ORDER BY venue", [("coinbase",), ("kraken",)]),
         ("FROM trades SELECT trade_id WHERE venue = 'coinbase'", [("a",)]),
         ("SELECT trade_id FROM TRADES WHERE venue = 'coinbase'", [("a",)]),
         ('SELECT trade_id FROM "trades" WHERE venue = \'coinbase\'', [("a",)]),
@@ -650,12 +651,12 @@ def test_a_file_whose_name_understates_its_knowledge_time_is_still_filtered(root
     from quantagent.data.store import AppendOnlyStore
 
     store = AppendOnlyStore(root, clock=FakeClock(9000))
-    result = store.append(TRADES, "binance", "BTCUSDT", trade_table(("late", T0, 1)))
+    result = store.append(TRADES, "kraken", "ETH-USD", trade_table(("late", T0, 1)))
     disguised = result.files[0].with_name(f"part-{1000:020d}.parquet")
     result.files[0].rename(disguised)  # test-only tampering
 
     with PITSession(root, as_of=5000) as s:
         assert rows(s.sql("SELECT count(*) FROM trades")) == [(0,)]
-        assert s.trades("binance", "BTCUSDT", 0, 2**63 - 1).num_rows == 0
+        assert s.trades("kraken", "ETH-USD", 0, 2**63 - 1).num_rows == 0
     with PITSession(root, as_of=9000) as s:
         assert rows(s.sql("SELECT trade_id FROM trades")) == [("late",)]
