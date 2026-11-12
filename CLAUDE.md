@@ -147,6 +147,12 @@ cd ..
 .venv\Scripts\python -m quantagent.data.recorder --venue kraken --instrument BTC-USD --out data\raw --duration 3600
 .venv\Scripts\python -m quantagent.data.adapters data\raw\kraken\BTC-USD\<file>.qaraw.zst --store data\normalized
 
+# Rebuild an order book from the store and verify it against the venue's rules
+.venv\Scripts\python -m quantagent.data.book verify --store data\normalized --venue kraken --instrument BTC-USD
+
+# Tests over the one-hour recordings in data\raw (not in git; excluded by default)
+.venv\Scripts\python -m pytest python -m local_data
+
 # Data quality report over a date range (exit 1 on any ERROR finding)
 .venv\Scripts\python -m quantagent.data.quality --store data\normalized --start 2026-11-11 --end 2026-11-11
 ```

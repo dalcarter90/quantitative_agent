@@ -35,9 +35,10 @@ quantagent = ["*.pyd", "*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers -m 'not network'"
+addopts = "-ra --strict-markers -m 'not network and not local_data'"
 markers = [
     "network: needs internet access to a venue; excluded from the default run",
+    "local_data: needs the recordings under data/ (not in git); excluded from the default run",
 ]
 
 [tool.ruff]

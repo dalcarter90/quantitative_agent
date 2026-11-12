@@ -29,6 +29,7 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
 | `recorder` | Records public market data into raw logs |
 | `adapters` | Kraken and Coinbase: raw records to rows |
 | `quality` | Data quality checks and the report command |
+| `book` | The reference order book reconstructor (section 8) |
 
 ## 1. Representation
 
@@ -281,3 +282,39 @@ network and processing delay was roughly 40 to 90 ms. There is no look-ahead
 (data appears known later than it was), but lag and latency figures from this
 data are wrong by the offset. The timestamps are left as recorded, and these
 sessions report `clock_not_recorded`.
+
+## 8. Reference order book
+
+`quantagent.data.book` rebuilds an instrument's L2 book from its stored book
+events and stream events, and is the oracle the C++ order book is checked
+against (roadmap Phase 2). It favors being obviously correct over speed.
+
+```
+python -m quantagent.data.book verify --store data/normalized --venue kraken --instrument BTC-USD
+python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE
+```
+
+- Snapshots replace the book; updates apply level by level in `level_index`
+  order, and quantity 0 removes a level. Kraken books are cut to the
+  subscribed depth after every message.
+- **Integrity, per venue.** Kraken: the reconstructor computes the CRC32 of
+  the ten best levels per side after every message and compares it with the
+  venue's. Coinbase: book message numbers must increase, and gaps come from
+  the stored `SEQUENCE_*` events (heartbeats and trades share the
+  numbering, so gaps are invisible in book messages alone). For both venues
+  a stored `CHECKSUM_MISMATCH`, `SEQUENCE_*` or `MESSAGE_REJECTED` event on
+  the stream raises, and a new session or connection means the next message
+  must be a snapshot.
+- **It raises; it never repairs.** `DeltaBeforeSnapshot`, `ChecksumMismatch`,
+  `SequenceBreak` and `StreamFault` carry the raw record (`recv_ts`, `seq`)
+  and the values involved.
+- **Check snapshots** are compared with the book rebuilt up to the last
+  stream message whose venue time is at or before the snapshot's, level by
+  level within the snapshot's depth.
+- **What it cannot see:** a lost Kraken update that does not touch the ten
+  best levels before it is overwritten, and a repeated Kraken update (the
+  quantities are absolute, so the book does not change).
+
+The golden files in `python/tests/fixtures/golden/` hold the top 20 levels
+per side after every stream message of each fixture; their README gives the
+format.
