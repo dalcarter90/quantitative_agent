@@ -85,6 +85,7 @@ thread.
 with PITSession(store_root, as_of=t) as s:   # as_of is a required keyword, no default
     s.trades(venue, instrument, start, end)  # only rows with knowledge_ts <= t
     s.book_events(venue, instrument, start, end)
+    s.stream_events(venue, instrument, start, end)  # gaps, reconnects, checksum mismatches
     s.instruments(venue, instrument)         # every metadata version known at t
     s.instrument(venue, instrument, at=u)    # the version in effect at u, as known at t
     s.sql("SELECT ... FROM trades ...")      # one SELECT over the same views
@@ -288,7 +289,7 @@ Details and alternatives are in ADR 0006.
 | Tier | Content | Format | Used by |
 |------|---------|--------|---------|
 | Raw log | Exact bytes received, with `recv_ts` and `seq` | Append-only length-prefixed binary, zstd per segment | Replay engine, normalizer. Never rewritten |
-| Normalized store | Trades, book events, bars, instrument metadata, all three timestamps | Parquet, partitioned by venue/instrument/date, integer mantissas | `PITSession`, via DuckDB |
+| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps; bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/date, integer mantissas | `PITSession`, via DuckDB |
 | Journal | Every hot-path decision, order, risk result and fill | Append-only fixed-record binary | Reconciliation, audit, monitoring |
 | Experiment registry | Hypotheses, configs, results, trial counts | DuckDB/SQLite file | Validation harness, agent |
 | Audit log | Every agent tool call with its reasoning | Append-only JSON lines | Humans |

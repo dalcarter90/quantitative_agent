@@ -28,7 +28,13 @@ from typing import Any
 
 from quantagent.data.fixedpoint import to_mantissa
 from quantagent.data.rawlog import RawRecord, read_raw_log
-from quantagent.data.schema import DATASETS, EVENT_TS_RECEIPT, EVENT_TS_VENUE, table_from_rows
+from quantagent.data.schema import (
+    DATASETS,
+    EVENT_TS_RECEIPT,
+    EVENT_TS_VENUE,
+    StreamEventKind,
+    table_from_rows,
+)
 from quantagent.data.store import AppendOnlyStore, _check_name
 
 Row = dict[str, Any]
@@ -39,6 +45,12 @@ STREAM_CHANNEL = "ws"
 PROBE_CHANNEL = "probe"
 _CONTROL_EVENTS = {"start", "connect", "subscribe", "disconnect", "rest", "stop"}
 _MAX_DEPTH = 100_000
+_MAX_EVENT_DETAIL = 200
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
 
 _RFC3339 = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z"
@@ -102,6 +114,7 @@ class Report:
     rows: Counter = field(default_factory=Counter)  # rows per dataset
     rejects: list[Reject] = field(default_factory=list)
     sequence_anomalies: list[SequenceAnomaly] = field(default_factory=list)
+    events: Counter = field(default_factory=Counter)  # stream events by kind name
     truncated: bool = False  # the raw log ended in a partial record
 
     @property
@@ -117,6 +130,7 @@ class Report:
             f"rows: {listed(self.rows)}",
             f"rejected: {listed(self.rejected)}",
             f"sequence anomalies: {len(self.sequence_anomalies)}",
+            f"checksum mismatches: {self.events['CHECKSUM_MISMATCH']}",
         ]
         if self.truncated:
             lines.append("the raw log ended in a partial record")
@@ -229,6 +243,27 @@ class VenueAdapter:
         self.start_depth: int | None = None
         self.exponents: tuple[int, int] | None = None  # (price_exp, qty_exp) in force
         self.anomalies: list[SequenceAnomaly] = []
+        self.events: list[Row] = []  # stream events noticed while handling a record
+
+    def note(
+        self,
+        kind: StreamEventKind,
+        *,
+        connection: str | None = None,
+        expected: int | None = None,
+        observed: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Record a stream event for the record being handled (ADR 0010)."""
+        self.events.append(
+            {
+                "kind": kind,
+                "connection": connection,
+                "expected": expected,
+                "observed": observed,
+                "detail": detail,
+            }
+        )
 
     def handle(self, record: RawRecord) -> Handled:
         if record.channel == CONTROL_CHANNEL:
@@ -256,8 +291,26 @@ class VenueAdapter:
             self.instrument, self.symbol = message["instrument"], symbol
             self.start_depth = checked_depth(depth)
             self.exponents = None
+            about = {k: message.get(k) for k in ("symbol", "depth", "recorder_version")}
+            self.note(StreamEventKind.SESSION_START, detail=_compact(about))
+        elif event == "stop":
+            self.note(StreamEventKind.SESSION_STOP)
         elif event == "connect":
-            self.on_connect(str(message["connection"]))
+            connection = str(message["connection"])
+            self.on_connect(connection)
+            self.note(StreamEventKind.CONNECT, connection=connection, detail=message.get("url"))
+        elif event == "subscribe":
+            self.note(
+                StreamEventKind.SUBSCRIBE_REQUEST,
+                connection=str(message["connection"]),
+                detail=_compact(message.get("request")),
+            )
+        elif event == "disconnect":
+            self.note(
+                StreamEventKind.DISCONNECT,
+                connection=str(message["connection"]),
+                detail=str(message.get("reason")),
+            )
         return ignored(f"recorder.{event}")
 
     def require_session(self) -> None:
@@ -293,8 +346,8 @@ class Normalizer:
     def feed(self, record: RawRecord) -> None:
         report = self.report
         report.records += 1
+        adapter = self._adapters.get(record.venue)
         try:
-            adapter = self._adapters.get(record.venue)
             if adapter is None:
                 if record.venue not in self._registry:
                     raise Rejected("unknown_venue", record.venue)
@@ -306,11 +359,12 @@ class Normalizer:
                     report.sequence_anomalies.extend(adapter.anomalies)
                     adapter.anomalies.clear()
         except Rejected as refused:
-            self._reject(record, refused.reason, refused.detail)
+            self._reject(record, adapter, refused.reason, refused.detail)
             return
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
-            self._reject(record, "malformed_message", f"{type(error).__name__}: {error}")
+            self._reject(record, adapter, "malformed_message", f"{type(error).__name__}: {error}")
             return
+        self._store_events(record, adapter)
 
         report.outcomes[outcome] += 1
         if outcome == "ignored":
@@ -323,11 +377,45 @@ class Normalizer:
             report.rows[dataset_name] += 1
         self.pending_rows += len(rows)
 
-    def _reject(self, record: RawRecord, reason: str, detail: str) -> None:
+    def _reject(
+        self, record: RawRecord, adapter: VenueAdapter | None, reason: str, detail: str
+    ) -> None:
         self.report.outcomes["rejected"] += 1
         self.report.rejects.append(
             Reject(record.seq, record.recv_ts, record.channel, reason, detail or reason)
         )
+        if adapter is not None:
+            # A record that could not be normalized is a hole in the stream.
+            adapter.note(
+                StreamEventKind.MESSAGE_REJECTED,
+                connection=record.channel,
+                detail=f"{reason}: {detail}"[:_MAX_EVENT_DETAIL],
+            )
+            self._store_events(record, adapter)
+
+    def _store_events(self, record: RawRecord, adapter: VenueAdapter) -> None:
+        """Turn the events the adapter noted for ``record`` into stream_events rows."""
+        if not adapter.events:
+            return
+        noted, adapter.events = adapter.events, []
+        if adapter.instrument is None:
+            return  # before any session start there is no partition to put them in
+        key = ("stream_events", record.venue, adapter.instrument)
+        rows = self._rows.setdefault(key, [])
+        for index, event in enumerate(noted):
+            rows.append(
+                {
+                    "event_ts": record.recv_ts,
+                    "event_ts_source": EVENT_TS_RECEIPT,
+                    "recv_ts": record.recv_ts,
+                    "seq": record.seq,
+                    "event_index": index,
+                    **event,
+                }
+            )
+            self.report.events[event["kind"].name] += 1
+        self.report.rows["stream_events"] += len(noted)
+        self.pending_rows += len(noted)
 
     def take_rows(self) -> dict[RowKey, list[Row]]:
         """Return the rows produced since the last call and forget them."""
@@ -344,7 +432,7 @@ def normalize(records: Iterable[RawRecord]) -> Normalized:
     return Normalized(rows=normalizer.take_rows(), report=normalizer.report)
 
 
-_APPEND_ORDER = {"instruments": 0, "trades": 1, "book_events": 2}
+_APPEND_ORDER = {"instruments": 0, "trades": 1, "book_events": 2, "stream_events": 3}
 
 
 def ingest(

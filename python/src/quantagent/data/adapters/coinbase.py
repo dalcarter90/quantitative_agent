@@ -21,6 +21,7 @@ before this was written
 - Prices and sizes are decimal strings.
 """
 
+import json
 from typing import Any
 
 from quantagent.data.adapters.base import (
@@ -42,7 +43,7 @@ from quantagent.data.adapters.base import (
 )
 from quantagent.data.fixedpoint import to_mantissa
 from quantagent.data.rawlog import RawRecord
-from quantagent.data.schema import BookEventKind, Side
+from quantagent.data.schema import BookEventKind, Side, StreamEventKind
 
 PRODUCT_CHANNEL = "rest:product"
 _BOOK_KINDS = {
@@ -52,6 +53,11 @@ _BOOK_KINDS = {
 }
 _BOOK_SIDES = {"bid": Side.BUY, "offer": Side.SELL}
 _AGGRESSOR_FOR_MAKER = {"BUY": Side.SELL, "SELL": Side.BUY}
+_SEQUENCE_EVENTS = {
+    "gap": StreamEventKind.SEQUENCE_GAP,
+    "repeat": StreamEventKind.SEQUENCE_REPEAT,
+    "out_of_order": StreamEventKind.SEQUENCE_OUT_OF_ORDER,
+}
 
 
 class CoinbaseAdapter(VenueAdapter):
@@ -80,7 +86,15 @@ class CoinbaseAdapter(VenueAdapter):
             self._track_sequence(record, message["sequence_num"])
         if channel == "error":
             raise Rejected("venue_error", str(message.get("events")))
-        if channel in ("subscriptions", "heartbeats"):
+        if channel == "subscriptions":
+            confirmed = as_object(as_list(message["events"], "events")[0], "event")
+            self.note(
+                StreamEventKind.SUBSCRIPTION_ACK,
+                connection=record.channel,
+                detail=json.dumps(confirmed.get("subscriptions"), separators=(",", ":")),
+            )
+            return ignored(channel)
+        if channel == "heartbeats":
             return ignored(channel)
         if channel == "l2_data":
             return self._book(record, message)
@@ -98,6 +112,12 @@ class CoinbaseAdapter(VenueAdapter):
                 SequenceAnomaly(
                     kind, record.channel, last + 1, received, record.seq, record.recv_ts
                 )
+            )
+            self.note(
+                _SEQUENCE_EVENTS[kind],
+                connection=record.channel,
+                expected=last + 1,
+                observed=received,
             )
         if last is None or received > last:
             self._last_sequence[record.channel] = received
@@ -174,8 +194,9 @@ class CoinbaseAdapter(VenueAdapter):
             kind = as_object(event, "event").get("type")
             if kind not in ("snapshot", "update"):
                 raise Rejected("unknown_message", f"market_trades event type {kind!r}")
-            if kind == "snapshot":
+            if kind == "snapshot" and name != "snapshot":
                 name = "snapshot"
+                self.note(StreamEventKind.TRADE_BACKFILL, connection=record.channel)
             for trade in as_list(event["trades"], "trades"):
                 self.require_symbol(as_object(trade, "trade")["product_id"])
                 price_exp, qty_exp = self.require_exponents()

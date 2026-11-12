@@ -19,10 +19,11 @@ confirms it.
 | [0003](0003-build-system.md) | CMake presets + vcpkg manifest | Accepted |
 | [0004](0004-queue-design.md) | In-house bounded SPSC ring buffer | Accepted |
 | [0005](0005-price-and-time-representation.md) | int64 mantissa with per-instrument exponent; int64 ns timestamps | Accepted, amended by 0008 |
-| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted, amended by 0009 |
+| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted, amended by 0009 and 0010 |
 | [0007](0007-agent-tool-permissions.md) | Allow-listed tool server, structurally enforced | Accepted |
 | [0008](0008-event-ts-without-venue-timestamp.md) | `event_ts` holds `recv_ts` when the venue gives no timestamp; `event_ts_source` records which | Accepted |
-| [0009](0009-venue-neutral-book-events.md) | Kraken as second venue; book events keyed by raw record, with optional per-venue integrity columns | Accepted, schema part awaiting owner review |
+| [0009](0009-venue-neutral-book-events.md) | Kraken as second venue; book events keyed by raw record, with optional per-venue integrity columns | Accepted, amended by 0010 |
+| [0010](0010-stream-events.md) | `stream_events`: integrity events for every venue, written by the adapters, read through `PITSession` | Accepted, additions awaiting owner review |
 
 ## Template
 

@@ -71,8 +71,9 @@ def instrument_row(**overrides):
 ROW_FACTORIES = {"trades": trade_row, "book_events": book_row, "instruments": instrument_row}
 
 
-def test_the_three_datasets_are_registered():
-    assert set(DATASETS) == {"trades", "book_events", "instruments"}
+def test_the_datasets_are_registered():
+    # stream_events (ADR 0010) has its own tests in test_stream_events.py.
+    assert set(DATASETS) == {"trades", "book_events", "instruments", "stream_events"}
     assert DATASETS["trades"] is TRADES
     assert DATASETS["book_events"] is BOOK_EVENTS
     assert DATASETS["instruments"] is INSTRUMENTS
