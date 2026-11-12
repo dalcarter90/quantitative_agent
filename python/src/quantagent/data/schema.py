@@ -65,6 +65,13 @@ class StreamEventKind(IntEnum):
     # trades observed as they happened. Their receipt time says nothing about
     # when they occurred.
     TRADE_BACKFILL = 6
+    # The recording clock's offset from NTP time, measured at session start
+    # (ADR 0011). observed is the offset in ns (positive: the clock was ahead),
+    # or null if it could not be measured; expected is the limit in force.
+    CLOCK_OFFSET = 7
+    # The recorder was run with --allow-clock-offset; detail says whether the
+    # offset was within the limit, above it, or not measured.
+    CLOCK_OVERRIDE = 8
     SEQUENCE_GAP = 10  # expected and observed hold the venue's sequence numbers
     SEQUENCE_REPEAT = 11
     SEQUENCE_OUT_OF_ORDER = 12

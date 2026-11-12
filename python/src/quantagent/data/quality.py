@@ -13,6 +13,8 @@ The checks:
 - ``check_stream_integrity``: what the adapters recorded about the stream
   itself (ADR 0010): lost, repeated or reordered messages, checksum
   mismatches, messages that could not be normalized, dropped connections.
+- ``check_recording_clock``: whether each recording session's clock was
+  measured, and whether it was within the limit (ADR 0011).
 - ``check_clock_skew``: receive time minus venue time outside a band, and
   venue time running backwards within a stream.
 - ``check_crossed_books``: a book snapshot whose best bid is at or above its
@@ -102,6 +104,8 @@ class QualityConfig:
     outlier_window: int = 50
     outlier_min_trades: int = 20
     outlier_bps: int = 500
+    # A recording session whose clock was further than this from NTP time.
+    max_clock_offset_ns: int = 250_000_000
     max_findings: int = 1000  # per check and instrument
 
     def __post_init__(self) -> None:
@@ -111,7 +115,7 @@ class QualityConfig:
                 raise ValueError(f"{item.name} must be an integer, got {value!r}")
         if self.min_lag_ns > self.max_lag_ns:
             raise ValueError("min_lag_ns must not exceed max_lag_ns")
-        for name in ("max_backwards_ns", "outlier_bps"):
+        for name in ("max_backwards_ns", "outlier_bps", "max_clock_offset_ns"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative")
         for name in ("outlier_window", "outlier_min_trades", "max_findings"):
@@ -282,6 +286,102 @@ def check_stream_integrity(
             )
         elif kind == StreamEventKind.MESSAGE_REJECTED:
             add(Severity.ERROR, "message_rejected", f"on {connection}: {detail}")
+    return scope.result()
+
+
+# --- recording clock --------------------------------------------------------------------
+
+
+def check_recording_clock(
+    session: PITSession, venue: str, instrument: str, start: int, end: int, config: QualityConfig
+) -> CheckResult:
+    """Each recording session's clock, as the recorder measured it (ADR 0011).
+
+    An offset beyond ``max_clock_offset_ns`` is an error: every ``recv_ts``
+    and ``knowledge_ts`` of that session is off by about that much. A session
+    whose clock could not be measured is a warning; one recorded before clocks
+    were measured at all is reported as information. Use of the recorder's
+    override is always reported.
+    """
+    scope = _Scope("recording_clock", session, venue, instrument, start, end, config)
+    kinds = (
+        StreamEventKind.SESSION_START,
+        StreamEventKind.CLOCK_OFFSET,
+        StreamEventKind.CLOCK_OVERRIDE,
+    )
+    events = [
+        event
+        for event in session.stream_events(venue, instrument, start, end).to_pylist()
+        if event["kind"] in kinds
+    ]
+
+    sessions: list[dict[str, Any]] = []
+    for event in events:
+        kind = StreamEventKind(event["kind"])
+        if kind == StreamEventKind.SESSION_START:
+            sessions.append({"start": event, "clock": None, "override": None})
+            continue
+        if not sessions:  # the range begins inside a session
+            sessions.append({"start": None, "clock": None, "override": None})
+        slot = "clock" if kind == StreamEventKind.CLOCK_OFFSET else "override"
+        sessions[-1][slot] = event
+
+    measured_offsets = []
+    for found in sessions:
+        clock, override = found["clock"], found["override"]
+        if clock is None:
+            if found["start"] is not None:
+                begin = found["start"]
+                scope.add(
+                    Severity.INFO,
+                    "clock_not_recorded",
+                    "stream_events",
+                    begin["recv_ts"],
+                    begin["seq"],
+                    "this session was recorded before the clock was measured, so its "
+                    "recv_ts may be off by an unknown amount (docs/data-core.md, section 7)",
+                )
+        elif clock["observed"] is None:
+            scope.add(
+                Severity.WARNING,
+                "clock_unmeasured",
+                "stream_events",
+                clock["recv_ts"],
+                clock["seq"],
+                "the recording clock could not be measured at session start",
+            )
+        else:
+            offset = clock["observed"]
+            measured_offsets.append(abs(offset))
+            if abs(offset) > config.max_clock_offset_ns:
+                note = "; the session was recorded with the override" if override else ""
+                scope.add(
+                    Severity.ERROR,
+                    "clock_offset_exceeded",
+                    "stream_events",
+                    clock["recv_ts"],
+                    clock["seq"],
+                    f"the recording clock was {offset / 1e6:+.1f} ms from NTP time (positive: "
+                    f"ahead), beyond the {config.max_clock_offset_ns / 1e6:.1f} ms limit; "
+                    f"recv_ts and knowledge_ts are off by about that much{note}",
+                )
+        if override is not None:
+            scope.add(
+                Severity.INFO,
+                "clock_override",
+                "stream_events",
+                override["recv_ts"],
+                override["seq"],
+                f"recorded with --allow-clock-offset ({override['detail']})",
+            )
+
+    scope.stats = {
+        "sessions": sum(found["start"] is not None for found in sessions),
+        "measured": len(measured_offsets),
+        "overridden": sum(found["override"] is not None for found in sessions),
+    }
+    if measured_offsets:
+        scope.stats["max_abs_offset_ns"] = max(measured_offsets)
     return scope.result()
 
 
@@ -553,6 +653,7 @@ def check_outliers(
 
 CHECKS: tuple[Check, ...] = (
     check_stream_integrity,
+    check_recording_clock,
     check_clock_skew,
     check_crossed_books,
     check_outliers,

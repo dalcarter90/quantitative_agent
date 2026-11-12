@@ -43,7 +43,7 @@ RowKey = tuple[str, str, str]  # (dataset name, venue, instrument)
 CONTROL_CHANNEL = "recorder"
 STREAM_CHANNEL = "ws"
 PROBE_CHANNEL = "probe"
-_CONTROL_EVENTS = {"start", "connect", "subscribe", "disconnect", "rest", "stop"}
+_CONTROL_EVENTS = {"start", "clock", "connect", "subscribe", "disconnect", "rest", "stop"}
 _MAX_DEPTH = 100_000
 _MAX_EVENT_DETAIL = 200
 
@@ -295,6 +295,8 @@ class VenueAdapter:
             self.note(StreamEventKind.SESSION_START, detail=_compact(about))
         elif event == "stop":
             self.note(StreamEventKind.SESSION_STOP)
+        elif event == "clock":
+            self._clock(message)
         elif event == "connect":
             connection = str(message["connection"])
             self.on_connect(connection)
@@ -312,6 +314,32 @@ class VenueAdapter:
                 detail=str(message.get("reason")),
             )
         return ignored(f"recorder.{event}")
+
+    def _clock(self, message: dict) -> None:
+        """The clock offset the recorder measured at session start (ADR 0011)."""
+        offset, limit = message["offset_ns"], message["limit_ns"]
+        override, servers = message["override"], message["servers"]
+        if offset is not None and type(offset) is not int:
+            raise TypeError(f"clock offset_ns is not an integer: {offset!r}")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError(f"clock limit_ns is not a positive integer: {limit!r}")
+        if type(override) is not bool:
+            raise TypeError(f"clock override is not a boolean: {override!r}")
+        servers = as_list(servers, "clock servers")
+        self.note(
+            StreamEventKind.CLOCK_OFFSET,
+            expected=limit,
+            observed=offset,
+            detail=_compact({"servers": servers}),
+        )
+        if override:
+            if offset is None:
+                reason = "offset not measured"
+            elif abs(offset) <= limit:
+                reason = "offset within limit"
+            else:
+                reason = "offset above limit"
+            self.note(StreamEventKind.CLOCK_OVERRIDE, detail=reason)
 
     def require_session(self) -> None:
         if self.symbol is None:

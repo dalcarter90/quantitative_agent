@@ -25,6 +25,7 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
 | `store` | `AppendOnlyStore`, the only writer |
 | `session`, `sqlguard` | `PITSession`, the only reader, and its SQL allow-list |
 | `rawlog` | The raw capture log |
+| `clock` | Measures the recording clock against NTP servers |
 | `recorder` | Records public market data into raw logs |
 | `adapters` | Kraken and Coinbase: raw records to rows |
 | `quality` | Data quality checks and the report command |
@@ -70,9 +71,10 @@ taken on a second connection; it is not part of the update stream.
 
 `stream_events` kinds: `SESSION_START`, `SESSION_STOP`, `CONNECT`,
 `DISCONNECT`, `SUBSCRIBE_REQUEST`, `SUBSCRIPTION_ACK`, `TRADE_BACKFILL`,
-`SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
+`CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
 `CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`. ADR 0010 lists what each means and
-what `expected`, `observed` and `detail` hold for it.
+what `expected`, `observed` and `detail` hold for it; ADR 0011 the two clock
+kinds.
 
 The schema rejects structural errors only: wrong types, nulls in required
 columns, unknown enum values, negative timestamps, invalid metadata, and a
@@ -152,14 +154,18 @@ unsealed log is dropped and reported; any other damage raises.
 
 ```
 python -m quantagent.data.recorder --venue kraken --instrument BTC-USD \
-    --out data/raw --duration 3600 --probe-interval 600 --depth 25
+    --out data/raw --duration 3600 --probe-interval 600 --depth 25 \
+    [--allow-clock-offset]
 ```
 
-Public market data only; no API keys are read or sent. Raw log channels:
+Public market data only; no API keys are read or sent. Before contacting the
+venue the recorder measures its clock (section 7) and refuses to start, with
+exit status 2, if the offset is above 250 ms or cannot be measured, unless
+`--allow-clock-offset` is given. Raw log channels:
 `ws` (the stream), `probe` (a fresh book snapshot from a short second
 connection every probe interval), `rest:product` (Coinbase metadata) and
-`recorder` (JSON control records: start, connect, subscribe, disconnect,
-rest, stop).
+`recorder` (JSON control records: start, clock, connect, subscribe,
+disconnect, rest, stop).
 
 ### Adapters
 
@@ -207,6 +213,9 @@ the cap was hit.
 
 | Check | Finds | Severity |
 |-------|-------|----------|
+| `recording_clock` | A session whose clock offset was above `max_clock_offset_ns` (`clock_offset_exceeded`) | ERROR |
+| | A session whose clock could not be measured (`clock_unmeasured`) | WARNING |
+| | A session recorded before clocks were measured (`clock_not_recorded`); any use of `--allow-clock-offset` (`clock_override`) | INFO |
 | `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected` | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
 | | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
@@ -224,6 +233,7 @@ an error):
 | `min_lag_ns`, `max_lag_ns` | −0.5 s, 10 s |
 | `max_backwards_ns` | 0 |
 | `outlier_window`, `outlier_min_trades`, `outlier_bps` | 50, 20, 500 |
+| `max_clock_offset_ns` | 250 ms |
 | `max_findings` | 1000 |
 
 What the checks cannot see:
@@ -231,27 +241,43 @@ What the checks cannot see:
 - **A crossed book between snapshots.** No top-of-book quotes are stored, and
   an update alone cannot be judged. Checking the book after every update
   needs it rebuilt: the Phase 2 reconstructor does that.
-- **A wrong recording clock.** A clock that is steadily fast or slow shifts
-  every lag by the same amount and stays inside the band (section 7).
+- **A wrong recording clock, from the data alone.** A clock that is steadily
+  fast or slow shifts every lag by the same amount and stays inside the
+  `clock_skew` band. `recording_clock` catches it only through the offset the
+  recorder measured (section 7), and only at session start.
 - **Lost Kraken updates the checksum misses** (section 5), and anything in a
   period that was not recorded.
 
 ## 7. Clock accuracy
 
-`recv_ts` and `knowledge_ts` come from the recording machine's wall clock.
-The machine that recorded the Phase 1c data had its Windows Time service
-stopped, and its clock ran about 1.4 s ahead during the recordings
-(measured from Coinbase's per-message send times: no message arrived sooner
-than 1,398 ms after it was sent, over routes with 20 to 50 ms round trips)
-and about 1.2 s ahead a day later (measured against four NTP servers). The
-median lags in the quality report, about 1.48 s, are mostly this offset.
+`recv_ts` and `knowledge_ts` come from the recording machine's wall clock, so
+they assume that clock is synchronized to NTP (ADR 0011).
 
-Effects on the stored data:
+**What the recorder does.** Before contacting a venue it measures its offset
+(`clock.measure_offset`): three SNTP samples from each of four servers run by
+independent operators, the fastest reply per server, the median across
+servers, and at least two servers must answer. The offset is this clock minus
+NTP time, so positive means the clock is ahead and timestamps are late. Above
+250 ms, or if it cannot be measured, the recorder refuses to start unless run
+with `--allow-clock-offset`. Either way the measurement is written into the
+raw log right after the session start and becomes a `CLOCK_OFFSET` stream
+event, and any use of the override a `CLOCK_OVERRIDE` event. The
+`recording_clock` quality check reports both.
 
-- No look-ahead: a fast clock makes data appear known *later* than it was.
-- Latency and lag statistics are wrong by the offset, and the offset drifts.
-- `recv_ts` from different machines, or from this machine at different
-  times, cannot be compared to better than the offset.
+**Known offsets in existing data.** The Phase 1c recordings (the one-hour
+logs of 2026-11-11 03:09 to 04:10 UTC, and the committed 150-second fixtures
+of 03:06 to 03:09 UTC) were made before this check existed, on a machine with
+its Windows Time service stopped. Their clock was **about 1.4 s ahead**:
 
-Recording should happen on a machine whose clock is synchronized; the roadmap
-records the open decision on how to enforce that.
+- no Coinbase message arrived sooner than 1,398 ms after Coinbase's own send
+  timestamp, over routes with 20 to 50 ms round trips;
+- when the time service was started, at 2026-11-12 00:13:43 UTC, the system
+  event log shows the clock stepped back by 1.241 s (it had drifted in
+  between).
+
+So their `recv_ts` and `knowledge_ts` are about 1.4 s late, and the ~1.48 s
+median lag the quality report shows for them is mostly this offset; the true
+network and processing delay was roughly 40 to 90 ms. There is no look-ahead
+(data appears known later than it was), but lag and latency figures from this
+data are wrong by the offset. The timestamps are left as recorded, and these
+sessions report `clock_not_recorded`.

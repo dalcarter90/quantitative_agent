@@ -7,8 +7,20 @@ import json
 import pytest
 
 from quantagent.data import recorder
+from quantagent.data.clock import ClockMeasurement, ServerSample
 from quantagent.data.rawlog import read_raw_log
-from quantagent.data.recorder import VENUES, record
+from quantagent.data.recorder import VENUES, ClockOffsetError, record
+
+MS = 1_000_000
+
+
+def clock_at(offset_ns, servers=2):
+    """A clock measurement as the recorder would get it from NTP."""
+    samples = tuple(ServerSample(f"ntp{i}", offset_ns, 20 * MS, None) for i in range(servers))
+    return lambda: ClockMeasurement(offset_ns=offset_ns, samples=samples)
+
+
+GOOD_CLOCK = clock_at(3 * MS)
 
 
 class FakeSocket:
@@ -39,7 +51,16 @@ KRAKEN_SNAPSHOT = '{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/US
 KRAKEN_UPDATE = '{"channel":"book","type":"update","data":[]}'
 
 
-def run_kraken(tmp_path, main_sockets, *, duration=0.5, probe_interval=0.12, reconnects=False):
+def run_kraken(
+    tmp_path,
+    main_sockets,
+    *,
+    duration=0.5,
+    probe_interval=0.12,
+    reconnects=False,
+    measure_clock=GOOD_CLOCK,
+    allow_clock_offset=False,
+):
     """Run the recorder against scripted sockets.
 
     The first connection is the main stream. Later connections are probes,
@@ -72,6 +93,8 @@ def run_kraken(tmp_path, main_sockets, *, duration=0.5, probe_interval=0.12, rec
             connect=connect,
             fetch=no_rest,
             reconnect_delay=0.01,
+            measure_clock=measure_clock,
+            allow_clock_offset=allow_clock_offset,
         )
     )
     return path, list(read_raw_log(path)), probes
@@ -158,7 +181,8 @@ def test_recording_writes_control_records_then_every_message_in_order(tmp_path):
         "recorder_version": 0,
     }
     assert events[-1] == {"event": "stop"}
-    assert events[1] == {"event": "connect", "connection": "ws", "url": "wss://ws.kraken.com/v2"}
+    assert events[1]["event"] == "clock"
+    assert events[2] == {"event": "connect", "connection": "ws", "url": "wss://ws.kraken.com/v2"}
     subscribed = [
         e["request"] for e in events if e["event"] == "subscribe" and e["connection"] == "ws"
     ]
@@ -231,6 +255,7 @@ def test_coinbase_metadata_is_fetched_before_connecting(tmp_path):
             connect=lambda url, **options: main,
             fetch=fetch,
             reconnect_delay=0.01,
+            measure_clock=GOOD_CLOCK,
         )
     )
     records = list(read_raw_log(path))
@@ -238,7 +263,7 @@ def test_coinbase_metadata_is_fetched_before_connecting(tmp_path):
     channels = [r.channel for r in records]
     assert channels.index("rest:product") < channels.index("ws")
     assert next(r.payload for r in records if r.channel == "rest:product") == body
-    assert controls(records)[1] == {"event": "rest", "channel": "rest:product", "url": fetched[0]}
+    assert controls(records)[2] == {"event": "rest", "channel": "rest:product", "url": fetched[0]}
 
 
 def test_recv_ts_is_taken_when_each_message_arrives(tmp_path):
@@ -253,8 +278,97 @@ def test_recv_ts_is_taken_when_each_message_arrives(tmp_path):
 @pytest.mark.parametrize("venue", sorted(VENUES))
 def test_live_capture_smoke(tmp_path, venue):
     path = asyncio.run(
+        # Uses the real NTP measurement: this refuses to run on a bad clock.
         record(VENUES[venue], "BTC-USD", tmp_path, duration=6, probe_interval=3, depth=10)
     )
     records = list(read_raw_log(path))
     assert sum(r.channel == "ws" for r in records) > 5
     assert any(r.channel == "probe" for r in records)
+
+
+# --- the recording clock (ADR 0011) -------------------------------------------------------
+
+
+def test_the_clock_offset_is_recorded_right_after_the_session_start(tmp_path):
+    _, records, _ = run_kraken(tmp_path, [FakeSocket([KRAKEN_SNAPSHOT])])
+    events = controls(records)
+    assert [e["event"] for e in events[:3]] == ["start", "clock", "connect"]
+    assert events[1] == {
+        "event": "clock",
+        "offset_ns": 3 * MS,
+        "limit_ns": 250 * MS,
+        "within_limit": True,
+        "override": False,
+        "servers": [
+            {"host": "ntp0", "offset_ns": 3 * MS, "round_trip_ns": 20 * MS},
+            {"host": "ntp1", "offset_ns": 3 * MS, "round_trip_ns": 20 * MS},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "measure",
+    [clock_at(251 * MS), clock_at(-1400 * MS), clock_at(None, servers=0)],
+    ids=["ahead", "behind", "unmeasured"],
+)
+def test_the_recorder_refuses_to_start_with_a_bad_or_unknown_clock(tmp_path, measure):
+    connected = []
+
+    def connect(url, **options):
+        connected.append(url)
+        return FakeSocket([KRAKEN_SNAPSHOT])
+
+    with pytest.raises(ClockOffsetError, match="--allow-clock-offset"):
+        asyncio.run(
+            record(
+                VENUES["kraken"],
+                "BTC-USD",
+                tmp_path,
+                duration=0.2,
+                probe_interval=10,
+                depth=25,
+                connect=connect,
+                fetch=lambda url: b"{}",
+                measure_clock=measure,
+            )
+        )
+    assert connected == []  # nothing was contacted
+    assert not any(p.is_file() for p in tmp_path.rglob("*"))  # and nothing was written
+
+
+def test_the_override_records_a_bad_clock_and_says_so(tmp_path):
+    _, records, _ = run_kraken(
+        tmp_path,
+        [FakeSocket([KRAKEN_SNAPSHOT])],
+        measure_clock=clock_at(-1400 * MS),
+        allow_clock_offset=True,
+    )
+    clock = controls(records)[1]
+    assert (clock["event"], clock["offset_ns"], clock["within_limit"], clock["override"]) == (
+        "clock",
+        -1400 * MS,
+        False,
+        True,
+    )
+    assert any(r.channel == "ws" for r in records)
+
+
+def test_the_override_is_recorded_even_when_it_was_not_needed(tmp_path):
+    _, records, _ = run_kraken(tmp_path, [FakeSocket([KRAKEN_SNAPSHOT])], allow_clock_offset=True)
+    clock = controls(records)[1]
+    assert (clock["within_limit"], clock["override"]) == (True, True)
+
+
+def test_the_command_line_refuses_and_exits_2_without_writing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(recorder, "measure_offset", clock_at(900 * MS))
+    arguments = ["--venue", "kraken", "--instrument", "BTC-USD", "--out", str(tmp_path)]
+    assert recorder.main(arguments) == 2
+    error = capsys.readouterr().err
+    assert "900.0 ms" in error and "250 ms" in error and "--allow-clock-offset" in error
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_limit_cannot_be_changed_from_the_command_line():
+    parser_help = recorder.build_parser().format_help()
+    assert "--allow-clock-offset" in parser_help
+    assert "offset-ms" not in parser_help and "max-clock" not in parser_help

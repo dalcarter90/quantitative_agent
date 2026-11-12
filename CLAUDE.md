@@ -61,7 +61,7 @@ If a task seems to require breaking one of these, stop and ask the owner.
 ## How to work
 
 - **One roadmap phase per session**, in order (Phase 1 is split into 1a to
-  1d; each is one session). Start by reading the phase's acceptance criteria. Do not begin a phase whose prerequisites are unmet.
+  1e; each is one session). Start by reading the phase's acceptance criteria. Do not begin a phase whose prerequisites are unmet.
 - **Every phase ends with tests green.** Run `scripts/check.ps1` and confirm
   it prints `ALL GREEN` before you say a phase is done. If it fails, the
   phase is not done; report the failure with its output.

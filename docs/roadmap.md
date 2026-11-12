@@ -2,7 +2,7 @@
 
 Each phase is sized for one working session and ends with `scripts/check.ps1`
 green and a merged PR. Phase 1 is too large for one session, so it is split
-into 1a to 1d; each of those is one session with its own PR. Do phases in
+into 1a to 1e; each of those is one session with its own PR. Do phases in
 order unless a phase says otherwise. Do not start a phase whose prerequisites
 are not checked off.
 
@@ -27,6 +27,7 @@ before making it.
 | 1b | Data core: point-in-time query session | Done |
 | 1c | Data core: raw capture, fixtures, Kraken and Coinbase adapters | Done |
 | 1d | Data core: quality checks | Done |
+| 1e | Data core: recording clock (ADR 0011) | Done |
 | 2 | Python reference order book reconstructor | Not started |
 | 3 | C++ core types | Not started |
 | 4 | C++ order book, verified | Not started |
@@ -500,7 +501,7 @@ that finds the planted defect.
 
 **Notes for the next phases:**
 
-- **Ask the owner: the recording clock.** The machine that made the Phase
+- **The recording clock (decided: ADR 0011, built in Phase 1e).** The machine that made the Phase
   1c recordings has its Windows Time service stopped, and its clock ran
   about 1.4 s ahead while recording (no Coinbase message arrived sooner than
   1,398 ms after Coinbase sent it) and about 1.2 s ahead a day later (four
@@ -538,6 +539,72 @@ that finds the planted defect.
   checks pull per-instrument rows into Python for the outlier median; a
   day of Coinbase trades is fine, months may need a per-day loop.
 - **Python test time** is now about 95 seconds.
+
+#### Phase 1e: Recording clock (done)
+
+Added after Phase 1d by the owner, because the Phase 1c recordings were made
+on a clock about 1.4 s fast (ADR 0011).
+
+- [x] The recorder measures its NTP offset at the start of every session,
+      before contacting the venue, and stores it as a `CLOCK_OFFSET` stream
+      event.
+- [x] It refuses to start if the offset exceeds 250 ms, or cannot be
+      measured, unless run with `--allow-clock-offset`. The limit is not a
+      command-line option.
+- [x] Any use of the override is recorded, as a `CLOCK_OVERRIDE` stream
+      event, whether or not it was needed.
+- [x] A quality check, `recording_clock`, flags any session whose offset
+      exceeds the limit.
+- [x] The synchronized-clock assumption is recorded in the architecture
+      (section 6.2) and in ADR 0011.
+- [x] The existing one-hour recordings' ~1.4 s offset is documented
+      (`docs/data-core.md` section 7, the fixture README, ADR 0011).
+- [x] The current clock offset was confirmed before recording anything.
+
+**What was built:**
+
+- `clock.py`: an SNTP client (`sntp_query`) and `measure_offset`: three
+  samples from each of four servers (Cloudflare, Google, Microsoft, NTP
+  Pool), the fastest reply per server, the median across servers, at least
+  two must answer. Replies are refused if they are not server replies, come
+  from an unsynchronized server, are a kiss-of-death, or do not echo the
+  request's timestamp. No new dependency.
+- `recorder.py`: measures first; on refusal exits with status 2 without
+  contacting the venue or writing a file. Writes a `clock` control record
+  right after `start`. `RECORDER_VERSION` is now 2.
+- Adapters: the `clock` control record becomes `CLOCK_OFFSET` (and
+  `CLOCK_OVERRIDE` when used); malformed clock records are rejected.
+- `quality.py`: `check_recording_clock` (ERROR above the limit, WARNING if
+  unmeasured, INFO for sessions recorded before clocks were measured and for
+  any override) and `QualityConfig.max_clock_offset_ns`.
+- ADR 0011; ADR 0010's additions marked confirmed by the owner.
+
+**Verified:**
+
+- The SNTP client is tested against a local fake NTP server: offsets of
+  0, +1.4 and -0.75 s are measured to within 20 ms, server processing time
+  is excluded from the round trip, and six kinds of bad reply are refused.
+- The recorder refuses a clock 251 ms ahead, 1.4 s behind, or unmeasured,
+  and in each case opens no connection and writes no file.
+- Before recording anything this session, the clock was measured against
+  four NTP servers at 0.6 to 8.2 ms. The network tests (a real NTP
+  measurement and a 6-second capture from each venue) then passed.
+
+**Notes for the next phases:**
+
+- **The Windows Time service on the recording machine was stopped again**
+  when this phase started (start type Automatic), even though the clock was
+  then within 10 ms after a sync the day before. Without the service the
+  clock drifts, and the recorder will start refusing once it is 250 ms off.
+- **The committed fixtures keep their 1.4 s offset.** Tests that depend on
+  lags (for example the clock skew band test) are written against it. Every
+  quality report on them now includes one `clock_not_recorded` INFO
+  finding per session. The tests that asserted "no findings" for the
+  fixtures were changed to expect exactly those findings.
+- **The clock is measured at session start only.** Drift within a session is
+  not caught. Measuring again at the stop record would be a small addition.
+- **Phase 11** (live feed threads) stamps wall-clock time too and needs the
+  same check; its criteria now say so.
 
 ---
 
@@ -719,6 +786,9 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       Boost.Beast with OpenSSL via vcpkg). Record in a new ADR.
 - [ ] Feed threads connect to Kraken and Coinbase public streams, with
       reconnect, resubscribe and resync.
+- [ ] The feed process measures its clock offset at startup as the recorder
+      does (ADR 0011), refuses to start above 250 ms unless overridden, and
+      records the measurement and any override.
 - [ ] Threads wired per architecture section 5: feed, core, journal, with
       pinning and wait strategy from config.
 - [ ] Raw capture runs alongside; a recorded live session replays to the same

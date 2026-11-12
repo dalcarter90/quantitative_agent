@@ -277,6 +277,16 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 | `knowledge_ts` | When the record became available to queries in the store | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
 | `seq` | Local monotonic sequence number at receipt | Feed thread. Total order for replay is `(recv_ts, seq)` |
 
+**Wall-clock times assume a synchronized clock** (ADR 0011). `recv_ts` and
+`knowledge_ts` are only as accurate as the clock of the machine that stamped
+them, so every component that stamps wall-clock time must run on a clock kept
+synchronized to NTP. The recorder enforces this: at the start of every
+session it measures its offset against several NTP servers, refuses to record
+if the offset is above 250 ms unless explicitly overridden, and stores the
+measurement (and any override) as stream events, which a quality check
+reports. Feed and journal threads will need the same check when they start
+stamping time.
+
 Latency measurements inside the process use a monotonic clock and are stored
 as durations, never as wall times. Simulated "now" in a backtest is the
 `recv_ts` of the event being processed plus modelled latency, so a strategy

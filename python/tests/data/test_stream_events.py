@@ -110,6 +110,8 @@ def test_stream_event_kinds_cover_every_class_of_integrity_event():
         "SUBSCRIBE_REQUEST",
         "SUBSCRIPTION_ACK",
         "TRADE_BACKFILL",
+        "CLOCK_OFFSET",
+        "CLOCK_OVERRIDE",
         "SEQUENCE_GAP",
         "SEQUENCE_REPEAT",
         "SEQUENCE_OUT_OF_ORDER",
@@ -578,3 +580,68 @@ def test_stream_events_go_through_the_store_and_come_back_through_pitsession(ven
     knowledge_times = {int(p.name[5:25]) for p in (tmp_path / "store").rglob("*.parquet")}
     with PITSession(tmp_path / "store", as_of=min(knowledge_times) - 1) as before:
         assert before.stream_events(venue, INSTRUMENT, 0, INT64_MAX).num_rows == 0
+
+
+# --- the recording clock (ADR 0011) -------------------------------------------------------
+
+
+def clock_record(offset_ns, *, override=False, limit_ns=250_000_000):
+    servers = [{"host": "time.example", "offset_ns": offset_ns, "round_trip_ns": 20_000_000}]
+    if offset_ns is None:
+        servers = [{"host": "time.example", "error": "OSError: timed out"}]
+    return (
+        "recorder",
+        {
+            "event": "clock",
+            "offset_ns": offset_ns,
+            "limit_ns": limit_ns,
+            "within_limit": offset_ns is not None and abs(offset_ns) <= limit_ns,
+            "override": override,
+            "servers": servers,
+        },
+    )
+
+
+def clock_events(normalized):
+    rows = events_of(normalized, "kraken")
+    wanted = (K.CLOCK_OFFSET, K.CLOCK_OVERRIDE)
+    return [(K(r["kind"]), r["expected"], r["observed"], r["detail"]) for r in rows
+            if r["kind"] in wanted]  # fmt: skip
+
+
+def test_a_clock_record_becomes_a_clock_offset_event():
+    normalized = kraken_session(clock_record(3_000_000))
+    ((kind, expected, observed, detail),) = clock_events(normalized)
+    assert (kind, expected, observed) == (K.CLOCK_OFFSET, 250_000_000, 3_000_000)
+    assert json.loads(detail) == {
+        "servers": [{"host": "time.example", "offset_ns": 3_000_000, "round_trip_ns": 20_000_000}]
+    }
+
+
+@pytest.mark.parametrize(
+    ("offset", "reason"),
+    [(3_000_000, "offset within limit"), (-1_400_000_000, "offset above limit"),
+     (None, "offset not measured")],
+)  # fmt: skip
+def test_an_override_is_its_own_event(offset, reason):
+    normalized = kraken_session(clock_record(offset, override=True))
+    assert clock_events(normalized)[1:] == [(K.CLOCK_OVERRIDE, None, None, reason)]
+    assert clock_events(normalized)[0][2] == offset
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"offset_ns": 1.5},
+        {"offset_ns": "3"},
+        {"limit_ns": 0},
+        {"limit_ns": None},
+        {"override": "yes"},
+        {"servers": "none"},
+    ],
+)
+def test_a_malformed_clock_record_is_rejected(change):
+    channel, message = clock_record(3_000_000)
+    normalized = kraken_session((channel, {**message, **change}))
+    assert [r.reason for r in normalized.report.rejects] == ["malformed_message"]
+    assert clock_events(normalized) == []
