@@ -112,6 +112,7 @@ def test_stream_event_kinds_cover_every_class_of_integrity_event():
         "TRADE_BACKFILL",
         "CLOCK_OFFSET",
         "CLOCK_OVERRIDE",
+        "CLOCK_STEP",
         "SEQUENCE_GAP",
         "SEQUENCE_REPEAT",
         "SEQUENCE_OUT_OF_ORDER",
@@ -185,7 +186,13 @@ def test_kraken_session_events_in_order():
         (10, 0, K.SESSION_STOP, None, None, None),
     ]
     details = {(r["seq"]): r["detail"] for r in rows}
-    assert json.loads(details[0]) == {"symbol": "BTC/USD", "depth": 10, "recorder_version": 1}
+    assert json.loads(details[0]) == {
+        "symbol": "BTC/USD",
+        "depth": 10,
+        "recorder_version": 1,
+        "clock_identity": None,  # recorded before ADR 0012
+        "monotonic_stamps": False,
+    }
     assert json.loads(details[2]) == {
         "method": "subscribe",
         "channel": "book",
@@ -479,7 +486,8 @@ def copy_log(records, path, *, drop=(), replace=None):
             if record.seq in drop:
                 continue
             payload = replace.get(record.seq, record.payload)
-            writer.write(record.venue, record.channel, payload, recv_ts=record.recv_ts)
+            writer.write(record.venue, record.channel, payload, recv_ts=record.recv_ts,
+                         recv_mono_ns=record.recv_mono_ns)  # fmt: skip
     return path
 
 
@@ -645,3 +653,82 @@ def test_a_malformed_clock_record_is_rejected(change):
     normalized = kraken_session((channel, {**message, **change}))
     assert [r.reason for r in normalized.report.rejects] == ["malformed_message"]
     assert clock_events(normalized) == []
+
+
+# --- wall clock steps against the monotonic counter (ADR 0012) ------------------------------
+
+from quantagent.data.adapters.base import CLOCK_STEP_FLOOR_NS  # noqa: E402
+from quantagent.data.rawlog import RawRecord  # noqa: E402
+
+MONO_OFFSET = 1_700_000_000_000_000_000  # wall time minus counter, while the clock is steady
+
+
+def stamped(records, steps=None, jitter=None):
+    """Give records monotonic stamps. ``steps`` maps a record seq to a wall-clock
+    jump applied from that record on; ``jitter`` adds a small per-record wobble."""
+    out, shift = [], 0
+    for record in records:
+        shift += (steps or {}).get(record.seq, 0)
+        wobble = (jitter or {}).get(record.seq, 0)
+        mono = record.recv_ts - MONO_OFFSET
+        out.append(RawRecord(record.recv_ts + shift + wobble, record.seq, record.venue,
+                             record.channel, record.payload, mono))  # fmt: skip
+    return out
+
+
+def kraken_records_with(steps=None, jitter=None, start_extra=None):
+    from test_adapters import KRAKEN_START, KRAKEN_TRADES
+
+    start = KRAKEN_START if start_extra is None else (
+        "recorder", {**KRAKEN_START[1], **start_extra})  # fmt: skip
+    base = log("kraken", start, KRAKEN_INSTRUMENT, KRAKEN_BOOK_ACK, KRAKEN_SNAPSHOT,
+               KRAKEN_TRADES, KRAKEN_TRADES, KRAKEN_TRADES)  # fmt: skip
+    return stamped(base, steps, jitter)
+
+
+def steps_of(normalized):
+    rows = events_of(normalized, "kraken")
+    return [(r["seq"], r["connection"], r["observed"]) for r in rows if r["kind"] == K.CLOCK_STEP]
+
+
+def test_a_session_with_monotonic_stamps_says_so_in_its_start_event():
+    identity = {"platform": "win32", "machine_id": "m", "boot_id": "BootId:58",
+                "counter": "QueryPerformanceCounter()", "counter_resolution_ns": 100}  # fmt: skip
+    normalized = normalize(kraken_records_with(start_extra={"clock_identity": identity}))
+    start = events_of(normalized, "kraken")[0]
+    assert K(start["kind"]) == K.SESSION_START
+    detail = json.loads(start["detail"])
+    assert (detail["monotonic_stamps"], detail["clock_identity"]) == (True, identity)
+
+
+@pytest.mark.parametrize("step", [-1_241_000_000, -60_000_000, 40_000_000, 3_000_000_000])
+def test_a_wall_clock_step_is_an_event_with_its_signed_size(step):
+    normalized = normalize(kraken_records_with(steps={5: step}))
+    assert steps_of(normalized) == [(5, "ws", step)]
+    assert normalized.report.events["CLOCK_STEP"] == 1
+
+
+def test_movement_below_the_floor_is_not_a_step():
+    assert CLOCK_STEP_FLOOR_NS == 25_000_000
+    # Each record differs from the one before by less than the floor.
+    wobble = {3: 10_000_000, 4: -8_000_000, 5: 12_000_000, 6: 0}
+    assert steps_of(normalize(kraken_records_with(jitter=wobble))) == []
+
+
+def test_each_step_is_reported_once_against_the_offset_before_it():
+    normalized = normalize(kraken_records_with(steps={3: 100_000_000, 6: -300_000_000}))
+    assert steps_of(normalized) == [(3, "ws", 100_000_000), (6, "ws", -300_000_000)]
+
+
+def test_a_new_session_starts_a_new_baseline():
+    first = kraken_records_with()
+    second = [RawRecord(r.recv_ts + 10**12, r.seq, r.venue, r.channel, r.payload,
+                        r.recv_mono_ns + 5 * 10**11) for r in kraken_records_with()]  # fmt: skip
+    assert steps_of(normalize(first + second)) == []
+
+
+def test_records_without_monotonic_stamps_produce_no_step_events():
+    from test_fixtures import fixture_path
+
+    normalized = normalize(read_raw_log(fixture_path("kraken")))
+    assert normalized.report.events["CLOCK_STEP"] == 0

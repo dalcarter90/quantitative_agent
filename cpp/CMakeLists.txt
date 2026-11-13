@@ -19,7 +19,7 @@ else()
   target_compile_options(qa_warnings INTERFACE -Wall -Wextra -Wpedantic -Werror)
 endif()
 
-add_library(qa_core STATIC src/version.cpp)
+add_library(qa_core STATIC src/version.cpp src/clock.cpp)
 target_include_directories(qa_core PUBLIC include)
 target_compile_definitions(qa_core PRIVATE QA_VERSION="${PROJECT_VERSION}")
 target_link_libraries(qa_core PRIVATE qa_warnings)

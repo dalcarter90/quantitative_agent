@@ -31,10 +31,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from quantagent.data.clock import MAX_OFFSET_NS, ClockMeasurement, measure_offset
+from quantagent.data.clock import (
+    MAX_OFFSET_NS,
+    ClockMeasurement,
+    clock_identity,
+    measure_offset,
+    stamp,
+)
 from quantagent.data.rawlog import RawLogWriter
 
-RECORDER_VERSION = 2  # 2: the clock offset is measured and recorded (ADR 0011)
+# 2: the clock offset is measured and recorded (ADR 0011).
+# 3: every record has a monotonic stamp; the start names the counter (ADR 0012).
+RECORDER_VERSION = 3
+# How early the event loop's timer can fire before the session deadline.
+_TIMER_SLACK = 0.1
 CONTROL = "recorder"
 STREAM = "ws"
 PROBE = "probe"
@@ -167,8 +177,8 @@ async def record(
     symbol = spec.symbol(instrument)
     directory = Path(out_dir) / spec.name / instrument
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    writer = RawLogWriter(directory / f"{stamp}.qaraw")
+    started = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    writer = RawLogWriter(directory / f"{started}.qaraw")
     deadline = time.monotonic() + duration
 
     def control(**fields: Any) -> None:
@@ -186,6 +196,10 @@ async def record(
     async def stream() -> None:
         while remaining() > 0:
             reason = "session ended"
+            # A wait that times out was waiting until the deadline: the session is
+            # over. The event loop's timer can fire a little early (its clock ticks
+            # every 15.6 ms on Windows), so remaining() is not the test for that.
+            session_over = False
             try:
                 async with connect(spec.url, max_size=None) as socket:
                     await open_and_subscribe(socket, STREAM, spec.subscriptions(symbol, depth))
@@ -193,15 +207,22 @@ async def record(
                         try:
                             message = await asyncio.wait_for(socket.recv(), timeout=remaining())
                         except TimeoutError:
+                            if remaining() > _TIMER_SLACK:
+                                raise  # not our deadline: a failure, so reconnect
+                            session_over = True
                             break
-                        received = time.time_ns()
+                        received, mono = stamp()
                         payload = message.encode() if isinstance(message, str) else bytes(message)
-                        writer.write(spec.name, STREAM, payload, recv_ts=received)
+                        writer.write(
+                            spec.name, STREAM, payload, recv_ts=received, recv_mono_ns=mono
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - any failure means reconnect
                 reason = f"{type(error).__name__}: {error}"
             control(event="disconnect", connection=STREAM, reason=reason)
+            if session_over:
+                return
             if remaining() > 0:
                 await asyncio.sleep(min(reconnect_delay, max(remaining(), 0)))
 
@@ -213,9 +234,11 @@ async def record(
                 give_up = time.monotonic() + 20
                 while time.monotonic() < give_up:
                     message = await asyncio.wait_for(socket.recv(), timeout=20)
-                    received = time.time_ns()
+                    received, mono = stamp()
                     text = message if isinstance(message, str) else bytes(message).decode()
-                    writer.write(spec.name, PROBE, text.encode(), recv_ts=received)
+                    writer.write(
+                        spec.name, PROBE, text.encode(), recv_ts=received, recv_mono_ns=mono
+                    )
                     if spec.is_book_snapshot(text):
                         break
                 else:
@@ -240,6 +263,7 @@ async def record(
             symbol=symbol,
             depth=depth,
             recorder_version=RECORDER_VERSION,
+            clock_identity=clock_identity().to_json(),
         )
         control(
             event="clock",

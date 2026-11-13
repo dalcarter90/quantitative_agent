@@ -29,7 +29,8 @@ before making it.
 | 1d | Data core: quality checks | Done |
 | 1e | Data core: recording clock (ADR 0011) | Done |
 | 2 | Python reference order book reconstructor | Done |
-| 3 | C++ core types | Not started |
+| 2a | Replay order and monotonic receive time (ADR 0012) | Done |
+| 3 | C++ core types | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -704,16 +705,8 @@ optimization.
 
 **Notes for the next phases:**
 
-- **Ask the owner: replay order across clock steps.** The architecture says
-  the total order for replay is `(recv_ts, seq)`, and the reconstructor
-  sorts that way. That is only arrival order if `recv_ts` never goes
-  backwards within a log. It does not in any existing log (checked), but a
-  time service stepping the clock back mid-recording (Windows Time stepped
-  this machine's clock back 1.24 s when it started) would reorder the
-  stream. Within one raw log, `seq` alone is arrival order. Options: order
-  by `seq` within a log and by `recv_ts` only across logs, or have the
-  recorder record a clock step as a stream event. This touches the
-  architecture's replay definition, so it needs a decision before Phase 7.
+- **Replay order across clock steps (decided: ADR 0012, built in Phase 2a).**
+  Within one raw log the order is `seq`; logs merge by a monotonic stamp.
 - **`recv_ts` resolution is about 0.3 to 0.5 ms on this machine.** Python
   3.12's `time.time_ns()` on Windows follows the system timer, so about 70%
   of the records in the one-hour Kraken log share their `recv_ts` with the
@@ -741,18 +734,164 @@ optimization.
 
 ---
 
+### Phase 2a: Replay order and monotonic receive time (done)
+
+Added after Phase 2 by the owner (ADR 0012), before Phase 3.
+
+- [x] Within one raw log, replay order is `seq` alone; `recv_ts` is a
+      measurement, not an ordering key. Recorded in ADR 0012 and the
+      architecture (sections 4.2 and 6.2).
+- [x] Raw records gain `recv_mono_ns`, the monotonic high-resolution counter
+      (`time.perf_counter_ns`), read in the same call as `recv_ts`. Logs
+      from the same machine and boot are merged by it; `recv_ts` stays the
+      absolute time.
+- [x] The recorder records the clock identity (platform, machine id, boot
+      id, counter) that says when two logs' monotonic stamps are comparable.
+- [x] A quality check flags any session where the wall clock stepped against
+      the monotonic counter beyond a threshold, with the size of the step.
+- [x] Existing logs and fixtures are still read, are documented as lacking
+      the field, and are not rewritten.
+
+**What was built:**
+
+- Raw log version 2 (`rawlog.py`): `recv_mono` after `recv_ts` in every
+  record, -1 when absent. The reader reads versions 1 and 2 and reports
+  `version`; the writer writes 2 and, unless given stamps, reads both clocks
+  itself.
+- `clock.py`: `stamp()` (wall clock and counter read together),
+  `ClockIdentity` and `clock_identity()` (Windows `MachineGuid` and `BootId`;
+  Linux `/etc/machine-id` and `boot_id`).
+- `logorder.py`: `merge_logs(paths)` and `log_clock_identity(path)`. One log
+  is replayed in `seq` order; several are merged by monotonic stamp, then log,
+  then `seq`, and refused if not comparable or unstamped.
+- Recorder version 3: stamps every record with both clocks and puts the clock
+  identity in the start record.
+- Adapters: `SESSION_START` detail now says whether the session has monotonic
+  stamps and names its clock identity; a change in `recv_ts - recv_mono_ns`
+  between consecutive records larger than 25 ms is a `CLOCK_STEP` event with
+  its signed size.
+- `quality.py`: `check_recording_clock` reports `clock_step` (ERROR) beyond
+  `max_clock_step_ns` (default 50 ms) and `clock_steps_not_measurable` (INFO).
+- `book.py`: a stored backward `CLOCK_STEP` raises `ReplayOrderUnreliable`.
+
+**Verified:**
+
+- Two simultaneous 60-second recordings with the new recorder (kept in
+  `data/raw-adr0012/`, not in git): every record stamped, no two records
+  sharing a monotonic stamp (against about 70% sharing `recv_ts` in the
+  version 1 logs), `recv_ts - recv_mono_ns` moving at most 1.16 ms between
+  consecutive records, drift under 0.3 ms over the minute, identities
+  comparable, and the two logs merged in monotonic order. The clock was
+  +11 to +12 ms from NTP. No clock steps; the quality report found nothing.
+- No existing log has `recv_ts` going backwards (checked before this phase),
+  so the stored data's `(recv_ts, seq)` order is arrival order for all of it.
+
+**Notes for the next phases:**
+
+- **Ask the owner: the normalized store does not know which log a row came
+  from** (ADR 0012, "Open"). `seq` restarts in every log, so stored rows
+  cannot be put in `seq`-within-log order, and book and stream event keys
+  `(recv_ts, seq, ...)` could collide between two logs of the same venue and
+  instrument recorded at the same time. Fixing both needs a `log_id` column
+  (and probably `recv_mono_ns`) on every dataset. Until decided: one recorder
+  per venue and instrument at a time, and the reconstructor refuses sessions
+  with a backward clock step.
+- **Ask the owner: Coinbase check snapshots are not always exact.** In the
+  new 60-second Coinbase recording, one of its two check snapshots differs
+  from the rebuilt book on 55 of 37,746 levels near the inside of the
+  market, and no position in the stream reproduces it exactly (closest: 33
+  levels, 27 ms after its venue time). The stream had no gaps, and the other
+  snapshot matched exactly. Every earlier Coinbase check matched (1 of 1 on
+  the fixture, 6 of 6 in the hour). The likely cause is that Coinbase's
+  snapshot is not taken at a message boundary of the update stream. Phase 2's
+  criterion "equals every check snapshot on every level" therefore holds
+  usually but not always on Coinbase, and Phase 4 inherits it. Options: keep
+  the exact rule and treat a mismatch as a finding to explain, or allow a
+  documented tolerance for Coinbase. Kraken is unaffected: its checksum
+  verifies the book after every message.
+- **Phase 7** must read raw logs through `merge_logs` (or a single reader)
+  and order by `seq`; its criterion now says so.
+- **The Windows Time service** was again found stopped at the start of this
+  phase. The recorder checked the offset itself (11 to 12 ms).
+
+---
+
 ## Part B: C++ hot path
 
-### Phase 3: C++ core types
+### Phase 3: C++ core types (done)
 
-- [ ] `Price`, `Qty` strong types, `Timestamp`, instrument id, instrument
+- [x] `Price`, `Qty` strong types, `Timestamp`, instrument id, instrument
       metadata, `Side`. No implicit conversion to floating point (verified by
       a compile-fail check or `static_assert` on convertibility).
-- [ ] 128-bit notional helper that compiles on MSVC, with overflow tests.
-- [ ] `MarketEvent` and order message structs: fixed size, trivially copyable
+- [x] 128-bit notional helper that compiles on MSVC, with overflow tests.
+- [x] `MarketEvent` and order message structs: fixed size, trivially copyable
       (`static_assert`), size and layout documented.
-- [ ] `Clock` interface with system and manual implementations.
-- [ ] Types exposed in `quantagent._core`; Python round-trip tests.
+- [x] `Clock` interface with system and manual implementations.
+- [x] Types exposed in `quantagent._core`; Python round-trip tests.
+
+**What was built** (`cpp/include/qa/`, `cpp/src/clock.cpp`, bindings in
+`cpp/bindings/module.cpp`):
+
+- `types.hpp`: `Price`, `Qty`, `Timestamp`, `MonoTimestamp` (ADR 0012),
+  `InstrumentId`, `Side`, `InstrumentMeta`. Construction only from integers
+  that fit without loss; floating point and bool constructors are deleted.
+- `notional.hpp`: `Int128`, `multiply` (`_mul128` on MSVC x64),
+  `multiply_portable`, `notional(Price, Qty)`, `to_int64`.
+- `events.hpp`: `MarketEvent` (88 bytes), `OrderRequest` (64),
+  `ExecutionReport` (80), and their enums. Layouts in architecture
+  section 6.3.
+- `clock.hpp`: `Clock`, `SystemClock`, `ManualClock` (including a wall-clock
+  step on its own, for testing ADR 0012 behaviour).
+- Python (`quantagent._core`): all of the above, plus `to_bytes`,
+  `from_bytes` (which refuses unknown enum values and non-zero reserved
+  bytes), `size()` and `layout()` for each message, and `notional` returning
+  an exact Python int.
+
+**Verified:**
+
+- 15 new GoogleTest cases plus compile-time checks: the conversion rules as
+  `static_assert`s on `is_convertible`, `is_constructible` and concepts for
+  `+`, `*` and `<` between the types; every layout offset; no padding
+  (`has_unique_object_representations`); 128-bit products against known
+  values, at the int64 boundary, and the intrinsic against the portable
+  version on 200,000 random pairs.
+- 92 new Python round-trip tests: every int64 extreme through every type and
+  field and back, through `to_bytes`/`from_bytes`, with floats, bools,
+  strings and out-of-range integers refused.
+- The C++ `SystemClock`'s counter agrees with Python's `perf_counter_ns`
+  within 1 ms, so stamps from C++ feed threads will be comparable with the
+  recorder's (ADR 0012).
+- 15 deliberate breakages (portable multiply, overflow detection, ordering,
+  deleted conversions, layout, clocks, bindings): all caught, by a test or by
+  the build's `static_assert`s.
+- Benchmark baseline (this machine, Release, 12-core 4.1 GHz): `notional`
+  1.3 ns, `multiply_portable` 2.4 ns.
+
+**Notes for the next phases:**
+
+- **Phase 4 needs a Python-side converter** from `BookMessage` (the
+  reference reconstructor's input) to `MarketEvent`s, with `kLastInMessage`
+  on each message's last level so the C++ book knows when to verify a
+  checksum. It is not built yet because nothing uses it.
+- **`MarketEvent` is per level.** A Coinbase snapshot is about 38,000 events.
+  `level_index` is 32 bits for that reason; `depth` is 16 bits (Kraken's
+  largest is 1000).
+- **The order messages are a first cut** (architecture 6.3). They carry no
+  venue order id: Coinbase and Kraken use strings, which do not fit a fixed
+  layout. Phase 10 needs a mapping from our `client_order_id` to the venue's
+  id, kept by the execution thread.
+- **A recorder bug from Phase 1c was fixed here.** When the stream's
+  receive timed out at the session deadline, the event loop's timer could
+  fire a few milliseconds early (its clock ticks every 15.6 ms on Windows),
+  and the recorder then opened a pointless new connection for the remaining
+  milliseconds. It showed up as a test failing about 1 run in 25. A timeout
+  within 0.1 s of the deadline now ends the session; one earlier than that
+  is still a failure that reconnects. Two deterministic tests cover both.
+  The one-hour recordings were not affected (their connection counts are
+  exactly one stream plus six probes).
+- **The Linux preset is still unbuilt.** `__int128` is the GCC/Clang path for
+  `multiply`; it is only exercised once a Linux build exists, and the test
+  that compares it with the portable version will cover it then.
 
 ### Phase 4: C++ order book, verified
 
@@ -813,9 +952,10 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 
 ### Phase 7: Deterministic replay engine
 
-- [ ] Replay engine reads a raw log and drives handlers, books and a strategy
-      callback on one thread in `(recv_ts, seq)` order, with time from the
-      event stream.
+- [ ] Replay engine reads raw logs and drives handlers, books and a strategy
+      callback on one thread, in `seq` order within each log and merging
+      several logs by `recv_mono_ns` through `logorder.merge_logs` (ADR
+      0012), with time from the event stream.
 - [ ] Journal writer: binary, append-only; reader in Python.
 - [ ] Determinism test: two runs over the same log give byte-identical
       journals. Run in CI.

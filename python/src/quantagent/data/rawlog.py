@@ -12,10 +12,17 @@ Layout, all integers little-endian::
 
     file    := MAGIC record*
     record  := length:u32 body crc:u32
-    body    := recv_ts:i64 seq:u64 venue_len:u8 venue channel_len:u8 channel payload
+    body    := recv_ts:i64 recv_mono:i64 seq:u64 venue_len:u8 venue channel_len:u8 channel payload
 
 ``length`` is the size of ``body`` and ``crc`` is the CRC32 of ``body``.
-``seq`` starts at 0 and increases by one per record within a segment.
+``seq`` starts at 0 and increases by one per record within a segment, and
+**is the replay order within the segment** (ADR 0012). ``recv_ts`` is the wall
+clock, a measurement, not an ordering key. ``recv_mono`` is the system's
+monotonic counter read at the same moment; -1 means the record has none.
+
+Version 1 segments (``MAGIC_V1``, written before ADR 0012) have no
+``recv_mono`` field. They are still read, with ``recv_mono_ns`` None. The
+writer only writes version 2.
 """
 
 import os
@@ -29,13 +36,16 @@ from typing import BinaryIO
 
 import pyarrow as pa
 
-MAGIC = b"QARAW\x01\n"
+MAGIC_V1 = b"QARAW\x01\n"
+MAGIC = b"QARAW\x02\n"
 SUFFIX = ".qaraw"
 SEALED_SUFFIX = ".qaraw.zst"
 
 _INT64_MAX = 2**63 - 1
 _LENGTH = struct.Struct("<I")
-_FIXED = struct.Struct("<qQ")
+_FIXED_V1 = struct.Struct("<qQ")
+_FIXED = struct.Struct("<qqQ")
+_NO_MONO = -1
 _MAX_BODY = 1 << 30  # a length beyond this means the file is not a raw log
 _COMPRESSION_LEVEL = 9
 
@@ -47,10 +57,12 @@ class RawLogError(ValueError):
 @dataclass(frozen=True, slots=True)
 class RawRecord:
     recv_ts: int  # when our process received the bytes, ns since the Unix epoch
-    seq: int  # position in the segment; (recv_ts, seq) orders replay
+    seq: int  # position in the segment, and the replay order within it (ADR 0012)
     venue: str
     channel: str  # which connection or request the bytes came from
     payload: bytes  # exactly what was received
+    # The monotonic counter at the same moment as recv_ts; None in version 1 logs.
+    recv_mono_ns: int | None = None
 
 
 def _encode_name(kind: str, value: str) -> bytes:
@@ -65,11 +77,18 @@ def _encode_name(kind: str, value: str) -> bytes:
 class RawLogWriter:
     """Appends records to a new raw log segment. There is no other operation."""
 
-    def __init__(self, path: str | os.PathLike[str], *, clock: Callable[[], int] = time.time_ns):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        clock: Callable[[], int] = time.time_ns,
+        monotonic: Callable[[], int] = time.perf_counter_ns,
+    ):
         self._path = Path(path)
         if not self._path.name.endswith(SUFFIX):
             raise ValueError(f"raw log file names must end with {SUFFIX}: {self._path.name}")
         self._clock = clock
+        self._monotonic = monotonic
         self._next_seq = 0
         # "x": fail rather than open a file that already exists.
         self._file: BinaryIO | None = open(self._path, "xb")
@@ -81,10 +100,21 @@ class RawLogWriter:
         return self._path
 
     def write(
-        self, venue: str, channel: str, payload: bytes, *, recv_ts: int | None = None
+        self,
+        venue: str,
+        channel: str,
+        payload: bytes,
+        *,
+        recv_ts: int | None = None,
+        recv_mono_ns: int | None = None,
     ) -> RawRecord:
-        """Append one record. ``recv_ts`` defaults to the clock; pass the time
-        the bytes arrived when that was measured earlier."""
+        """Append one record.
+
+        Without ``recv_ts``, the wall clock and the monotonic counter are read
+        now. Pass both when the bytes arrived earlier and were stamped then. A
+        ``recv_ts`` alone (copying a record from a version 1 log) is written
+        with no monotonic stamp.
+        """
         if self._file is None:
             raise ValueError("raw log is closed")
         venue_bytes = _encode_name("venue", venue)
@@ -92,7 +122,14 @@ class RawLogWriter:
         if not isinstance(payload, bytes):
             raise TypeError(f"payload must be bytes, got {type(payload).__name__}")
         if recv_ts is None:
-            recv_ts = self._clock()
+            if recv_mono_ns is not None:
+                raise ValueError("a monotonic stamp needs the wall time taken with it")
+            recv_ts, recv_mono_ns = self._clock(), self._monotonic()
+        if recv_mono_ns is not None:
+            if type(recv_mono_ns) is not int:
+                raise TypeError(f"recv_mono_ns must be int, got {type(recv_mono_ns).__name__}")
+            if not 0 <= recv_mono_ns <= _INT64_MAX:
+                raise ValueError(f"recv_mono_ns={recv_mono_ns} is outside 0..int64 max")
         if type(recv_ts) is not int:
             raise TypeError(f"recv_ts must be int nanoseconds, got {type(recv_ts).__name__}")
         if not 0 <= recv_ts <= _INT64_MAX:
@@ -100,7 +137,9 @@ class RawLogWriter:
 
         body = b"".join(
             (
-                _FIXED.pack(recv_ts, self._next_seq),
+                _FIXED.pack(
+                    recv_ts, _NO_MONO if recv_mono_ns is None else recv_mono_ns, self._next_seq
+                ),
                 bytes([len(venue_bytes)]),
                 venue_bytes,
                 bytes([len(channel_bytes)]),
@@ -114,7 +153,7 @@ class RawLogWriter:
         # Hand each record to the operating system as it is written, so a
         # crash of this process loses at most the record in progress.
         self._file.flush()
-        record = RawRecord(recv_ts, self._next_seq, venue, channel, payload)
+        record = RawRecord(recv_ts, self._next_seq, venue, channel, payload, recv_mono_ns)
         self._next_seq += 1
         return record
 
@@ -161,6 +200,7 @@ class RawLogReader:
         self._path = path
         self._sealed = path.name.endswith(SEALED_SUFFIX)
         self.truncated = False
+        self.version: int | None = None  # 1 or 2, known once iteration starts
 
     def __iter__(self) -> Iterator[RawRecord]:
         self.truncated = False
@@ -190,7 +230,12 @@ class RawLogReader:
         self.truncated = True
 
     def _records(self, stream) -> Iterator[RawRecord]:
-        if self._read(stream, len(MAGIC)) != MAGIC:
+        magic = self._read(stream, len(MAGIC))
+        if magic == MAGIC:
+            self.version, fixed = 2, _FIXED
+        elif magic == MAGIC_V1:
+            self.version, fixed = 1, _FIXED_V1
+        else:
             raise RawLogError("not a raw log: bad or incomplete file header")
         expected_seq = 0
         while True:
@@ -200,7 +245,7 @@ class RawLogReader:
             if len(prefix) < _LENGTH.size:
                 return self._partial()
             (length,) = _LENGTH.unpack(prefix)
-            if length > _MAX_BODY or length < _FIXED.size + 2:
+            if length > _MAX_BODY or length < fixed.size + 2:
                 raise RawLogError(f"impossible record length {length}")
             rest = self._read(stream, length + _LENGTH.size)
             if len(rest) < length + _LENGTH.size:
@@ -209,10 +254,14 @@ class RawLogReader:
             if zlib.crc32(body) != _LENGTH.unpack(rest[length:])[0]:
                 raise RawLogError(f"record {expected_seq}: checksum mismatch")
 
-            recv_ts, seq = _FIXED.unpack_from(body)
+            if self.version == 2:
+                recv_ts, mono, seq = fixed.unpack_from(body)
+                recv_mono_ns = None if mono == _NO_MONO else mono
+            else:
+                (recv_ts, seq), recv_mono_ns = fixed.unpack_from(body), None
             if seq != expected_seq:
                 raise RawLogError(f"record sequence broken: expected {expected_seq}, found {seq}")
-            position = _FIXED.size
+            position = fixed.size
             names = []
             for _ in range(2):
                 size = body[position]
@@ -220,7 +269,7 @@ class RawLogReader:
                 position += 1 + size
             if position > length:
                 raise RawLogError(f"record {seq}: malformed names")
-            yield RawRecord(recv_ts, seq, names[0], names[1], body[position:])
+            yield RawRecord(recv_ts, seq, names[0], names[1], body[position:], recv_mono_ns)
             expected_seq += 1
 
 

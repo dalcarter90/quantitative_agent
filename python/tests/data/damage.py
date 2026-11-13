@@ -19,7 +19,8 @@ from quantagent.data.rawlog import RawLogWriter, RawRecord
 def write(records: list[RawRecord], path: Path) -> Path:
     with RawLogWriter(path) as writer:
         for record in records:
-            writer.write(record.venue, record.channel, record.payload, recv_ts=record.recv_ts)
+            writer.write(record.venue, record.channel, record.payload, recv_ts=record.recv_ts,
+                         recv_mono_ns=record.recv_mono_ns)  # fmt: skip
     return path
 
 
@@ -36,11 +37,11 @@ def duplicated(records: list[RawRecord], seq: int) -> list[RawRecord]:
     shift = 0
     for record in records:
         out.append(RawRecord(record.recv_ts, record.seq + shift, record.venue, record.channel,
-                             record.payload))  # fmt: skip
+                             record.payload, record.recv_mono_ns))  # fmt: skip
         if record.seq == seq:
             shift = 1
             out.append(RawRecord(record.recv_ts, record.seq + 1, record.venue, record.channel,
-                                 record.payload))  # fmt: skip
+                                 record.payload, record.recv_mono_ns))  # fmt: skip
     assert len(out) == len(records) + 1 and shift == 1
     return out
 
@@ -52,8 +53,8 @@ def swapped(records: list[RawRecord], seq: int) -> list[RawRecord]:
     following = next(i for i in range(index + 1, len(records)) if records[i].channel == "ws")
     out = list(records)
     a, b = records[index], records[following]
-    out[index] = RawRecord(a.recv_ts, a.seq, a.venue, a.channel, b.payload)
-    out[following] = RawRecord(b.recv_ts, b.seq, b.venue, b.channel, a.payload)
+    out[index] = RawRecord(a.recv_ts, a.seq, a.venue, a.channel, b.payload, a.recv_mono_ns)
+    out[following] = RawRecord(b.recv_ts, b.seq, b.venue, b.channel, a.payload, b.recv_mono_ns)
     return out
 
 

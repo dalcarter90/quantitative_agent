@@ -749,3 +749,31 @@ def test_a_shallower_check_snapshot_is_compared_only_to_its_depth():
     deeper = [messages[0], dataclasses.replace(messages[1], levels=(*bids[:11], (SELL, 101, 1)))]
     (result,) = verify_check_snapshots("coinbase", deeper)
     assert result.differences == [(BUY, 90, None, 1)]  # level 11 is outside depth 10
+
+
+# --- replay order and wall-clock steps (ADR 0012) ------------------------------------------------
+
+
+def test_a_backward_wall_clock_step_stops_the_replay():
+    """Stored rows are ordered by (recv_ts, seq). That is arrival order only
+    while the wall clock never goes back, so a backward step raises."""
+    stored = [event(2, K.CLOCK_STEP, expected=None, observed=-1_241_000_000)]
+    with pytest.raises(book_module.ReplayOrderUnreliable) as raised:
+        run("coinbase", coinbase(2, 3, 4), stored)
+    assert (raised.value.recv_ts, raised.value.seq, raised.value.step_ns) == (
+        1_002,
+        2,
+        -1_241_000_000,
+    )
+    assert "1241.0 ms" in str(raised.value) and "ADR 0012" in str(raised.value)
+
+
+def test_a_step_on_any_connection_counts_because_the_clock_is_shared():
+    stored = [event(1, K.CLOCK_STEP, connection="probe", observed=-30_000_000)]
+    with pytest.raises(book_module.ReplayOrderUnreliable):
+        run("coinbase", coinbase(2, 3, 4), stored)
+
+
+def test_a_forward_step_does_not_reorder_and_does_not_stop_the_replay():
+    stored = [event(2, K.CLOCK_STEP, observed=300_000_000)]
+    assert sides(run("coinbase", coinbase(2, 3, 4), stored)) == ({100: 5, 99: 2}, {101: 3})

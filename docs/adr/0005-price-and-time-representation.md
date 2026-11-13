@@ -1,6 +1,6 @@
 # 0005: int64 mantissa with per-instrument exponent; int64 nanosecond timestamps
 
-Status: Accepted (by the owner, as proposed), amended by 0008 and 0011
+Status: Accepted (by the owner, as proposed), amended by 0008, 0011 and 0012
 Date: 2026-11-10
 
 ## Context

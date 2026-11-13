@@ -460,4 +460,5 @@ def test_the_data_package_exports_no_other_read_path():
         "quality",  # reads only through PITSession (tested in test_quality.py)
         "clock",  # measures the recording clock; reads no data
         "book",  # reads only through PITSession (tested in test_book.py)
+        "logorder",  # orders raw log records for replay; reads no store data
     }

@@ -46,6 +46,11 @@ PROBE_CHANNEL = "probe"
 _CONTROL_EVENTS = {"start", "clock", "connect", "subscribe", "disconnect", "rest", "stop"}
 _MAX_DEPTH = 100_000
 _MAX_EVENT_DETAIL = 200
+# A change in (recv_ts - recv_mono_ns) between consecutive records larger than
+# this is a wall-clock step (ADR 0012). Above the wall clock's tick on Windows
+# (up to 15.6 ms) plus the time between the two reads; far below any step
+# that matters.
+CLOCK_STEP_FLOOR_NS = 25_000_000
 
 
 def _compact(value: Any) -> str:
@@ -244,6 +249,7 @@ class VenueAdapter:
         self.exponents: tuple[int, int] | None = None  # (price_exp, qty_exp) in force
         self.anomalies: list[SequenceAnomaly] = []
         self.events: list[Row] = []  # stream events noticed while handling a record
+        self._clock_offset: int | None = None  # recv_ts - recv_mono_ns of the previous record
 
     def note(
         self,
@@ -266,9 +272,22 @@ class VenueAdapter:
         )
 
     def handle(self, record: RawRecord) -> Handled:
-        if record.channel == CONTROL_CHANNEL:
-            return self._control(record)
-        return self.handle_venue(record)
+        try:
+            if record.channel == CONTROL_CHANNEL:
+                return self._control(record)
+            return self.handle_venue(record)
+        finally:
+            self._track_clock(record)
+
+    def _track_clock(self, record: RawRecord) -> None:
+        """Note a wall-clock step against the monotonic counter (ADR 0012)."""
+        if record.recv_mono_ns is None:
+            return
+        offset = record.recv_ts - record.recv_mono_ns
+        previous, self._clock_offset = self._clock_offset, offset
+        if previous is not None and abs(offset - previous) > CLOCK_STEP_FLOOR_NS:
+            self.note(StreamEventKind.CLOCK_STEP, connection=record.channel,
+                      observed=offset - previous)  # fmt: skip
 
     def handle_venue(self, record: RawRecord) -> Handled:
         raise NotImplementedError
@@ -291,7 +310,11 @@ class VenueAdapter:
             self.instrument, self.symbol = message["instrument"], symbol
             self.start_depth = checked_depth(depth)
             self.exponents = None
-            about = {k: message.get(k) for k in ("symbol", "depth", "recorder_version")}
+            self._clock_offset = None  # a new log: its counter reading starts afresh
+            about = {
+                k: message.get(k) for k in ("symbol", "depth", "recorder_version", "clock_identity")
+            }
+            about["monotonic_stamps"] = record.recv_mono_ns is not None
             self.note(StreamEventKind.SESSION_START, detail=_compact(about))
         elif event == "stop":
             self.note(StreamEventKind.SESSION_STOP)

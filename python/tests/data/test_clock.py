@@ -231,3 +231,51 @@ def test_this_machine_against_real_ntp_servers():
     measured = measure_offset()
     assert measured.servers_answered >= 2
     assert measured.offset_ns is not None
+
+
+# --- clock identity and stamps (ADR 0012) -------------------------------------------------------
+
+import sys  # noqa: E402
+
+from quantagent.data import clock as clock_module  # noqa: E402
+from quantagent.data.clock import ClockIdentity, clock_identity, stamp  # noqa: E402
+
+
+def test_clock_identity_names_this_machine_boot_and_counter():
+    identity = clock_identity()
+    assert isinstance(identity, ClockIdentity)
+    assert identity.platform == sys.platform
+    assert identity.machine_id and identity.boot_id
+    assert identity.counter == time.get_clock_info("perf_counter").implementation
+    assert 0 < identity.counter_resolution_ns <= 1_000_000
+    assert identity == clock_identity()  # the same for the whole boot
+    assert identity.comparable_with(clock_identity())
+    assert ClockIdentity.from_json(identity.to_json()) == identity
+
+
+def test_identities_are_comparable_only_for_the_same_machine_boot_and_counter():
+    base = ClockIdentity("win32", "m1", "BootId:58", "QueryPerformanceCounter()", 100)
+    assert base.comparable_with(ClockIdentity("win32", "m1", "BootId:58",
+                                              "QueryPerformanceCounter()", 200))  # fmt: skip
+    for other in (
+        ClockIdentity("win32", "m2", "BootId:58", "QueryPerformanceCounter()", 100),
+        ClockIdentity("win32", "m1", "BootId:59", "QueryPerformanceCounter()", 100),
+        ClockIdentity("win32", "m1", "BootId:58", "clock_gettime(CLOCK_MONOTONIC)", 100),
+        ClockIdentity("linux", "m1", "BootId:58", "QueryPerformanceCounter()", 100),
+    ):
+        assert not base.comparable_with(other)
+
+
+def test_an_unknown_machine_or_boot_is_never_comparable(monkeypatch):
+    monkeypatch.setattr(clock_module, "_boot_id", lambda: None)
+    identity = clock_identity()
+    assert identity.boot_id is None
+    assert not identity.comparable_with(identity)
+
+
+def test_stamp_reads_the_wall_clock_and_the_counter_together():
+    wall_before, mono_before = time.time_ns(), time.perf_counter_ns()
+    wall, mono = stamp()
+    assert 0 <= wall - wall_before < 1_000_000_000
+    assert 0 <= mono - mono_before < 1_000_000_000
+    assert stamp()[1] >= mono  # the counter never goes back

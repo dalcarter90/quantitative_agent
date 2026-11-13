@@ -106,6 +106,8 @@ class QualityConfig:
     outlier_bps: int = 500
     # A recording session whose clock was further than this from NTP time.
     max_clock_offset_ns: int = 250_000_000
+    # A wall-clock step against the monotonic counter larger than this (ADR 0012).
+    max_clock_step_ns: int = 50_000_000
     max_findings: int = 1000  # per check and instrument
 
     def __post_init__(self) -> None:
@@ -115,7 +117,7 @@ class QualityConfig:
                 raise ValueError(f"{item.name} must be an integer, got {value!r}")
         if self.min_lag_ns > self.max_lag_ns:
             raise ValueError("min_lag_ns must not exceed max_lag_ns")
-        for name in ("max_backwards_ns", "outlier_bps", "max_clock_offset_ns"):
+        for name in ("max_backwards_ns", "outlier_bps", "max_clock_offset_ns", "max_clock_step_ns"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative")
         for name in ("outlier_window", "outlier_min_trades", "max_findings"):
@@ -308,6 +310,7 @@ def check_recording_clock(
         StreamEventKind.SESSION_START,
         StreamEventKind.CLOCK_OFFSET,
         StreamEventKind.CLOCK_OVERRIDE,
+        StreamEventKind.CLOCK_STEP,
     )
     events = [
         event
@@ -319,14 +322,18 @@ def check_recording_clock(
     for event in events:
         kind = StreamEventKind(event["kind"])
         if kind == StreamEventKind.SESSION_START:
-            sessions.append({"start": event, "clock": None, "override": None})
+            sessions.append({"start": event, "clock": None, "override": None, "steps": []})
             continue
         if not sessions:  # the range begins inside a session
-            sessions.append({"start": None, "clock": None, "override": None})
-        slot = "clock" if kind == StreamEventKind.CLOCK_OFFSET else "override"
-        sessions[-1][slot] = event
+            sessions.append({"start": None, "clock": None, "override": None, "steps": []})
+        if kind == StreamEventKind.CLOCK_STEP:
+            sessions[-1]["steps"].append(event)
+        else:
+            slot = "clock" if kind == StreamEventKind.CLOCK_OFFSET else "override"
+            sessions[-1][slot] = event
 
-    measured_offsets = []
+    measured_offsets: list[int] = []
+    steps: list[int] = []
     for found in sessions:
         clock, override = found["clock"], found["override"]
         if clock is None:
@@ -338,8 +345,9 @@ def check_recording_clock(
                     "stream_events",
                     begin["recv_ts"],
                     begin["seq"],
-                    "this session was recorded before the clock was measured, so its "
-                    "recv_ts may be off by an unknown amount (docs/data-core.md, section 7)",
+                    "this session was recorded before the clock was measured and before "
+                    "records had monotonic stamps, so its recv_ts may be off by an unknown "
+                    "amount and clock steps cannot be detected (docs/data-core.md, section 7)",
                 )
         elif clock["observed"] is None:
             scope.add(
@@ -365,6 +373,39 @@ def check_recording_clock(
                     f"ahead), beyond the {config.max_clock_offset_ns / 1e6:.1f} ms limit; "
                     f"recv_ts and knowledge_ts are off by about that much{note}",
                 )
+        begin = found["start"]
+        monotonic = begin is not None and _start_detail(begin).get("monotonic_stamps") is True
+        if clock is not None and begin is not None and not monotonic:
+            scope.add(
+                Severity.INFO,
+                "clock_steps_not_measurable",
+                "stream_events",
+                begin["recv_ts"],
+                begin["seq"],
+                "this session's records have no monotonic stamps, so wall-clock steps "
+                "during it cannot be detected (ADR 0012)",
+            )
+        for step in found["steps"]:
+            size = step["observed"]
+            steps.append(abs(size))
+            if abs(size) > config.max_clock_step_ns:
+                direction = "back" if size < 0 else "forward"
+                scope.add(
+                    Severity.ERROR,
+                    "clock_step",
+                    "stream_events",
+                    step["recv_ts"],
+                    step["seq"],
+                    f"the wall clock stepped {abs(size) / 1e6:.1f} ms {direction} against the "
+                    f"monotonic counter here, beyond the {config.max_clock_step_ns / 1e6:.1f} "
+                    "ms limit; recv_ts before and after this record are not comparable"
+                    + (
+                        ", and stored rows ordered by recv_ts are out of arrival order"
+                        if size < 0
+                        else ""
+                    )  # fmt: skip
+                    + " (ADR 0012)",
+                )
         if override is not None:
             scope.add(
                 Severity.INFO,
@@ -379,10 +420,21 @@ def check_recording_clock(
         "sessions": sum(found["start"] is not None for found in sessions),
         "measured": len(measured_offsets),
         "overridden": sum(found["override"] is not None for found in sessions),
+        "clock_steps": len(steps),
     }
     if measured_offsets:
         scope.stats["max_abs_offset_ns"] = max(measured_offsets)
+    if steps:
+        scope.stats["max_abs_step_ns"] = max(steps)
     return scope.result()
+
+
+def _start_detail(event: dict[str, Any]) -> dict[str, Any]:
+    try:
+        detail = json.loads(event["detail"] or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return detail if isinstance(detail, dict) else {}
 
 
 # --- clock skew -------------------------------------------------------------------------
