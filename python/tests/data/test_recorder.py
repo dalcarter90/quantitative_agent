@@ -38,6 +38,10 @@ class FakeSocket:
             return self._messages.pop(0)
         if self._then == "close":
             raise ConnectionError("scripted disconnect")
+        if isinstance(self._then, float):
+            # A timeout that fires this many seconds after the call.
+            await asyncio.sleep(self._then)
+            raise TimeoutError
         await asyncio.sleep(3600)
 
     async def __aenter__(self):
@@ -397,3 +401,30 @@ def test_every_record_has_a_monotonic_stamp_taken_with_its_receive_time(tmp_path
     assert monos == sorted(monos)  # file order is arrival order
     offsets = [r.recv_ts - r.recv_mono_ns for r in records]
     assert max(offsets) - min(offsets) < 50_000_000  # the two clocks were read together
+
+
+def connects(records):
+    return [e for e in controls(records) if e["event"] == "connect" and e["connection"] == "ws"]
+
+
+def test_a_timer_firing_just_before_the_deadline_ends_the_session(tmp_path):
+    """The event loop's timer can fire up to 15.6 ms early on Windows. That
+    timeout is the session ending, not a reason to open a new connection."""
+    early = FakeSocket([KRAKEN_SNAPSHOT], then=0.46)  # 40 ms before the 0.5 s deadline
+    _, records, _ = run_kraken(tmp_path, [early], duration=0.5, probe_interval=10)
+    assert len(connects(records)) == 1
+    stream_ends = [e for e in controls(records)
+                   if e["event"] == "disconnect" and e["connection"] == "ws"]  # fmt: skip
+    assert [e["reason"] for e in stream_ends] == ["session ended"]
+
+
+def test_a_timeout_long_before_the_deadline_is_a_failure_and_reconnects(tmp_path):
+    first = FakeSocket([KRAKEN_SNAPSHOT], then=0.05)
+    second = FakeSocket([KRAKEN_SNAPSHOT])
+    _, records, _ = run_kraken(
+        tmp_path, [first, second], duration=0.6, probe_interval=10, reconnects=True
+    )
+    assert len(connects(records)) == 2
+    reasons = [e["reason"] for e in controls(records)
+               if e["event"] == "disconnect" and e["connection"] == "ws"]  # fmt: skip
+    assert reasons[0].startswith("TimeoutError") and reasons[-1] == "session ended"

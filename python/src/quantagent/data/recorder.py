@@ -43,6 +43,8 @@ from quantagent.data.rawlog import RawLogWriter
 # 2: the clock offset is measured and recorded (ADR 0011).
 # 3: every record has a monotonic stamp; the start names the counter (ADR 0012).
 RECORDER_VERSION = 3
+# How early the event loop's timer can fire before the session deadline.
+_TIMER_SLACK = 0.1
 CONTROL = "recorder"
 STREAM = "ws"
 PROBE = "probe"
@@ -194,6 +196,10 @@ async def record(
     async def stream() -> None:
         while remaining() > 0:
             reason = "session ended"
+            # A wait that times out was waiting until the deadline: the session is
+            # over. The event loop's timer can fire a little early (its clock ticks
+            # every 15.6 ms on Windows), so remaining() is not the test for that.
+            session_over = False
             try:
                 async with connect(spec.url, max_size=None) as socket:
                     await open_and_subscribe(socket, STREAM, spec.subscriptions(symbol, depth))
@@ -201,6 +207,9 @@ async def record(
                         try:
                             message = await asyncio.wait_for(socket.recv(), timeout=remaining())
                         except TimeoutError:
+                            if remaining() > _TIMER_SLACK:
+                                raise  # not our deadline: a failure, so reconnect
+                            session_over = True
                             break
                         received, mono = stamp()
                         payload = message.encode() if isinstance(message, str) else bytes(message)
@@ -212,6 +221,8 @@ async def record(
             except Exception as error:  # noqa: BLE001 - any failure means reconnect
                 reason = f"{type(error).__name__}: {error}"
             control(event="disconnect", connection=STREAM, reason=reason)
+            if session_over:
+                return
             if remaining() > 0:
                 await asyncio.sleep(min(reconnect_delay, max(remaining(), 0)))
 

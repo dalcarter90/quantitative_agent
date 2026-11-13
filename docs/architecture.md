@@ -295,6 +295,73 @@ as durations, never as wall times. Simulated "now" in a backtest is the
 `recv_ts` of the event being processed plus modelled latency, so a strategy
 sees data when we would have had it, not when the venue produced it.
 
+### 6.3 C++ core types and messages
+
+Built in roadmap Phase 3 (`cpp/include/qa/`). The layouts below are fixed by
+`static_assert`s in `cpp/tests/test_events.cpp` and checked from Python in
+`python/tests/test_core_types.py`; change all three together.
+
+**Value types** (`qa/types.hpp`): `Price` and `Qty` (int64 mantissas),
+`Timestamp` (wall clock, ns since the Unix epoch), `MonoTimestamp` (the
+monotonic counter, ADR 0012), `InstrumentId` (uint32), `Side` (`Sell = -1`,
+`Unknown = 0`, `Buy = 1`, as in the Python schema) and `InstrumentMeta`. Each is
+constructed explicitly from an integer, never converts implicitly, cannot be
+built from or turned into floating point or bool, and does not mix with the
+others: a `Price` cannot be compared with, added to or multiplied by a `Qty`.
+
+**Notional** (`qa/notional.hpp`): `notional(Price, Qty)` returns the exact
+128-bit product as `Int128` (with `_mul128` on MSVC, `__int128` on GCC and
+Clang, a portable fallback otherwise), at exponent `price_exp + qty_exp`;
+`to_int64` says whether it fits back.
+
+**Clock** (`qa/clock.hpp`): the interface hot-path code takes its time from.
+`SystemClock` reads `std::chrono::system_clock` and `steady_clock`, which is
+the same counter as Python's `time.perf_counter_ns` (tested to agree within
+1 ms), so stamps from C++ and from the recorder are comparable. `ManualClock`
+returns what it is set to, can advance both clocks, and can step the wall
+clock alone.
+
+**Messages** (`qa/events.hpp`): fixed size, trivially copyable, standard
+layout, with no compiler padding (explicit zero `reserved` bytes), in the
+machine's byte order (little-endian on every supported platform).
+
+`MarketEvent`, 88 bytes, one per book level or trade:
+
+| Offset | Size | Field | Meaning |
+|--------|------|-------|---------|
+| 0 | 8 | `recv_ts` | Wall-clock receive time |
+| 8 | 8 | `recv_mono` | Monotonic receive stamp (flag `kHasMono`) |
+| 16 | 8 | `event_ts` | Venue time, or `recv_ts` if the venue gave none (flag `kEventTsFromReceipt`, ADR 0008) |
+| 24 | 8 | `seq` | Raw record number: replay order within a log |
+| 32 | 8 | `venue_seq` | The venue's message number (flag `kHasVenueSeq`) |
+| 40 | 8 | `trade_id` | The venue's trade id, if numeric (flag `kHasTradeId`) |
+| 48 | 8 | `price` | Price mantissa |
+| 56 | 8 | `qty` | Quantity mantissa; 0 removes a book level |
+| 64 | 4 | `instrument` | `InstrumentId` |
+| 68 | 4 | `checksum` | The venue's book checksum after the message (flag `kHasChecksum`) |
+| 72 | 4 | `level_index` | Position of the level in its message |
+| 76 | 2 | `depth` | Levels per side the venue keeps (flag `kHasDepth`) |
+| 78 | 1 | `kind` | `BookSnapshot = 0`, `BookDelta = 1`, `BookCheckSnapshot = 2` (as in the Python schema), `Trade = 3` |
+| 79 | 1 | `side` | `Side` |
+| 80 | 1 | `flags` | `kLastInMessage`, `kHasMono`, `kHasVenueSeq`, `kHasChecksum`, `kHasDepth`, `kHasTradeId`, `kEventTsFromReceipt` |
+| 81 | 7 | `reserved` | Zero |
+
+`OrderRequest`, 64 bytes (core to execution): `client_order_id` 0,
+`target_order_id` 8 (the order a cancel refers to), `price` 16, `qty` 24,
+`created_ts` 32, `created_mono` 40, `instrument` 48 (4), `kind` 52 (`New`,
+`Cancel`), `side` 53, `type` 54 (`Limit`, `Market`), `time_in_force` 55
+(`GoodTillCancel`, `ImmediateOrCancel`, `PostOnly`), `reserved` 56 (8).
+
+`ExecutionReport`, 80 bytes (execution to core): `client_order_id` 0,
+`exec_id` 8, `last_price` 16, `last_qty` 24, `leaves_qty` 32, `event_ts` 40,
+`recv_ts` 48, `recv_mono` 56, `instrument` 64 (4), `reject_code` 68 (2),
+`kind` 70 (`Ack`, `Reject`, `PartialFill`, `Fill`, `Cancelled`), `side` 71,
+`reserved` 72 (8).
+
+The order messages are a first cut, defined now so the queue and journal
+work has concrete types; Phases 9 and 10 may extend them, through a new
+layout and an ADR rather than an in-place change.
+
 ## 7. Storage
 
 Details and alternatives are in ADR 0006.

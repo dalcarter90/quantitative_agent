@@ -30,7 +30,7 @@ before making it.
 | 1e | Data core: recording clock (ADR 0011) | Done |
 | 2 | Python reference order book reconstructor | Done |
 | 2a | Replay order and monotonic receive time (ADR 0012) | Done |
-| 3 | C++ core types | Not started |
+| 3 | C++ core types | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -818,16 +818,80 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
 
 ## Part B: C++ hot path
 
-### Phase 3: C++ core types
+### Phase 3: C++ core types (done)
 
-- [ ] `Price`, `Qty` strong types, `Timestamp`, instrument id, instrument
+- [x] `Price`, `Qty` strong types, `Timestamp`, instrument id, instrument
       metadata, `Side`. No implicit conversion to floating point (verified by
       a compile-fail check or `static_assert` on convertibility).
-- [ ] 128-bit notional helper that compiles on MSVC, with overflow tests.
-- [ ] `MarketEvent` and order message structs: fixed size, trivially copyable
+- [x] 128-bit notional helper that compiles on MSVC, with overflow tests.
+- [x] `MarketEvent` and order message structs: fixed size, trivially copyable
       (`static_assert`), size and layout documented.
-- [ ] `Clock` interface with system and manual implementations.
-- [ ] Types exposed in `quantagent._core`; Python round-trip tests.
+- [x] `Clock` interface with system and manual implementations.
+- [x] Types exposed in `quantagent._core`; Python round-trip tests.
+
+**What was built** (`cpp/include/qa/`, `cpp/src/clock.cpp`, bindings in
+`cpp/bindings/module.cpp`):
+
+- `types.hpp`: `Price`, `Qty`, `Timestamp`, `MonoTimestamp` (ADR 0012),
+  `InstrumentId`, `Side`, `InstrumentMeta`. Construction only from integers
+  that fit without loss; floating point and bool constructors are deleted.
+- `notional.hpp`: `Int128`, `multiply` (`_mul128` on MSVC x64),
+  `multiply_portable`, `notional(Price, Qty)`, `to_int64`.
+- `events.hpp`: `MarketEvent` (88 bytes), `OrderRequest` (64),
+  `ExecutionReport` (80), and their enums. Layouts in architecture
+  section 6.3.
+- `clock.hpp`: `Clock`, `SystemClock`, `ManualClock` (including a wall-clock
+  step on its own, for testing ADR 0012 behaviour).
+- Python (`quantagent._core`): all of the above, plus `to_bytes`,
+  `from_bytes` (which refuses unknown enum values and non-zero reserved
+  bytes), `size()` and `layout()` for each message, and `notional` returning
+  an exact Python int.
+
+**Verified:**
+
+- 15 new GoogleTest cases plus compile-time checks: the conversion rules as
+  `static_assert`s on `is_convertible`, `is_constructible` and concepts for
+  `+`, `*` and `<` between the types; every layout offset; no padding
+  (`has_unique_object_representations`); 128-bit products against known
+  values, at the int64 boundary, and the intrinsic against the portable
+  version on 200,000 random pairs.
+- 92 new Python round-trip tests: every int64 extreme through every type and
+  field and back, through `to_bytes`/`from_bytes`, with floats, bools,
+  strings and out-of-range integers refused.
+- The C++ `SystemClock`'s counter agrees with Python's `perf_counter_ns`
+  within 1 ms, so stamps from C++ feed threads will be comparable with the
+  recorder's (ADR 0012).
+- 15 deliberate breakages (portable multiply, overflow detection, ordering,
+  deleted conversions, layout, clocks, bindings): all caught, by a test or by
+  the build's `static_assert`s.
+- Benchmark baseline (this machine, Release, 12-core 4.1 GHz): `notional`
+  1.3 ns, `multiply_portable` 2.4 ns.
+
+**Notes for the next phases:**
+
+- **Phase 4 needs a Python-side converter** from `BookMessage` (the
+  reference reconstructor's input) to `MarketEvent`s, with `kLastInMessage`
+  on each message's last level so the C++ book knows when to verify a
+  checksum. It is not built yet because nothing uses it.
+- **`MarketEvent` is per level.** A Coinbase snapshot is about 38,000 events.
+  `level_index` is 32 bits for that reason; `depth` is 16 bits (Kraken's
+  largest is 1000).
+- **The order messages are a first cut** (architecture 6.3). They carry no
+  venue order id: Coinbase and Kraken use strings, which do not fit a fixed
+  layout. Phase 10 needs a mapping from our `client_order_id` to the venue's
+  id, kept by the execution thread.
+- **A recorder bug from Phase 1c was fixed here.** When the stream's
+  receive timed out at the session deadline, the event loop's timer could
+  fire a few milliseconds early (its clock ticks every 15.6 ms on Windows),
+  and the recorder then opened a pointless new connection for the remaining
+  milliseconds. It showed up as a test failing about 1 run in 25. A timeout
+  within 0.1 s of the deadline now ends the session; one earlier than that
+  is still a failure that reconnects. Two deterministic tests cover both.
+  The one-hour recordings were not affected (their connection counts are
+  exactly one stream plus six probes).
+- **The Linux preset is still unbuilt.** `__int128` is the GCC/Clang path for
+  `multiply`; it is only exercised once a Linux build exists, and the test
+  that compares it with the portable version will cover it then.
 
 ### Phase 4: C++ order book, verified
 
