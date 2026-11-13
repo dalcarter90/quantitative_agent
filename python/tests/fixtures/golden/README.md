@@ -5,33 +5,40 @@ The order book rebuilt by the Python reference reconstructor
 in `../raw/`. Phase 4 checks the C++ order book against these, message by
 message.
 
-| File | Built from | Rows (stream messages) |
-|------|------------|------------------------|
-| `kraken-BTC-USD.top20.parquet` | `../raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst` | 13,782 |
-| `coinbase-BTC-USD.top20.parquet` | `../raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst` | 2,702 |
+| File | Built from | Log id | Rows (stream messages) |
+|------|------------|--------|------------------------|
+| `kraken-BTC-USD.top20.parquet` | `../raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst` | `20261111T030647.970222600Z-164f377e87e8` | 13,782 |
+| `coinbase-BTC-USD.top20.parquet` | `../raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst` | `20261111T030647.970222600Z-6fd8ece9ac35` | 2,702 |
 
 ## Format
 
 Parquet, zstd-compressed, one row per stream message in replay order
-(`recv_ts`, then `seq`). Independent check snapshots are not part of the
-stream and have no row.
+(`log_id`, then `seq`; ADR 0013). Independent check snapshots are not part of
+the stream and have no row.
 
 | Column | Type | Meaning |
 |--------|------|---------|
-| `recv_ts` | int64 | The raw record the message came from: receive time, ns since the Unix epoch |
+| `log_id` | string | The raw log the message came from (ADR 0013) |
 | `seq` | uint64 | The raw record's number in its log |
+| `recv_ts` | int64 | When that record was received: ns since the Unix epoch, wall clock. Information only, not an ordering key |
 | `bid_price_00`, `bid_qty_00` | int64, nullable | The best bid after the message: price mantissa and quantity mantissa |
 | `ask_price_00`, `ask_qty_00` | int64, nullable | The best ask after the message |
 | `bid_price_NN` ... `ask_qty_NN` | int64, nullable | The level of rank `NN` (00 to 19, best first) on each side |
 
 Columns run rank by rank: `bid_price_00, bid_qty_00, ask_price_00,
-ask_qty_00, bid_price_01, ...`, 82 columns in all. A rank the book does not
+ask_qty_00, bid_price_01, ...`, 83 columns in all. A rank the book does not
 have is null on both price and quantity. Prices and quantities are int64
 mantissas at the instrument's `price_exp` and `qty_exp` (ADR 0005): Kraken
 BTC-USD is 1 and 8, Coinbase BTC-USD is 2 and 8. Rank 00 is the top of book.
 
 Kraken books are the subscribed 25 levels, cut to depth after every message;
 Coinbase books are the full book. The file holds the top 20 of each.
+
+## History
+
+- ADR 0013 added the `log_id` column and moved `recv_ts` after `seq`. Every
+  row, `seq`, `recv_ts` and level value is unchanged from the files it
+  replaced, checked column by column when they were regenerated.
 
 ## Regenerating
 

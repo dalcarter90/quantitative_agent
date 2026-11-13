@@ -181,11 +181,12 @@ def test_findings_are_structured():
         venue="kraken",
         instrument=INSTRUMENT,
         dataset="trades",
+        log_id="L",
         recv_ts=5,
         seq=7,
         message="price 0",
     )
-    assert finding.where == "kraken/BTC-USD trades record (recv_ts 5, seq 7)"
+    assert finding.where == "kraken/BTC-USD trades record (log L, seq 7)"
     assert Severity.INFO < Severity.WARNING < Severity.ERROR
     with pytest.raises(AttributeError):
         finding.severity = Severity.INFO
@@ -322,11 +323,9 @@ def test_a_message_received_long_after_its_venue_time_is_flagged(tmp_path, krake
         )
 
     result = run(check_clock_skew, planted(tmp_path, kraken_rows, edit))
-    # Arriving 25 seconds late also puts it after messages with later venue times.
-    assert brief(result) == [
-        ("late", Severity.WARNING, "trades", victim["seq"]),
-        ("event_ts_backwards", Severity.WARNING, "trades", victim["seq"]),
-    ]
+    # Only its receive time changed, not its place in the log, so venue time does
+    # not step back: stored data is in record order, not recv_ts order (ADR 0013).
+    assert brief(result) == [("late", Severity.WARNING, "trades", victim["seq"])]
     finding = result.findings[0]
     assert finding.recv_ts == victim["event_ts"] + 25 * NS
     assert "25.000 s" in finding.message
@@ -560,6 +559,7 @@ def synthetic_trades(tmp_path, prices):
             "event_ts": 1_000 * NS + i * NS,
             "event_ts_source": "venue",
             "recv_ts": 1_000 * NS + i * NS + 1,
+            "log_id": "20231114T120000.000000000Z-000000000000",
             "seq": i,
             "trade_id": f"t{i:04d}",
             "price": price,
@@ -963,10 +963,11 @@ def test_each_session_is_judged_on_its_own(tmp_path, kraken_rows):
 # --- wall clock steps (ADR 0012) ----------------------------------------------------------------
 
 
-def clock_step(rows, seq_offset, step):
+def clock_step(rows, step):
+    """A step noticed at the stream's last record (its disconnect), as the
+    adapter notes it: one more event of that record (ADR 0013 keys)."""
     last = rows[EVENTS][-2]
-    return {**last, "seq": last["seq"] + seq_offset, "recv_ts": last["recv_ts"] + seq_offset,
-            "event_ts": last["recv_ts"] + seq_offset, "event_index": 0,
+    return {**last, "event_index": last["event_index"] + 1,
             "kind": StreamEventKind.CLOCK_STEP, "connection": "ws", "expected": None,
             "observed": step, "detail": None}  # fmt: skip
 
@@ -979,7 +980,7 @@ def test_a_wall_clock_step_beyond_the_threshold_is_flagged_with_its_size(
 ):
     def edit(rows):
         with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"))
-        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, 1, step), rows[EVENTS][-1]]
+        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, step), rows[EVENTS][-1]]
 
     result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
     (finding,) = result.findings
@@ -996,7 +997,7 @@ def test_a_wall_clock_step_beyond_the_threshold_is_flagged_with_its_size(
 def test_a_step_below_the_threshold_is_counted_but_not_flagged(tmp_path, kraken_rows):
     def edit(rows):
         with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"))
-        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, 1, -30_000_000), rows[EVENTS][-1]]
+        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, -30_000_000), rows[EVENTS][-1]]
 
     root = planted(tmp_path, kraken_rows, edit)
     result = run(check_recording_clock, root)
@@ -1024,3 +1025,51 @@ def test_a_measured_session_without_monotonic_stamps_cannot_be_checked_for_steps
 
 def test_the_step_threshold_default():
     assert QualityConfig().max_clock_step_ns == 50_000_000
+
+
+# --- findings name their log (ADR 0013) ------------------------------------------------------
+
+
+def test_findings_point_at_the_log_and_record(tmp_path, kraken_rows):
+    victim = live_trades(kraken_rows)[60]
+
+    def edit(rows):
+        rows[TRADES] = [
+            {**r, "qty": 0} if r["trade_id"] == victim["trade_id"] else r for r in rows[TRADES]
+        ]
+
+    (finding,) = run(check_outliers, planted(tmp_path, kraken_rows, edit)).findings
+    assert (finding.log_id, finding.seq, finding.recv_ts) == (
+        victim["log_id"], victim["seq"], victim["recv_ts"]
+    )  # fmt: skip
+    assert f"log {victim['log_id']}, seq {victim['seq']}" in finding.where
+
+
+def test_a_backfill_marks_trades_of_its_own_log_only(tmp_path, kraken_rows, clean_store):
+    """A TRADE_BACKFILL event at the same seq of another log is a different
+    record: it must not take a live trade out of the lag statistics."""
+    victim = live_trades(kraken_rows)[60]
+    (backfill,) = [e for e in kraken_rows[EVENTS] if e["kind"] == StreamEventKind.TRADE_BACKFILL]
+    other = "29991231T000000.000000000Z-ffffffffffff"
+
+    def edit(rows):
+        rows[EVENTS] = [*rows[EVENTS], {**backfill, "log_id": other, "seq": victim["seq"]}]
+
+    result = run(check_clock_skew, planted(tmp_path, kraken_rows, edit))
+    assert result.stats == run(check_clock_skew, clean_store).stats
+
+
+def test_venue_time_is_compared_within_each_log_only(tmp_path, kraken_rows):
+    """A second, earlier-venue-time log is a different stream: its first
+    message is not compared with the end of the log before it."""
+    later = "29991231T000000.000000000Z-ffffffffffff"
+    earliest = min(r["event_ts"] for r in kraken_rows[BOOK])
+
+    def edit(rows):
+        copy = [{**r, "log_id": later, "event_ts": earliest + (r["event_ts"] - earliest) // 2,
+                 "recv_ts": earliest + (r["event_ts"] - earliest) // 2 + 1_450_000_000}
+                for r in rows[BOOK][:200]]  # fmt: skip
+        rows[BOOK] = rows[BOOK] + copy
+
+    result = run(check_clock_skew, planted(tmp_path, kraken_rows, edit))
+    assert [f.what for f in result.findings if f.what == "event_ts_backwards"] == []

@@ -54,18 +54,26 @@ clock. See section 7.
 ## 2. Datasets
 
 All four share leading columns `event_ts`, `event_ts_source`, `recv_ts`,
-`seq` (the raw log record number), and `knowledge_ts` in storage. Venue,
-instrument and date are not columns in the files; they are the partition
-directories, and they appear as columns in the session's views.
+`log_id` (the raw log the row came from), `seq` (the record number in that
+log), and `knowledge_ts` in storage. Venue, instrument and date are not
+columns in the files; they are the partition directories, and they appear as
+columns in the session's views.
+
+**`log_id`** (ADR 0013) is derived from a log's first record:
+`<UTC time of that record, to the ns>Z-<12 hex digits of its SHA-256>`, for
+example `20261111T030919.259642800Z-2ca464c155f1` (`rawlog.log_id_of`). It is
+the same however the log is read (sealed or not, cut short, copied, renamed),
+and ids sort by when their logs began. `(log_id, seq)` names one raw record.
+No key uses `recv_ts`, which is a measurement (ADR 0012).
 
 | Dataset | One row per | Key (within venue and instrument) | Other columns |
 |---------|-------------|-----------------------------------|---------------|
 | `trades` | Trade | `trade_id` | `price`, `qty`, `side` (the aggressor: `BUY`, `SELL` or `UNKNOWN`) |
-| `book_events` | Price level of a book message | `recv_ts, seq, level_index` | `kind` (`SNAPSHOT`, `DELTA`, `CHECK_SNAPSHOT`), `side`, `price`, `qty`, `level_index`, and the venue's integrity fields `venue_seq_first`, `venue_seq_last`, `checksum`, `depth` (each optional; ADR 0009) |
-| `instruments` | Version of an instrument's metadata | `event_ts` (when the version takes effect) | `price_exp`, `qty_exp`, `tick_size`, `lot_size` |
-| `stream_events` | Integrity event (ADR 0010) | `recv_ts, seq, event_index` | `kind`, `connection`, `expected`, `observed`, `detail` |
+| `book_events` | Price level of a book message | `log_id, seq, level_index` | `kind` (`SNAPSHOT`, `DELTA`, `CHECK_SNAPSHOT`), `side`, `price`, `qty`, `level_index`, and the venue's integrity fields `venue_seq_first`, `venue_seq_last`, `checksum`, `depth` (each optional; ADR 0009) |
+| `instruments` | Version of an instrument's metadata, as observed in one raw record | `log_id, seq` (`event_ts` says when the version takes effect) | `price_exp`, `qty_exp`, `tick_size`, `lot_size` |
+| `stream_events` | Integrity event (ADR 0010) | `log_id, seq, event_index` | `kind`, `connection`, `expected`, `observed`, `detail` |
 
-Book rows of one message share `recv_ts` and `seq` and are numbered by
+Book rows of one message share `log_id` and `seq` and are numbered by
 `level_index` in the order the venue listed them, which matters because a
 venue may change one price twice in a message. A `DELTA` with quantity 0
 removes the level. A `CHECK_SNAPSHOT` is an independent image of the book
@@ -80,7 +88,8 @@ kinds.
 
 The schema rejects structural errors only: wrong types, nulls in required
 columns, unknown enum values, negative timestamps, invalid metadata, and a
-`"receipt"` row whose `event_ts` differs from its `recv_ts`. Implausible
+`"receipt"` row whose `event_ts` differs from its `recv_ts`, and a `log_id`
+not of the form above. Implausible
 market values (a zero price) are stored as received and left to the quality
 checks. Build tables with `schema.table_from_rows`, which refuses floats,
 bools and numeric strings that pyarrow would silently convert.
@@ -100,8 +109,18 @@ bools and numeric strings that pyarrow would silently convert.
   written under a temporary name and published by hard link, which cannot
   replace a file; a failed multi-partition append publishes nothing.
 - A **correction** is a new row with the same key and a later `knowledge_ts`.
-  Because book events and stream events are keyed by the raw record they came
-  from, normalizing a raw log again produces corrections, not duplicates.
+  Because book events, stream events and instrument versions are keyed by the
+  raw record they came from, and a log keeps its `log_id`, normalizing a raw
+  log again produces corrections, not duplicates. Two logs never collide, so
+  several recorders of one instrument can run at once (ADR 0013).
+- **Order.** The range methods return rows in `(log_id, seq)` order: one log
+  after another, in the order they began, each in the order its records
+  arrived. Logs are not interleaved in the store; merging logs by arrival is
+  done on raw logs (`logorder.merge_logs`, section 5).
+- **Schema versions** are written into every file (`qa.schema_version`).
+  Files of an older version cannot be read with the current code: a store
+  written before ADR 0013 has no `log_id` and must be rebuilt from its raw
+  logs.
 - Limits: one writer per store root (assumed, not locked); hard links need
   NTFS or ext4; venue and instrument names are restricted to
   `A-Z a-z 0-9 . _ -`.
@@ -119,8 +138,9 @@ with PITSession(store_root, as_of=t) as s:
 ```
 
 Every method returns the latest version of each record among the rows with
-`knowledge_ts <= as_of`, as a pyarrow table (or an `InstrumentMeta`). The
-views are `trades`, `book_events`, `instruments` and `stream_events`, each
+`knowledge_ts <= as_of`, as a pyarrow table (or an `InstrumentMeta`). Range
+methods return rows in `(log_id, seq)` order (section 3); `instruments` by
+`event_ts`, then `(log_id, seq)`. The views are `trades`, `book_events`, `instruments` and `stream_events`, each
 with `venue`, `instrument`, `date` and then the stored columns.
 
 Look-ahead is blocked in three independent layers:
@@ -225,7 +245,8 @@ silently.
 
 Each check is a function `check(session, venue, instrument, start, end,
 config)` returning a `CheckResult` with `Finding`s (check, severity, a stable
-code, the raw record it points at, a message) and counts of what it examined.
+code, the raw record it points at as `log_id` and `seq` with its `recv_ts`, a
+message) and counts of what it examined.
 Checks read only through `PITSession` and never change data. Findings per
 check and instrument are capped at `max_findings`, and the result says when
 the cap was hit.
@@ -239,7 +260,7 @@ the cap was hit.
 | `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected` | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
 | | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
-| `clock_skew` | `recv_ts - event_ts` below `min_lag_ns` (`early`, including venue time later than receipt) or above `max_lag_ns` (`late`); venue time stepping back between consecutive messages by more than `max_backwards_ns` (`event_ts_backwards`). One finding per message. Only rows with `event_ts_source = "venue"`; backfilled trades (marked by `TRADE_BACKFILL`) are excluded, because their receipt time says nothing about when they happened | WARNING |
+| `clock_skew` | `recv_ts - event_ts` below `min_lag_ns` (`early`, including venue time later than receipt) or above `max_lag_ns` (`late`); venue time stepping back between consecutive messages of one log (in `seq` order) by more than `max_backwards_ns` (`event_ts_backwards`). One finding per message. Only rows with `event_ts_source = "venue"`; backfilled trades (marked by `TRADE_BACKFILL`) are excluded, because their receipt time says nothing about when they happened | WARNING |
 | `crossed_books` | A snapshot (stream or check) whose best bid is at (`locked`) or above (`crossed`) its best ask | ERROR |
 | | A snapshot with only one side (`one_sided`) | WARNING |
 | `outliers` | Zero or negative trade price or quantity, zero or negative book price, negative book quantity | ERROR |
@@ -326,15 +347,15 @@ python -m quantagent.data.book golden --store ... --venue ... --instrument ... -
   the stream raises, and a new session or connection means the next message
   must be a snapshot.
 - **It raises; it never repairs.** `DeltaBeforeSnapshot`, `ChecksumMismatch`,
-  `SequenceBreak` and `StreamFault` carry the raw record (`recv_ts`, `seq`)
-  and the values involved.
-- **Check snapshots** are compared with the book rebuilt up to the last
-  stream message whose venue time is at or before the snapshot's, level by
-  level within the snapshot's depth.
-- **Order.** Stored rows are replayed in `(recv_ts, seq)` order, which is
-  arrival order only while the wall clock does not step back; a stored
-  backward `CLOCK_STEP` makes the reconstructor raise
-  `ReplayOrderUnreliable` (ADR 0012, "Open").
+  `SequenceBreak` and `StreamFault` carry the raw record (`log_id`, `seq`,
+  with its `recv_ts`) and the values involved.
+- **Check snapshots** are compared with the book rebuilt from their own log's
+  stream, up to the last message whose venue time is at or before the
+  snapshot's, level by level within the snapshot's depth.
+- **Order.** Stored rows are replayed in `(log_id, seq)` order: each log in
+  the order its records arrived, from its own snapshot, whatever the wall
+  clock did (ADR 0013). A clock step is reported by the `recording_clock`
+  check, not by the reconstructor.
 - **What it cannot see:** a lost Kraken update that does not touch the ten
   best levels before it is overwritten, and a repeated Kraken update (the
   quantities are absolute, so the book does not change).

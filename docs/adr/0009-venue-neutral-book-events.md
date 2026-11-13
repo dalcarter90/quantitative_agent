@@ -1,6 +1,6 @@
 # 0009: Venue-neutral book events, with Kraken as the second venue
 
-Status: Accepted (confirmed by the owner as written, 2026-11-11), amended by 0010
+Status: Accepted (confirmed by the owner as written, 2026-11-11), amended by 0010 and 0013
 Date: 2026-11-11
 Amends: 0006
 

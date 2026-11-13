@@ -27,7 +27,7 @@ from os import PathLike
 from typing import Any
 
 from quantagent.data.fixedpoint import to_mantissa
-from quantagent.data.rawlog import RawRecord, read_raw_log
+from quantagent.data.rawlog import RawRecord, log_id_of, read_raw_log
 from quantagent.data.schema import (
     DATASETS,
     EVENT_TS_RECEIPT,
@@ -393,12 +393,17 @@ class Normalizer:
         self._rows: dict[RowKey, list[Row]] = {}
         self.pending_rows = 0  # rows produced and not yet taken
         self.report = Report()
+        self._log_id: str | None = None  # the raw log being fed (ADR 0013)
 
     def feed(self, record: RawRecord) -> None:
         report = self.report
         report.records += 1
+        if record.seq == 0:
+            self._log_id = log_id_of(record)  # every raw log begins at seq 0
         adapter = self._adapters.get(record.venue)
         try:
+            if self._log_id is None:
+                raise Rejected("no_log_start", "no record with seq 0 before this one")
             if adapter is None:
                 if record.venue not in self._registry:
                     raise Rejected("unknown_venue", record.venue)
@@ -424,6 +429,7 @@ class Normalizer:
         report.messages[kind] += 1
         instrument = adapter.instrument
         for dataset_name, row in rows:
+            row["log_id"] = self._log_id
             self._rows.setdefault((dataset_name, record.venue, instrument), []).append(row)
             report.rows[dataset_name] += 1
         self.pending_rows += len(rows)
@@ -435,7 +441,7 @@ class Normalizer:
         self.report.rejects.append(
             Reject(record.seq, record.recv_ts, record.channel, reason, detail or reason)
         )
-        if adapter is not None:
+        if adapter is not None and self._log_id is not None:
             # A record that could not be normalized is a hole in the stream.
             adapter.note(
                 StreamEventKind.MESSAGE_REJECTED,
@@ -459,6 +465,7 @@ class Normalizer:
                     "event_ts": record.recv_ts,
                     "event_ts_source": EVENT_TS_RECEIPT,
                     "recv_ts": record.recv_ts,
+                    "log_id": self._log_id,
                     "seq": record.seq,
                     "event_index": index,
                     **event,

@@ -51,6 +51,7 @@ def test_views_have_partition_columns_and_stored_columns(session):
         "event_ts_source",
         "recv_ts",
         "knowledge_ts",
+        "log_id",
         "seq",
         "trade_id",
         "price",

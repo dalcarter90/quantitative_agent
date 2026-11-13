@@ -25,12 +25,14 @@ Version 1 segments (``MAGIC_V1``, written before ADR 0012) have no
 writer only writes version 2.
 """
 
+import hashlib
 import os
 import struct
 import time
 import zlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -63,6 +65,34 @@ class RawRecord:
     payload: bytes  # exactly what was received
     # The monotonic counter at the same moment as recv_ts; None in version 1 logs.
     recv_mono_ns: int | None = None
+
+
+def log_id_of(first: RawRecord) -> str:
+    """The identity of the raw log whose first record (seq 0) is ``first`` (ADR 0013).
+
+    ``<UTC time of the first record, to the ns>Z-<12 hex digits of its SHA-256>``.
+    It depends only on the first record, so a log keeps its id whether it is
+    sealed or not, cut short, or read again. Ids sort by when their logs began.
+    """
+    if first.seq != 0:
+        raise ValueError(f"a log id comes from a log's first record (seq 0), not seq {first.seq}")
+    seconds, nanoseconds = divmod(first.recv_ts, 1_000_000_000)
+    started = datetime.fromtimestamp(seconds, UTC).strftime("%Y%m%dT%H%M%S")
+    venue, channel = first.venue.encode("utf-8"), first.channel.encode("utf-8")
+    mono = _NO_MONO if first.recv_mono_ns is None else first.recv_mono_ns
+    digest = hashlib.sha256(
+        b"".join(
+            (
+                _FIXED.pack(first.recv_ts, mono, first.seq),
+                bytes([len(venue)]),
+                venue,
+                bytes([len(channel)]),
+                channel,
+                first.payload,
+            )
+        )
+    ).hexdigest()
+    return f"{started}.{nanoseconds:09d}Z-{digest[:12]}"
 
 
 def _encode_name(kind: str, value: str) -> bytes:

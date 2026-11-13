@@ -29,7 +29,7 @@ from test_adapters import (
 from test_fixtures import INSTRUMENT, VENUES, fixture_path
 
 from quantagent.data.adapters import ingest, normalize
-from quantagent.data.rawlog import RawLogWriter, read_raw_log
+from quantagent.data.rawlog import RawLogWriter, log_id_of, read_raw_log
 from quantagent.data.schema import (
     DATASETS,
     STREAM_EVENTS,
@@ -59,6 +59,7 @@ def event_row(**overrides):
         "event_ts": 77,
         "event_ts_source": "receipt",
         "recv_ts": 77,
+        "log_id": "20231114T120000.000000000Z-000000000000",
         "seq": 3,
         "event_index": 0,
         "kind": K.SEQUENCE_GAP,
@@ -76,12 +77,13 @@ def event_row(**overrides):
 
 def test_stream_events_is_a_registered_bitemporal_dataset():
     assert DATASETS["stream_events"] is STREAM_EVENTS
-    assert STREAM_EVENTS.key == ("recv_ts", "seq", "event_index")
+    assert STREAM_EVENTS.key == ("log_id", "seq", "event_index")
     assert STREAM_EVENTS.stored_schema.names == [
         "event_ts",
         "event_ts_source",
         "recv_ts",
         "knowledge_ts",
+        "log_id",
         "seq",
         "event_index",
         "kind",
@@ -97,7 +99,7 @@ def test_stream_events_is_a_registered_bitemporal_dataset():
     assert schema.field("observed").type == pa.int64()
     for name in ("connection", "expected", "observed", "detail"):
         assert schema.field(name).nullable, name
-    for name in ("event_ts", "recv_ts", "seq", "event_index", "kind"):
+    for name in ("event_ts", "recv_ts", "log_id", "seq", "event_index", "kind"):
         assert not schema.field(name).nullable, name
 
 
@@ -213,6 +215,7 @@ def test_every_stream_event_refers_to_its_raw_record_and_takes_the_receipt_time(
     assert rows
     by_seq = {r.seq: r for r in records}
     for row in rows:
+        assert row["log_id"] == log_id_of(records[0])
         assert row["recv_ts"] == by_seq[row["seq"]].recv_ts
         assert (row["event_ts"], row["event_ts_source"]) == (row["recv_ts"], "receipt")
     table_from_rows(STREAM_EVENTS, rows)
@@ -466,7 +469,7 @@ def test_fixture_events_point_at_real_raw_records(capture):
     venue, records, normalized = capture
     by_seq = {r.seq: r for r in records}
     rows = events_of(normalized, venue)
-    keys = [(r["recv_ts"], r["seq"], r["event_index"]) for r in rows]
+    keys = [(r["log_id"], r["seq"], r["event_index"]) for r in rows]
     assert len(set(keys)) == len(keys)
     for row in rows:
         record = by_seq[row["seq"]]

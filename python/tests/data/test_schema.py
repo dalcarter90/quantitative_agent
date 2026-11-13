@@ -23,6 +23,7 @@ def trade_row(**overrides):
         "event_ts": 1_700_000_000_000_000_000,
         "event_ts_source": "venue",
         "recv_ts": 1_700_000_000_050_000_000,
+        "log_id": "20231114T120000.000000000Z-000000000000",
         "seq": 1,
         "trade_id": "t-1",
         "price": 9712310,
@@ -38,6 +39,7 @@ def book_row(**overrides):
         "event_ts": 1_700_000_000_000_000_000,
         "event_ts_source": "venue",
         "recv_ts": 1_700_000_000_050_000_000,
+        "log_id": "20231114T120000.000000000Z-000000000000",
         "seq": 1,
         "kind": BookEventKind.DELTA,
         "venue_seq_first": 100,
@@ -58,6 +60,7 @@ def instrument_row(**overrides):
         "event_ts": 1_700_000_000_000_000_000,
         "event_ts_source": "venue",
         "recv_ts": 1_700_000_000_050_000_000,
+        "log_id": "20231114T120000.000000000Z-000000000000",
         "seq": 1,
         "price_exp": 2,
         "qty_exp": 5,
@@ -288,8 +291,8 @@ def test_validate_table_rejects_non_tables():
 
 
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
-def test_every_dataset_is_at_schema_version_2_with_event_ts_source(dataset):
-    assert dataset.version == 2
+def test_every_dataset_is_at_schema_version_3_with_event_ts_source(dataset):
+    assert dataset.version == 3
     field = dataset.schema.field("event_ts_source")
     assert field.type == pa.string()
     assert not field.nullable
@@ -326,9 +329,9 @@ def test_a_receipt_row_must_hold_recv_ts_in_event_ts(dataset):
 
 
 def test_book_events_are_keyed_by_raw_record_and_position():
-    assert BOOK_EVENTS.key == ("recv_ts", "seq", "level_index")
+    assert BOOK_EVENTS.key == ("log_id", "seq", "level_index")
     assert TRADES.key == ("trade_id",)
-    assert INSTRUMENTS.key == ("event_ts",)
+    assert INSTRUMENTS.key == ("log_id", "seq")
 
 
 def test_book_events_work_for_a_venue_with_a_checksum_and_no_sequence_numbers():
@@ -371,3 +374,32 @@ def test_book_event_columns_must_be_structurally_valid(overrides):
     (column,) = overrides
     with pytest.raises(SchemaError, match=column):
         table_from_rows(BOOK_EVENTS, [book_row(**overrides)])
+
+
+# --- log_id (ADR 0013) ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
+def test_every_row_names_the_raw_log_it_came_from(dataset):
+    field = dataset.schema.field("log_id")
+    assert field.type == pa.string() and not field.nullable
+    names = dataset.stored_schema.names
+    assert names[names.index("knowledge_ts") + 1 : names.index("seq") + 1] == ["log_id", "seq"]
+
+
+@pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
+def test_no_key_depends_on_receive_time(dataset):
+    assert "recv_ts" not in dataset.key
+    assert "event_ts" not in dataset.key or dataset is TRADES
+
+
+@pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
+@pytest.mark.parametrize(
+    "bad",
+    ["", "test-log", "20231114T120000Z-000000000000", "20231114T120000.000000000Z-00000000000G",
+     "20231114T120000.000000000Z-0000000000000", " 20231114T120000.000000000Z-000000000000",
+     None, 5],
+)  # fmt: skip
+def test_log_id_must_be_well_formed(dataset, bad):
+    with pytest.raises(SchemaError, match="log_id"):
+        table_from_rows(dataset, [ROW_FACTORIES[dataset.name](log_id=bad)])

@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 from _builders import (
     INT64_MAX,
+    LOG,
     NS_PER_DAY,
     NS_PER_SECOND,
     T0,
@@ -197,8 +198,8 @@ def test_typed_results_use_the_stored_schema_and_replay_order(history):
         trades = session.trades(*KRK, *ALL_TIME)
         assert isinstance(trades, pa.Table)
         assert trades.schema.equals(TRADES.stored_schema)
-        order = [(r["recv_ts"], r["seq"]) for r in trades.to_pylist()]
-        assert order == sorted(order)
+        order = [(r["log_id"], r["seq"]) for r in trades.to_pylist()]
+        assert order == [(LOG, 0), (LOG, 1), (LOG, 2)]  # replay order (ADR 0013)
         assert session.book_events(*KRK, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
         assert session.instruments(*KRK).schema.equals(INSTRUMENTS.stored_schema)
 
@@ -266,7 +267,7 @@ def test_instrument_in_effect_is_the_latest_known_version_at_or_before_the_time(
 def test_instrument_defaults_to_the_version_in_effect_at_as_of(root):
     store = AppendOnlyStore(root, clock=FakeClock(100, 200))
     store.append(INSTRUMENTS, *KRK, instrument_table(1_000, tick_size=1))
-    store.append(INSTRUMENTS, *KRK, instrument_table(5_000, tick_size=2))
+    store.append(INSTRUMENTS, *KRK, instrument_table(5_000, tick_size=2, seq=1))
     with PITSession(root, as_of=4_999) as session:
         assert session.instrument(*KRK).tick_size == 1
     with PITSession(root, as_of=5_000) as session:
@@ -462,3 +463,26 @@ def test_the_data_package_exports_no_other_read_path():
         "book",  # reads only through PITSession (tested in test_book.py)
         "logorder",  # orders raw log records for replay; reads no store data
     }
+
+
+# --- order: (log_id, seq), never recv_ts (ADR 0012, ADR 0013) ---------------------------------
+
+
+def test_rows_come_back_in_log_and_seq_order_even_if_recv_ts_goes_backwards(root):
+    from quantagent.data.schema import table_from_rows
+
+    store = AppendOnlyStore(root, clock=FakeClock(1_000))
+    later_log = "20231114T130000.000000000Z-000000000001"
+    rows = []
+    # In the first log the wall clock stepped back after seq 1.
+    for log_id, seq, recv_ts in [(LOG, 0, T0 + 500), (LOG, 1, T0 + 900), (LOG, 2, T0 + 100),
+                                 (later_log, 0, T0 + 50), (later_log, 1, T0 + 60)]:  # fmt: skip
+        rows.append({"event_ts": T0, "event_ts_source": "venue", "recv_ts": recv_ts,
+                     "log_id": log_id, "seq": seq, "trade_id": f"{log_id[-1]}{seq}",
+                     "price": 1, "qty": 1, "side": 1})  # fmt: skip
+    store.append(TRADES, *KRK, table_from_rows(TRADES, rows))
+    with PITSession(root, as_of=INT64_MAX) as session:
+        got = session.trades(*KRK, 0, INT64_MAX).to_pylist()
+    assert [(r["log_id"], r["seq"]) for r in got] == [
+        (LOG, 0), (LOG, 1), (LOG, 2), (later_log, 0), (later_log, 1)
+    ]  # fmt: skip
