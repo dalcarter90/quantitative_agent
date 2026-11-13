@@ -26,6 +26,13 @@ that depend on the lag between venue time and receipt time (for example the
 clock skew band test) are written against this. See `docs/data-core.md`,
 section 7.
 
+## Raw log version
+
+These are version 1 raw logs, recorded before ADR 0012. Their records have no
+monotonic receive stamp (`recv_mono_ns` is None), so they cannot be merged
+with other logs, and clock steps during them cannot be detected. They are kept
+as recorded and are never rewritten.
+
 ## What is inside
 
 Each record has a receive time, a sequence number, the venue, a channel and

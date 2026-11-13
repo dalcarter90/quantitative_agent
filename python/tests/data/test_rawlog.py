@@ -66,7 +66,7 @@ def test_a_truncated_final_record_is_dropped_and_reported(tmp_path):
     payloads = [b"first record", b"second record", b"the final record, cut short"]
     written = write_log(path, payloads)
     whole = path.read_bytes()
-    last_start = whole.rindex(b"the final record") - 30  # safely inside the last record
+    last_start = whole.rindex(b"the final record") - 60  # inside the second-to-last record
 
     # Cut at every byte position from inside the last record's header to one
     # byte short of the end.
@@ -234,3 +234,63 @@ def test_records_are_readable_while_the_log_is_still_open(tmp_path):
         assert list(read_raw_log(path)) == [first]
         second = writer.write("kraken", "ws", b"two")
         assert list(read_raw_log(path)) == [first, second]
+
+
+# --- version 2: monotonic receive stamps (ADR 0012) -----------------------------------------
+
+
+def test_records_carry_a_monotonic_stamp_taken_with_the_wall_time(tmp_path):
+    path = tmp_path / "a.qaraw"
+    walls, monos = iter(range(100, 10**6, 10)), iter(range(5_000, 10**7, 3))
+    with RawLogWriter(path, clock=lambda: next(walls), monotonic=lambda: next(monos)) as writer:
+        stamped = writer.write("kraken", "ws", b"x")
+        given = writer.write("kraken", "ws", b"y", recv_ts=999, recv_mono_ns=777)
+        copied = writer.write("kraken", "ws", b"z", recv_ts=555)  # from a log without stamps
+    assert (stamped.recv_ts, stamped.recv_mono_ns) == (100, 5_000)
+    assert (given.recv_ts, given.recv_mono_ns) == (999, 777)
+    assert (copied.recv_ts, copied.recv_mono_ns) == (555, None)
+    reader = read_raw_log(path)
+    assert list(reader) == [stamped, given, copied]
+    assert reader.version == 2
+
+
+def test_the_writer_always_writes_version_2(tmp_path):
+    path = tmp_path / "a.qaraw"
+    RawLogWriter(path).close()
+    assert path.read_bytes() == b"QARAW\x02\n"
+
+
+def test_by_default_both_stamps_come_from_the_system_clocks(tmp_path):
+    import time
+
+    with RawLogWriter(tmp_path / "a.qaraw") as writer:
+        wall, mono = time.time_ns(), time.perf_counter_ns()
+        record = writer.write("kraken", "ws", b"x")
+    assert 0 <= record.recv_ts - wall < 1_000_000_000
+    assert 0 <= record.recv_mono_ns - mono < 1_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"recv_mono_ns": 5}, ValueError),  # a monotonic stamp without its wall time
+        ({"recv_ts": 5, "recv_mono_ns": -1}, ValueError),
+        ({"recv_ts": 5, "recv_mono_ns": 2**63}, ValueError),
+        ({"recv_ts": 5, "recv_mono_ns": 1.5}, TypeError),
+        ({"recv_ts": 5, "recv_mono_ns": True}, TypeError),
+    ],
+)
+def test_monotonic_stamps_are_validated(tmp_path, arguments, error):
+    with RawLogWriter(tmp_path / "a.qaraw") as writer:
+        with pytest.raises(error):
+            writer.write("kraken", "ws", b"x", **arguments)
+
+
+def test_version_1_logs_are_still_read_and_have_no_monotonic_stamps():
+    from test_fixtures import fixture_path
+
+    for venue in ("kraken", "coinbase"):
+        reader = read_raw_log(fixture_path(venue))
+        records = list(reader)
+        assert reader.version == 1
+        assert records and {r.recv_mono_ns for r in records} == {None}

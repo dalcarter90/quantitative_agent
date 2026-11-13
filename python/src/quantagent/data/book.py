@@ -101,6 +101,20 @@ class StreamFault(BookIntegrityError):
     """A message on the stream could not be normalized, so the stream has a hole."""
 
 
+class ReplayOrderUnreliable(BookIntegrityError):
+    """The wall clock stepped back during the session. Stored rows are ordered
+    by (recv_ts, seq), which is then no longer arrival order (ADR 0012)."""
+
+    def __init__(self, recv_ts: int, seq: int, step_ns: int):
+        super().__init__(
+            recv_ts,
+            seq,
+            f"the wall clock stepped {abs(step_ns) / 1e6:.1f} ms back here, so ordering stored "
+            "rows by (recv_ts, seq) is no longer arrival order (ADR 0012)",
+        )
+        self.step_ns = step_ns
+
+
 # --- the book ---------------------------------------------------------------------------
 
 
@@ -266,7 +280,12 @@ class _Replayer:
         if venue not in _VENUES:
             raise ValueError(f"no book rule for venue {venue!r}")
         self.venue, self.verify = venue, verify
-        relevant = [e for e in events if e["connection"] in (_STREAM, None)]
+        # The wall clock is shared by every connection, so its steps always count.
+        relevant = [
+            e
+            for e in events
+            if e["connection"] in (_STREAM, None) or e["kind"] == StreamEventKind.CLOCK_STEP
+        ]
         self._events = sorted(relevant, key=lambda e: (e["recv_ts"], e["seq"], e["event_index"]))
         self._next_event = 0
         self.book: ReferenceBook | None = None
@@ -297,6 +316,8 @@ class _Replayer:
             raise ChecksumMismatch(
                 recv_ts, seq, event["expected"], event["observed"], "stream_event"
             )
+        elif kind == StreamEventKind.CLOCK_STEP and event["observed"] < 0:
+            raise ReplayOrderUnreliable(recv_ts, seq, event["observed"])
         elif kind == StreamEventKind.MESSAGE_REJECTED:
             raise StreamFault(recv_ts, seq, f"a stream message was rejected: {event['detail']}")
 

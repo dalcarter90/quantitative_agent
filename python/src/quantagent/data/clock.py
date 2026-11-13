@@ -1,4 +1,5 @@
-"""How far this machine's clock is from true time (ADR 0011).
+"""How far this machine's clock is from true time (ADR 0011), and which
+monotonic counter its receive stamps come from (ADR 0012).
 
 Every ``recv_ts`` and ``knowledge_ts`` comes from the wall clock, so the
 recorder measures the clock against several NTP servers before it starts and
@@ -16,6 +17,7 @@ the servers' offsets, so one wrong server cannot move it far.
 import socket
 import statistics
 import struct
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -144,3 +146,116 @@ def measure_offset(
     answered = [sample.offset_ns for sample in results if sample.offset_ns is not None]
     offset = statistics.median_low(answered) if len(answered) >= MIN_SERVERS else None
     return ClockMeasurement(offset_ns=offset, samples=tuple(results))
+
+
+# --- monotonic receive stamps (ADR 0012) ------------------------------------------------
+
+
+def stamp() -> tuple[int, int]:
+    """Read the wall clock and the monotonic counter together.
+
+    Returns ``(recv_ts, recv_mono_ns)``: nanoseconds since the Unix epoch, and
+    nanoseconds on the system's monotonic high-resolution counter, which no
+    time service can step. Both are read back to back.
+    """
+    return time.time_ns(), time.perf_counter_ns()
+
+
+def _windows_value(key: str, name: str) -> str | None:
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
+            return str(winreg.QueryValueEx(handle, name)[0])
+    except OSError:
+        return None
+
+
+def _file_value(path: str) -> str | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _machine_id() -> str | None:
+    if sys.platform == "win32":
+        return _windows_value(r"SOFTWARE\Microsoft\Cryptography", "MachineGuid")
+    return _file_value("/etc/machine-id")
+
+
+def _boot_id() -> str | None:
+    if sys.platform == "win32":
+        # Incremented by Windows on every boot.
+        value = _windows_value(
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+            r"\PrefetchParameters",
+            "BootId",
+        )
+        return None if value is None else f"BootId:{value}"
+    return _file_value("/proc/sys/kernel/random/boot_id")
+
+
+@dataclass(frozen=True)
+class ClockIdentity:
+    """Which counter a log's monotonic stamps come from.
+
+    Two logs' stamps can be compared only if they were taken on the same
+    machine, in the same boot, from the same counter. An unknown machine or
+    boot is never comparable.
+    """
+
+    platform: str
+    machine_id: str | None
+    boot_id: str | None
+    counter: str  # the counter's implementation, as Python reports it
+    counter_resolution_ns: int
+
+    def difference(self, other: "ClockIdentity") -> str | None:
+        """Why the two are not comparable, or None if they are."""
+        if self.machine_id is None or other.machine_id is None:
+            return "machine unknown"
+        if self.boot_id is None or other.boot_id is None:
+            return "boot unknown"
+        if self.machine_id != other.machine_id or self.platform != other.platform:
+            return "different machine"
+        if self.boot_id != other.boot_id:
+            return "different boot"
+        if self.counter != other.counter:
+            return "different counter"
+        return None
+
+    def comparable_with(self, other: "ClockIdentity") -> bool:
+        return self.difference(other) is None
+
+    def to_json(self) -> dict:
+        return {
+            "platform": self.platform,
+            "machine_id": self.machine_id,
+            "boot_id": self.boot_id,
+            "counter": self.counter,
+            "counter_resolution_ns": self.counter_resolution_ns,
+        }
+
+    @classmethod
+    def from_json(cls, value: dict) -> "ClockIdentity":
+        return cls(
+            platform=value["platform"],
+            machine_id=value["machine_id"],
+            boot_id=value["boot_id"],
+            counter=value["counter"],
+            counter_resolution_ns=value["counter_resolution_ns"],
+        )
+
+
+def clock_identity() -> ClockIdentity:
+    """This machine's identity for the counter ``stamp`` reads."""
+    info = time.get_clock_info("perf_counter")
+    return ClockIdentity(
+        platform=sys.platform,
+        machine_id=_machine_id(),
+        boot_id=_boot_id(),
+        counter=info.implementation,
+        counter_resolution_ns=max(1, round(info.resolution * 1e9)),
+    )

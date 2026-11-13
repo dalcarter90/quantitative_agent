@@ -1,6 +1,6 @@
 # 0008: `event_ts` for messages without a venue timestamp
 
-Status: Accepted (owner decision)
+Status: Accepted (owner decision), amended by 0012
 Date: 2026-11-11
 Amends: 0005
 

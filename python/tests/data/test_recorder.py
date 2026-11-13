@@ -172,13 +172,14 @@ def test_recording_writes_control_records_then_every_message_in_order(tmp_path):
 
     events = controls(records)
     assert events[0]["event"] == "start"
-    assert events[0] | {"recorder_version": 0} == {
+    assert events[0] | {"recorder_version": 0, "clock_identity": None} == {
         "event": "start",
         "venue": "kraken",
         "instrument": "BTC-USD",
         "symbol": "BTC/USD",
         "depth": 25,
         "recorder_version": 0,
+        "clock_identity": None,
     }
     assert events[-1] == {"event": "stop"}
     assert events[1]["event"] == "clock"
@@ -372,3 +373,27 @@ def test_the_limit_cannot_be_changed_from_the_command_line():
     parser_help = recorder.build_parser().format_help()
     assert "--allow-clock-offset" in parser_help
     assert "offset-ms" not in parser_help and "max-clock" not in parser_help
+
+
+# --- monotonic receive stamps (ADR 0012) ---------------------------------------------------------
+
+
+def test_the_session_start_records_this_machines_clock_identity(tmp_path):
+    from quantagent.data.clock import clock_identity
+
+    _, records, _ = run_kraken(tmp_path, [FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_UPDATE])])
+    start = controls(records)[0]
+    assert start["recorder_version"] == recorder.RECORDER_VERSION == 3
+    assert start["clock_identity"] == clock_identity().to_json()
+
+
+def test_every_record_has_a_monotonic_stamp_taken_with_its_receive_time(tmp_path):
+    _, records, _ = run_kraken(
+        tmp_path, [FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE])], probe_interval=0.1
+    )
+    assert {r.channel for r in records} >= {"recorder", "ws", "probe"}
+    assert all(r.recv_mono_ns is not None for r in records)
+    monos = [r.recv_mono_ns for r in records]
+    assert monos == sorted(monos)  # file order is arrival order
+    offsets = [r.recv_ts - r.recv_mono_ns for r in records]
+    assert max(offsets) - min(offsets) < 50_000_000  # the two clocks were read together

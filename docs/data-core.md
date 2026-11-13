@@ -45,6 +45,7 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
 | `event_ts` | When the venue says it happened. If the venue's message has no timestamp, the receipt time (ADR 0008) | The adapter |
 | `event_ts_source` | `"venue"` or `"receipt"`: where `event_ts` came from, decided by the kind of message | The adapter |
 | `recv_ts` | When our process received the bytes (wall clock) | The recorder |
+| `recv_mono_ns` | The monotonic counter at the same moment; raw log records only, not stored rows (ADR 0012) | The recorder |
 | `knowledge_ts` | When the row became available in the store | The store, at write time |
 
 `recv_ts` and `knowledge_ts` are only as good as the recording machine's
@@ -72,7 +73,7 @@ taken on a second connection; it is not part of the update stream.
 
 `stream_events` kinds: `SESSION_START`, `SESSION_STOP`, `CONNECT`,
 `DISCONNECT`, `SUBSCRIBE_REQUEST`, `SUBSCRIPTION_ACK`, `TRADE_BACKFILL`,
-`CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
+`CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `CLOCK_STEP` (ADR 0012), `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
 `CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`. ADR 0010 lists what each means and
 what `expected`, `observed` and `detail` hold for it; ADR 0011 the two clock
 kinds.
@@ -146,10 +147,25 @@ parse tree (CLAUDE.md has the upgrade rule).
 
 ### Raw log
 
-`rawlog.RawLogWriter` appends records of `recv_ts`, `seq`, venue, channel and
-payload bytes, each with a CRC32, to `<name>.qaraw`; `seal()` compresses it to
-`<name>.qaraw.zst`. `read_raw_log` reads either. A partial final record in an
-unsealed log is dropped and reported; any other damage raises.
+`rawlog.RawLogWriter` appends records of `recv_ts`, `recv_mono_ns`, `seq`,
+venue, channel and payload bytes, each with a CRC32, to `<name>.qaraw`;
+`seal()` compresses it to `<name>.qaraw.zst`. `read_raw_log` reads either. A
+partial final record in an unsealed log is dropped and reported; any other
+damage raises.
+
+**Order (ADR 0012).** Within one log, records are replayed in `seq` order;
+`recv_ts` is a measurement, not an ordering key. `recv_mono_ns` is the
+system's monotonic high-resolution counter (`time.perf_counter_ns`) read in
+the same call as `recv_ts`. `logorder.merge_logs(paths)` merges logs recorded
+on the same machine in the same boot by it, and refuses logs whose counters
+are not comparable or that have no monotonic stamps.
+
+**Versions.** The writer writes version 2. Version 1 logs (everything recorded
+before ADR 0012: the Phase 1c one-hour recordings and the committed fixtures)
+have no monotonic stamp. They are read with `recv_mono_ns` None and are never
+rewritten; a single version 1 log is still replayed in `seq` order, but it
+cannot be merged with another log, and clock steps during it cannot be
+detected.
 
 ### Recorder
 
@@ -159,7 +175,9 @@ python -m quantagent.data.recorder --venue kraken --instrument BTC-USD \
     [--allow-clock-offset]
 ```
 
-Public market data only; no API keys are read or sent. Before contacting the
+Public market data only; no API keys are read or sent. The start record
+names the clock identity (platform, machine id, boot id, counter) that says
+which logs' monotonic stamps are comparable. Before contacting the
 venue the recorder measures its clock (section 7) and refuses to start, with
 exit status 2, if the offset is above 250 ms or cannot be measured, unless
 `--allow-clock-offset` is given. Raw log channels:
@@ -216,7 +234,8 @@ the cap was hit.
 |-------|-------|----------|
 | `recording_clock` | A session whose clock offset was above `max_clock_offset_ns` (`clock_offset_exceeded`) | ERROR |
 | | A session whose clock could not be measured (`clock_unmeasured`) | WARNING |
-| | A session recorded before clocks were measured (`clock_not_recorded`); any use of `--allow-clock-offset` (`clock_override`) | INFO |
+| | A wall-clock step against the monotonic counter beyond `max_clock_step_ns` (`clock_step`), with its size and direction (ADR 0012) | ERROR |
+| | A session recorded before clocks were measured (`clock_not_recorded`); a measured session without monotonic stamps (`clock_steps_not_measurable`); any use of `--allow-clock-offset` (`clock_override`) | INFO |
 | `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected` | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
 | | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
@@ -235,6 +254,7 @@ an error):
 | `max_backwards_ns` | 0 |
 | `outlier_window`, `outlier_min_trades`, `outlier_bps` | 50, 20, 500 |
 | `max_clock_offset_ns` | 250 ms |
+| `max_clock_step_ns` | 50 ms |
 | `max_findings` | 1000 |
 
 What the checks cannot see:
@@ -311,6 +331,10 @@ python -m quantagent.data.book golden --store ... --venue ... --instrument ... -
 - **Check snapshots** are compared with the book rebuilt up to the last
   stream message whose venue time is at or before the snapshot's, level by
   level within the snapshot's depth.
+- **Order.** Stored rows are replayed in `(recv_ts, seq)` order, which is
+  arrival order only while the wall clock does not step back; a stored
+  backward `CLOCK_STEP` makes the reconstructor raise
+  `ReplayOrderUnreliable` (ADR 0012, "Open").
 - **What it cannot see:** a lost Kraken update that does not touch the ten
   best levels before it is overwritten, and a repeated Kraken update (the
   quantities are absolute, so the book does not change).

@@ -838,10 +838,13 @@ def test_report_rejects_bad_arguments(arguments, clean_store):
 # --- the recording clock (ADR 0011) ----------------------------------------------------------
 
 
-def with_clock_events(rows, *events):
-    """Insert clock events right after the fixture's session start."""
+def with_clock_events(rows, *events, monotonic=True):
+    """Insert clock events right after the fixture's session start, and mark the
+    session as recorded with monotonic stamps, as a current recording is."""
     start = rows[EVENTS][0]
     assert start["kind"] == StreamEventKind.SESSION_START
+    detail = json.loads(start["detail"]) | {"monotonic_stamps": monotonic}
+    start = {**start, "detail": json.dumps(detail)}
     added = [
         {**start, "event_index": index + 1, "kind": kind, "expected": expected,
          "observed": observed, "detail": detail}
@@ -858,7 +861,8 @@ def test_a_session_recorded_before_clocks_were_measured_is_reported(clean_store)
         result = run(check_recording_clock, clean_store, venue)
         assert brief(result) == [("clock_not_recorded", Severity.INFO, "stream_events", 0)]
         assert "docs/data-core.md" in result.findings[0].message
-        assert result.stats == {"sessions": 1, "measured": 0, "overridden": 0}
+        assert "monotonic" in result.findings[0].message
+        assert result.stats == {"sessions": 1, "measured": 0, "overridden": 0, "clock_steps": 0}
 
 
 def test_a_measured_clock_within_the_limit_finds_nothing(tmp_path, kraken_rows):
@@ -871,6 +875,7 @@ def test_a_measured_clock_within_the_limit_finds_nothing(tmp_path, kraken_rows):
         "sessions": 1,
         "measured": 1,
         "overridden": 0,
+        "clock_steps": 0,
         "max_abs_offset_ns": 4_000_000,
     }
 
@@ -943,7 +948,8 @@ def test_each_session_is_judged_on_its_own(tmp_path, kraken_rows):
         rows[EVENTS] = [
             *rows[EVENTS],
             {**last, "seq": last["seq"] + 1, "recv_ts": last["recv_ts"] + 1,
-             "event_ts": last["recv_ts"] + 1, "kind": StreamEventKind.SESSION_START},
+             "event_ts": last["recv_ts"] + 1, "kind": StreamEventKind.SESSION_START,
+             "detail": json.dumps({"monotonic_stamps": True})},
             {**last, "seq": last["seq"] + 2, "recv_ts": last["recv_ts"] + 2,
              "event_ts": last["recv_ts"] + 2, "kind": StreamEventKind.CLOCK_OFFSET,
              "expected": LIMIT, "observed": 600_000_000, "detail": "{}"},
@@ -952,3 +958,69 @@ def test_each_session_is_judged_on_its_own(tmp_path, kraken_rows):
     result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
     assert [f.what for f in result.findings] == ["clock_offset_exceeded"]
     assert result.stats["sessions"] == 2 and result.stats["measured"] == 2
+
+
+# --- wall clock steps (ADR 0012) ----------------------------------------------------------------
+
+
+def clock_step(rows, seq_offset, step):
+    last = rows[EVENTS][-2]
+    return {**last, "seq": last["seq"] + seq_offset, "recv_ts": last["recv_ts"] + seq_offset,
+            "event_ts": last["recv_ts"] + seq_offset, "event_index": 0,
+            "kind": StreamEventKind.CLOCK_STEP, "connection": "ws", "expected": None,
+            "observed": step, "detail": None}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("step", "direction"), [(-1_241_000_000, "back"), (300_000_000, "forward")]
+)
+def test_a_wall_clock_step_beyond_the_threshold_is_flagged_with_its_size(
+    tmp_path, kraken_rows, step, direction
+):
+    def edit(rows):
+        with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"))
+        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, 1, step), rows[EVENTS][-1]]
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    (finding,) = result.findings
+    assert (finding.what, finding.severity, finding.dataset) == (
+        "clock_step",
+        Severity.ERROR,
+        "stream_events",
+    )
+    assert f"{abs(step) / 1e6:.1f} ms {direction}" in finding.message
+    assert result.stats["clock_steps"] == 1
+    assert result.stats["max_abs_step_ns"] == abs(step)
+
+
+def test_a_step_below_the_threshold_is_counted_but_not_flagged(tmp_path, kraken_rows):
+    def edit(rows):
+        with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"))
+        rows[EVENTS] = [*rows[EVENTS][:-1], clock_step(rows, 1, -30_000_000), rows[EVENTS][-1]]
+
+    root = planted(tmp_path, kraken_rows, edit)
+    result = run(check_recording_clock, root)
+    assert result.findings == []
+    assert result.stats["clock_steps"] == 1 and result.stats["max_abs_step_ns"] == 30_000_000
+    strict = QualityConfig(max_clock_step_ns=20_000_000)
+    assert [f.what for f in run(check_recording_clock, root, config=strict).findings] == [
+        "clock_step"
+    ]
+
+
+def test_a_measured_session_without_monotonic_stamps_cannot_be_checked_for_steps(
+    tmp_path, kraken_rows
+):
+    def edit(rows):
+        with_clock_events(
+            rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"), monotonic=False
+        )
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert [(f.what, f.severity) for f in result.findings] == [
+        ("clock_steps_not_measurable", Severity.INFO)
+    ]
+
+
+def test_the_step_threshold_default():
+    assert QualityConfig().max_clock_step_ns == 50_000_000

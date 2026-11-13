@@ -143,7 +143,8 @@ Tool calls only, listed exhaustively in section 8.
 ### 4.1 Live and paper
 
 1. **Receive.** A feed thread reads bytes from the venue socket and stamps
-   `recv_ts` (wall clock) and a local sequence number.
+   `recv_ts` (wall clock), `recv_mono_ns` (the monotonic counter, read in the
+   same call) and a local sequence number.
 2. **Capture.** The raw bytes, `recv_ts` and sequence number are pushed to the
    capture queue. The journal thread appends them to the raw log. This log is
    the source of truth for replay and for the data core.
@@ -182,7 +183,8 @@ waits for Python.
 ### 4.2 Backtest
 
 The replay engine reads a raw log and feeds steps 3 to 11 on a single thread,
-in `(recv_ts, seq)` order. The simulated exchange replaces the venue and
+in `seq` order; several logs from the same machine and boot are merged by
+their monotonic stamps (ADR 0012). The simulated exchange replaces the venue and
 models latency, fees and queue position. Time comes from the events.
 
 ### 4.3 The decision clock
@@ -275,7 +277,8 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 | `event_ts_source` | Where `event_ts` came from: `"venue"` or `"receipt"` | The adapter, from the message type (ADR 0008; arrives with Phase 1c) |
 | `recv_ts` | When our process received the bytes | Feed thread, wall clock |
 | `knowledge_ts` | When the record became available to queries in the store | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
-| `seq` | Local monotonic sequence number at receipt | Feed thread. Total order for replay is `(recv_ts, seq)` |
+| `recv_mono_ns` | The system's monotonic high-resolution counter, read with `recv_ts` | Feed thread (recorder). Comparable only between logs from the same machine, boot and counter (ADR 0012) |
+| `seq` | Local sequence number at receipt | Feed thread. **Within one raw log, replay order is `seq` alone**; logs are merged by `recv_mono_ns`. `recv_ts` is a measurement, never an ordering key (ADR 0012) |
 
 **Wall-clock times assume a synchronized clock** (ADR 0011). `recv_ts` and
 `knowledge_ts` are only as accurate as the clock of the machine that stamped

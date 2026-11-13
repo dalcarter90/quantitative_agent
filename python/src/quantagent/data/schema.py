@@ -72,6 +72,10 @@ class StreamEventKind(IntEnum):
     # The recorder was run with --allow-clock-offset; detail says whether the
     # offset was within the limit, above it, or not measured.
     CLOCK_OVERRIDE = 8
+    # The wall clock moved against the monotonic counter between two records
+    # by more than the adapter's floor (ADR 0012). observed is the signed size
+    # in ns: negative means the wall clock went back.
+    CLOCK_STEP = 9
     SEQUENCE_GAP = 10  # expected and observed hold the venue's sequence numbers
     SEQUENCE_REPEAT = 11
     SEQUENCE_OUT_OF_ORDER = 12
