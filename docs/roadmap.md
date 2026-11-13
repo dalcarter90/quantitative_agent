@@ -2,7 +2,7 @@
 
 Each phase is sized for one working session and ends with `scripts/check.ps1`
 green and a merged PR. Phase 1 is too large for one session, so it is split
-into 1a to 1d; each of those is one session with its own PR. Do phases in
+into 1a to 1e; each of those is one session with its own PR. Do phases in
 order unless a phase says otherwise. Do not start a phase whose prerequisites
 are not checked off.
 
@@ -27,7 +27,8 @@ before making it.
 | 1b | Data core: point-in-time query session | Done |
 | 1c | Data core: raw capture, fixtures, Kraken and Coinbase adapters | Done |
 | 1d | Data core: quality checks | Done |
-| 2 | Python reference order book reconstructor | Not started |
+| 1e | Data core: recording clock (ADR 0011) | Done |
+| 2 | Python reference order book reconstructor | Done |
 | 3 | C++ core types | Not started |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
@@ -500,7 +501,7 @@ that finds the planted defect.
 
 **Notes for the next phases:**
 
-- **Ask the owner: the recording clock.** The machine that made the Phase
+- **The recording clock (decided: ADR 0011, built in Phase 1e).** The machine that made the Phase
   1c recordings has its Windows Time service stopped, and its clock ran
   about 1.4 s ahead while recording (no Coinbase message arrived sooner than
   1,398 ms after Coinbase sent it) and about 1.2 s ahead a day later (four
@@ -539,21 +540,87 @@ that finds the planted defect.
   day of Coinbase trades is fine, months may need a per-day loop.
 - **Python test time** is now about 95 seconds.
 
+#### Phase 1e: Recording clock (done)
+
+Added after Phase 1d by the owner, because the Phase 1c recordings were made
+on a clock about 1.4 s fast (ADR 0011).
+
+- [x] The recorder measures its NTP offset at the start of every session,
+      before contacting the venue, and stores it as a `CLOCK_OFFSET` stream
+      event.
+- [x] It refuses to start if the offset exceeds 250 ms, or cannot be
+      measured, unless run with `--allow-clock-offset`. The limit is not a
+      command-line option.
+- [x] Any use of the override is recorded, as a `CLOCK_OVERRIDE` stream
+      event, whether or not it was needed.
+- [x] A quality check, `recording_clock`, flags any session whose offset
+      exceeds the limit.
+- [x] The synchronized-clock assumption is recorded in the architecture
+      (section 6.2) and in ADR 0011.
+- [x] The existing one-hour recordings' ~1.4 s offset is documented
+      (`docs/data-core.md` section 7, the fixture README, ADR 0011).
+- [x] The current clock offset was confirmed before recording anything.
+
+**What was built:**
+
+- `clock.py`: an SNTP client (`sntp_query`) and `measure_offset`: three
+  samples from each of four servers (Cloudflare, Google, Microsoft, NTP
+  Pool), the fastest reply per server, the median across servers, at least
+  two must answer. Replies are refused if they are not server replies, come
+  from an unsynchronized server, are a kiss-of-death, or do not echo the
+  request's timestamp. No new dependency.
+- `recorder.py`: measures first; on refusal exits with status 2 without
+  contacting the venue or writing a file. Writes a `clock` control record
+  right after `start`. `RECORDER_VERSION` is now 2.
+- Adapters: the `clock` control record becomes `CLOCK_OFFSET` (and
+  `CLOCK_OVERRIDE` when used); malformed clock records are rejected.
+- `quality.py`: `check_recording_clock` (ERROR above the limit, WARNING if
+  unmeasured, INFO for sessions recorded before clocks were measured and for
+  any override) and `QualityConfig.max_clock_offset_ns`.
+- ADR 0011; ADR 0010's additions marked confirmed by the owner.
+
+**Verified:**
+
+- The SNTP client is tested against a local fake NTP server: offsets of
+  0, +1.4 and -0.75 s are measured to within 20 ms, server processing time
+  is excluded from the round trip, and six kinds of bad reply are refused.
+- The recorder refuses a clock 251 ms ahead, 1.4 s behind, or unmeasured,
+  and in each case opens no connection and writes no file.
+- Before recording anything this session, the clock was measured against
+  four NTP servers at 0.6 to 8.2 ms. The network tests (a real NTP
+  measurement and a 6-second capture from each venue) then passed.
+
+**Notes for the next phases:**
+
+- **The Windows Time service on the recording machine was stopped again**
+  when this phase started (start type Automatic), even though the clock was
+  then within 10 ms after a sync the day before. Without the service the
+  clock drifts, and the recorder will start refusing once it is 250 ms off.
+- **The committed fixtures keep their 1.4 s offset.** Tests that depend on
+  lags (for example the clock skew band test) are written against it. Every
+  quality report on them now includes one `clock_not_recorded` INFO
+  finding per session. The tests that asserted "no findings" for the
+  fixtures were changed to expect exactly those findings.
+- **The clock is measured at session start only.** Drift within a session is
+  not caught. Measuring again at the stop record would be a small addition.
+- **Phase 11** (live feed threads) stamps wall-clock time too and needs the
+  same check; its criteria now say so.
+
 ---
 
-### Phase 2: Python reference order book reconstructor
+### Phase 2: Python reference order book reconstructor (done)
 
 A simple, obviously correct L2 book in Python
 (`python/src/quantagent/data/`), used as the oracle for the C++ order book.
 Correctness over speed: plain dictionaries and sorted views, no
 optimization.
 
-- [ ] Builds a book from a venue snapshot and applies deltas, with integer
+- [x] Builds a book from a venue snapshot and applies deltas, with integer
       prices and quantities. A level with zero quantity is removed.
-- [ ] Applies the levels of a message in `level_index` order, and after each
+- [x] Applies the levels of a message in `level_index` order, and after each
       message cuts the book to `depth` levels per side when the venue sends
       a truncated book (Kraken).
-- [ ] Enforces each venue's integrity rule exactly as that venue documents
+- [x] Enforces each venue's integrity rule exactly as that venue documents
       it, cited in the code with a link to the venue documentation. Kraken:
       the CRC32 checksum after every message (the Phase 1c notes give the
       exact recipe). Coinbase: `sequence_num` continuity on the connection,
@@ -561,7 +628,7 @@ optimization.
       stored `CHECKSUM_MISMATCH` or `SEQUENCE_GAP` also raises, and a test
       shows the reconstructor's own checksum verification agrees with the
       adapter's events.
-- [ ] **Raises on an integrity failure.** Kraken: a checksum that does not
+- [x] **Raises on an integrity failure.** Kraken: a checksum that does not
       match raises a specific exception carrying the expected and computed
       checksums and the message's `(recv_ts, seq)`. Coinbase: a gap raises
       one carrying the expected and received sequence numbers. It never
@@ -570,20 +637,107 @@ optimization.
       message must be one that changes the top 10 levels; the tests also
       document what the checksum cannot see (a lost update below the top
       10, and a repeated update).
-- [ ] Applying a delta before a snapshot raises.
-- [ ] Verified against exchange snapshots: over the Phase 1c fixtures and
+- [x] Applying a delta before a snapshot raises.
+- [x] Verified against exchange snapshots: over the Phase 1c fixtures and
       the one-hour recordings, the reconstructed book equals every
       `CHECK_SNAPSHOT` on every level, matched by venue time (the stream
       up to the last message with `event_ts` at or before the snapshot's).
-- [ ] The book is never crossed after any event on the fixtures (the Phase
+- [x] The book is never crossed after any event on the fixtures (the Phase
       1d check, run per event).
-- [ ] Unit tests on small hand-built sequences with hand-computed expected
+- [x] Unit tests on small hand-built sequences with hand-computed expected
       books: insert, update, delete, a delete of a missing level, and both
       sides.
-- [ ] Golden files exported for Phase 4: for each fixture, top-of-book and
+- [x] Golden files exported for Phase 4: for each fixture, top-of-book and
       top-20 depth after every event, in a documented format, committed
       alongside the fixtures (or generated deterministically by a test
       helper if too large to commit).
+
+**What was built** (`python/src/quantagent/data/book.py`):
+
+- `ReferenceBook`: price to quantity per side in plain dictionaries, plus a
+  sorted list of prices per side for the best levels. `replace` (snapshot),
+  `apply` (levels in order; quantity 0 removes), `truncate(depth)`, `top`,
+  `best_bid`, `best_ask`, `is_crossed`. Integers only.
+- `kraken_checksum(book)`, written from Kraken's documentation and
+  independent of the adapter's copy.
+- `messages_from_table`: `book_events` rows (as `PITSession` returns them)
+  grouped into `BookMessage`s, checked for a complete `level_index` and one
+  header per message.
+- `replay(venue, messages, events, verify=True)`: yields the book after every
+  stream message. Raises `DeltaBeforeSnapshot`, `ChecksumMismatch` (expected,
+  computed, `recv_ts`, `seq`), `SequenceBreak` (kind, expected, received) or
+  `StreamFault` (a rejected message on the stream). Each says whether it came
+  from its own check (`source="computed"`) or a stored stream event
+  (`"stream_event"`). A new session or connection means the next message
+  must be a snapshot.
+- `verify_check_snapshots`: every `CHECK_SNAPSHOT` against the book rebuilt
+  up to the last stream message at or before its venue time, level by level,
+  cut to the snapshot's depth.
+- `golden_table` and the command line: `python -m quantagent.data.book
+  verify|golden --store ... --venue ... --instrument ...`.
+- Golden files: `python/tests/fixtures/golden/<venue>-BTC-USD.top20.parquet`
+  (476 KB and 247 KB, format in the README there); `.gitignore` now allows
+  Parquet in that directory only.
+- Damaged-fixture helpers: `python/tests/data/damage.py` (`removed`,
+  `duplicated`, `swapped`, `write`).
+
+**Verified:**
+
+- Both fixtures replay with every rule satisfied and are never crossed after
+  any message (Kraken 13,782 messages, every checksum verified; Coinbase
+  2,702). Their check snapshots match on every level.
+- The one-hour recordings (local data, `pytest -m local_data`): 6 of 6
+  check snapshots match per venue (all 38,000-odd levels on Coinbase), the
+  book is never crossed, and every Kraken checksum verifies.
+- Damaged fixtures, per venue:
+
+  | Damage | Kraken | Coinbase |
+  |--------|--------|----------|
+  | One message removed | `ChecksumMismatch` at the next book message, if the lost update touched the ten best levels; otherwise unseen (tested) | `SequenceBreak` gap, from the stored events; unseen from book messages alone (tested) |
+  | One message duplicated | Unseen: quantities are absolute, so the book is unchanged (tested) | `SequenceBreak` repeat, from its own check and from the stored events |
+  | Two messages swapped | `ChecksumMismatch` at the first or second of the pair | `SequenceBreak` gap at the first |
+
+- Its own Kraken checksum and the adapter's stored `CHECKSUM_MISMATCH`
+  events agree on the record and both values, over twelve removals spread
+  across the fixture.
+- 23 deliberate breakages of the reconstructor; all 23 are caught.
+
+**Notes for the next phases:**
+
+- **Ask the owner: replay order across clock steps.** The architecture says
+  the total order for replay is `(recv_ts, seq)`, and the reconstructor
+  sorts that way. That is only arrival order if `recv_ts` never goes
+  backwards within a log. It does not in any existing log (checked), but a
+  time service stepping the clock back mid-recording (Windows Time stepped
+  this machine's clock back 1.24 s when it started) would reorder the
+  stream. Within one raw log, `seq` alone is arrival order. Options: order
+  by `seq` within a log and by `recv_ts` only across logs, or have the
+  recorder record a clock step as a stream event. This touches the
+  architecture's replay definition, so it needs a decision before Phase 7.
+- **`recv_ts` resolution is about 0.3 to 0.5 ms on this machine.** Python
+  3.12's `time.time_ns()` on Windows follows the system timer, so about 70%
+  of the records in the one-hour Kraken log share their `recv_ts` with the
+  previous record. Ties are ordered by `seq`, so nothing is misordered, but
+  latency measurements finer than 0.5 ms are not possible from this data.
+  Python 3.13 uses a precise system clock on Windows.
+- **For Phase 4:** drive the C++ book with `messages_from_table` output and
+  compare after every message with the golden files. The stale flag must be
+  set exactly where `replay` raises on the damaged fixtures from
+  `damage.py`. For Kraken, use removals the tests show are caught; the table
+  above lists what each venue's rule cannot see.
+- **Stored events are needed for Coinbase.** Without them, a lost Coinbase
+  message is invisible to the reconstructor (heartbeats and trades share the
+  numbering). Always pass the instrument's `stream_events` to `replay`.
+- **Check snapshots on the probe connection** are compared, not applied. A
+  probe's own checksum mismatch is ignored by `replay` (it concerns the probe
+  connection, not the stream).
+- **Memory.** `messages_from_table` holds a whole range in memory. For the
+  one-hour Coinbase recording (870,000 levels, 81 MB as Arrow) the messages
+  hold 127 MB and grouping peaks at 452 MB (measured with `tracemalloc`);
+  verifying all six check snapshots takes 9 seconds. Ranges much longer than
+  a few hours need a per-day loop.
+- **Test time** for the Python suite is now about 3 minutes, a third of it
+  the damaged-fixture tests.
 
 ---
 
@@ -719,6 +873,9 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       Boost.Beast with OpenSSL via vcpkg). Record in a new ADR.
 - [ ] Feed threads connect to Kraken and Coinbase public streams, with
       reconnect, resubscribe and resync.
+- [ ] The feed process measures its clock offset at startup as the recorder
+      does (ADR 0011), refuses to start above 250 ms unless overridden, and
+      records the measurement and any override.
 - [ ] Threads wired per architecture section 5: feed, core, journal, with
       pinning and wait strategy from config.
 - [ ] Raw capture runs alongside; a recorded live session replays to the same

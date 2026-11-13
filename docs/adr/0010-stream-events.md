@@ -1,6 +1,6 @@
 # 0010: `stream_events`, a dataset of integrity events
 
-Status: Accepted (owner decision; see "Review" for the parts added during implementation)
+Status: Accepted (owner decision; additions confirmed by the owner 2026-11-12), amended by 0011
 Date: 2026-11-11
 Amends: 0006, 0009
 
@@ -120,8 +120,8 @@ is reported for it until its next snapshot, so one fault is one event.
 The owner decided on the dataset, that it covers sequence gaps, reconnects,
 subscription changes and checksum mismatches for every venue, that each event
 refers to its raw record, that it is bitemporal and read through `PITSession`,
-and that the adapters write it. Added during implementation, for the owner to
-confirm or strike:
+and that the adapters write it. Added during implementation, and confirmed by
+the owner on 2026-11-12:
 
 - the kinds `SESSION_START`, `SESSION_STOP`, `MESSAGE_REJECTED` and
   `TRADE_BACKFILL`, which the list did not name;
@@ -129,3 +129,6 @@ confirm or strike:
   receipt-time rule;
 - verifying Kraken's checksum inside the adapter, which follows from "the
   adapters write these events" but puts book logic ahead of Phase 2.
+
+ADR 0011 later added two kinds, `CLOCK_OFFSET` and `CLOCK_OVERRIDE`, for the
+recording clock.

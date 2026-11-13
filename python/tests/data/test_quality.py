@@ -25,6 +25,7 @@ from quantagent.data.quality import (
     check_clock_skew,
     check_crossed_books,
     check_outliers,
+    check_recording_clock,
     check_stream_integrity,
     run_checks,
 )
@@ -41,6 +42,9 @@ from quantagent.data.store import AppendOnlyStore
 
 NS = 1_000_000_000
 ALL = (0, INT64_MAX)
+# The checks of the data itself. check_recording_clock is tested separately:
+# the committed fixtures were recorded before the clock was measured, so it
+# reports that on them (and should).
 CHECKS = [check_stream_integrity, check_clock_skew, check_crossed_books, check_outliers]
 TRADES = ("trades", "kraken", INSTRUMENT)
 BOOK = ("book_events", "kraken", INSTRUMENT)
@@ -157,8 +161,12 @@ def test_run_checks_covers_every_venue_and_instrument_in_the_store(clean_store):
         ("coinbase", INSTRUMENT),
         ("kraken", INSTRUMENT),
     ]
-    assert len(results) == 2 * len(CHECKS)
-    assert [f for r in results for f in r.findings] == []
+    assert len(results) == 2 * len(quality.CHECKS) == 2 * (len(CHECKS) + 1)
+    # The only findings: neither fixture session had its clock measured.
+    assert [(f.venue, f.what, f.severity) for r in results for f in r.findings] == [
+        ("coinbase", "clock_not_recorded", Severity.INFO),
+        ("kraken", "clock_not_recorded", Severity.INFO),
+    ]
     with PITSession(clean_store, as_of=INT64_MAX) as session:
         only = run_checks(session, *ALL, venue="kraken")
         assert {r.venue for r in only} == {"kraken"}
@@ -655,7 +663,8 @@ def test_running_every_check_changes_nothing_in_the_store(tmp_path, kraken_rows)
     before = digests()
     with PITSession(root, as_of=INT64_MAX) as session:
         results = run_checks(session, *ALL)
-        assert sum(len(r.findings) for r in results) == 1
+        whats = sorted(f.what for r in results for f in r.findings)
+        assert whats == ["clock_not_recorded", "nonpositive_price"]
         # The flagged row is still there, exactly as stored.
         assert session.sql("SELECT count(*) AS n FROM trades WHERE price = -1").to_pylist() == [
             {"n": 1}
@@ -693,6 +702,7 @@ def test_config_defaults_and_loading_from_a_file(tmp_path):
         500,
     )
     assert default.max_backwards_ns == 0 and default.max_findings == 1000
+    assert default.max_clock_offset_ns == 250_000_000
 
     path = tmp_path / "quality.json"
     path.write_text(json.dumps({"outlier_bps": 250, "max_lag_ns": 3 * NS}), encoding="utf-8")
@@ -713,6 +723,7 @@ def test_config_defaults_and_loading_from_a_file(tmp_path):
         '{"outlier_min_trades": 60}',  # more than the window can hold
         '{"min_lag_ns": 5, "max_lag_ns": 4}',
         '{"max_findings": 0}',
+        '{"max_clock_offset_ns": -1}',
         "[1, 2]",
         "not json",
     ],
@@ -736,7 +747,9 @@ def test_report_on_clean_data_exits_zero_and_summarizes(clean_store, capsys):
     for text in ("kraken/BTC-USD", "coinbase/BTC-USD", "stream_integrity", "clock_skew",
                  "crossed_books", "outliers", "0 findings", "median lag"):  # fmt: skip
         assert text in output, text
-    assert "Result: no findings" in output
+    assert "recording_clock" in output and "clock_not_recorded" in output
+    # The fixtures' clocks were never measured: reported, but not a failure.
+    assert "Result: 2 findings (worst: INFO); failing at ERROR" in output
 
 
 def test_report_exits_nonzero_only_at_or_above_the_chosen_severity(tmp_path, kraken_rows, capsys):
@@ -752,7 +765,7 @@ def test_report_exits_nonzero_only_at_or_above_the_chosen_severity(tmp_path, kra
     assert quality.main(["--store", root, *DAY]) == 0  # default: fail on errors only
     output = capsys.readouterr().out
     assert "WARNING" in output and "price_outlier" in output
-    assert "Result: 1 finding (worst: WARNING); failing at ERROR" in output
+    assert "Result: 2 findings (worst: WARNING); failing at ERROR" in output
     assert quality.main(["--store", root, *DAY, "--fail-on", "warning"]) == 1
     assert quality.main(["--store", root, *DAY, "--fail-on", "info"]) == 1
     assert quality.main(["--store", root, *DAY, "--fail-on", "error"]) == 0
@@ -820,3 +833,122 @@ def test_report_rejects_bad_arguments(arguments, clean_store):
     with pytest.raises(SystemExit) as stopped:
         quality.main(arguments)
     assert stopped.value.code == 2
+
+
+# --- the recording clock (ADR 0011) ----------------------------------------------------------
+
+
+def with_clock_events(rows, *events):
+    """Insert clock events right after the fixture's session start."""
+    start = rows[EVENTS][0]
+    assert start["kind"] == StreamEventKind.SESSION_START
+    added = [
+        {**start, "event_index": index + 1, "kind": kind, "expected": expected,
+         "observed": observed, "detail": detail}
+        for index, (kind, expected, observed, detail) in enumerate(events)
+    ]  # fmt: skip
+    rows[EVENTS] = [start, *added, *rows[EVENTS][1:]]
+
+
+LIMIT = 250_000_000
+
+
+def test_a_session_recorded_before_clocks_were_measured_is_reported(clean_store):
+    for venue in ("kraken", "coinbase"):
+        result = run(check_recording_clock, clean_store, venue)
+        assert brief(result) == [("clock_not_recorded", Severity.INFO, "stream_events", 0)]
+        assert "docs/data-core.md" in result.findings[0].message
+        assert result.stats == {"sessions": 1, "measured": 0, "overridden": 0}
+
+
+def test_a_measured_clock_within_the_limit_finds_nothing(tmp_path, kraken_rows):
+    def edit(rows):
+        with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, -4_000_000, "{}"))
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert result.findings == []
+    assert result.stats == {
+        "sessions": 1,
+        "measured": 1,
+        "overridden": 0,
+        "max_abs_offset_ns": 4_000_000,
+    }
+
+
+@pytest.mark.parametrize("offset", [LIMIT + 1, -1_400_000_000])
+def test_a_session_whose_offset_exceeds_the_limit_is_an_error(tmp_path, kraken_rows, offset):
+    def edit(rows):
+        with_clock_events(
+            rows,
+            (StreamEventKind.CLOCK_OFFSET, LIMIT, offset, "{}"),
+            (StreamEventKind.CLOCK_OVERRIDE, None, None, "offset above limit"),
+        )
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert brief(result) == [
+        ("clock_offset_exceeded", Severity.ERROR, "stream_events", 0),
+        ("clock_override", Severity.INFO, "stream_events", 0),
+    ]
+    assert f"{offset / 1e6:+.1f} ms" in result.findings[0].message
+    assert "250.0 ms" in result.findings[0].message
+    assert "override" in result.findings[0].message
+    assert result.stats["overridden"] == 1
+
+
+def test_the_limit_comes_from_the_quality_config(tmp_path, kraken_rows):
+    def edit(rows):
+        with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 100_000_000, "{}"))
+
+    root = planted(tmp_path, kraken_rows, edit)
+    assert run(check_recording_clock, root).findings == []
+    strict = QualityConfig(max_clock_offset_ns=50_000_000)
+    assert [f.what for f in run(check_recording_clock, root, config=strict).findings] == [
+        "clock_offset_exceeded"
+    ]
+
+
+def test_an_unmeasured_clock_is_a_warning(tmp_path, kraken_rows):
+    def edit(rows):
+        with_clock_events(
+            rows,
+            (StreamEventKind.CLOCK_OFFSET, LIMIT, None, "{}"),
+            (StreamEventKind.CLOCK_OVERRIDE, None, None, "offset not measured"),
+        )
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert [(f.what, f.severity) for f in result.findings] == [
+        ("clock_unmeasured", Severity.WARNING),
+        ("clock_override", Severity.INFO),
+    ]
+
+
+def test_an_override_that_was_not_needed_is_still_reported(tmp_path, kraken_rows):
+    def edit(rows):
+        with_clock_events(
+            rows,
+            (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"),
+            (StreamEventKind.CLOCK_OVERRIDE, None, None, "offset within limit"),
+        )
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert brief(result) == [("clock_override", Severity.INFO, "stream_events", 0)]
+    assert "offset within limit" in result.findings[0].message
+
+
+def test_each_session_is_judged_on_its_own(tmp_path, kraken_rows):
+    def edit(rows):
+        # A second session later in the same log: one good, one bad.
+        with_clock_events(rows, (StreamEventKind.CLOCK_OFFSET, LIMIT, 1_000_000, "{}"))
+        last = rows[EVENTS][-1]
+        rows[EVENTS] = [
+            *rows[EVENTS],
+            {**last, "seq": last["seq"] + 1, "recv_ts": last["recv_ts"] + 1,
+             "event_ts": last["recv_ts"] + 1, "kind": StreamEventKind.SESSION_START},
+            {**last, "seq": last["seq"] + 2, "recv_ts": last["recv_ts"] + 2,
+             "event_ts": last["recv_ts"] + 2, "kind": StreamEventKind.CLOCK_OFFSET,
+             "expected": LIMIT, "observed": 600_000_000, "detail": "{}"},
+        ]  # fmt: skip
+
+    result = run(check_recording_clock, planted(tmp_path, kraken_rows, edit))
+    assert [f.what for f in result.findings] == ["clock_offset_exceeded"]
+    assert result.stats["sessions"] == 2 and result.stats["measured"] == 2

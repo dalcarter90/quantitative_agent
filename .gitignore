@@ -36,6 +36,8 @@ dist/
 /runs/
 *.parquet
 *.duckdb
+# Except the golden order book files, which are test fixtures.
+!/python/tests/fixtures/golden/*.parquet
 
 # Editors / OS
 .idea/

@@ -61,7 +61,7 @@ If a task seems to require breaking one of these, stop and ask the owner.
 ## How to work
 
 - **One roadmap phase per session**, in order (Phase 1 is split into 1a to
-  1d; each is one session). Start by reading the phase's acceptance criteria. Do not begin a phase whose prerequisites are unmet.
+  1e; each is one session). Start by reading the phase's acceptance criteria. Do not begin a phase whose prerequisites are unmet.
 - **Every phase ends with tests green.** Run `scripts/check.ps1` and confirm
   it prints `ALL GREEN` before you say a phase is done. If it fails, the
   phase is not done; report the failure with its output.
@@ -146,6 +146,12 @@ cd ..
 # Record public market data (no API keys), then load it into a store
 .venv\Scripts\python -m quantagent.data.recorder --venue kraken --instrument BTC-USD --out data\raw --duration 3600
 .venv\Scripts\python -m quantagent.data.adapters data\raw\kraken\BTC-USD\<file>.qaraw.zst --store data\normalized
+
+# Rebuild an order book from the store and verify it against the venue's rules
+.venv\Scripts\python -m quantagent.data.book verify --store data\normalized --venue kraken --instrument BTC-USD
+
+# Tests over the one-hour recordings in data\raw (not in git; excluded by default)
+.venv\Scripts\python -m pytest python -m local_data
 
 # Data quality report over a date range (exit 1 on any ERROR finding)
 .venv\Scripts\python -m quantagent.data.quality --store data\normalized --start 2026-11-11 --end 2026-11-11

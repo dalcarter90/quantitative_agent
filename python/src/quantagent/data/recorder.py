@@ -9,9 +9,9 @@ reads none.
 What goes into the log, by channel:
 
 - ``recorder``: control records written by this program, as JSON. They mark
-  the start of the session, every connect, subscribe request and disconnect,
-  and each REST request. Adapters use them to know where one connection ends
-  and the next begins.
+  the start of the session, the clock offset measured before it (ADR 0011),
+  every connect, subscribe request and disconnect, and each REST request.
+  Adapters use them to know where one connection ends and the next begins.
 - ``ws``: every message received on the main streaming connection, verbatim.
 - ``probe``: messages from short-lived extra connections opened every
   ``probe_interval`` seconds to fetch a fresh order book snapshot. They are an
@@ -22,6 +22,7 @@ What goes into the log, by channel:
 import argparse
 import asyncio
 import json
+import sys
 import time
 import urllib.request
 from collections.abc import Callable
@@ -30,12 +31,38 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from quantagent.data.clock import MAX_OFFSET_NS, ClockMeasurement, measure_offset
 from quantagent.data.rawlog import RawLogWriter
 
-RECORDER_VERSION = 1
+RECORDER_VERSION = 2  # 2: the clock offset is measured and recorded (ADR 0011)
 CONTROL = "recorder"
 STREAM = "ws"
 PROBE = "probe"
+
+
+class ClockOffsetError(RuntimeError):
+    """The recording clock is too far off, or could not be measured."""
+
+
+def _clock_problem(measured: ClockMeasurement) -> str:
+    limit = f"{MAX_OFFSET_NS / 1e6:.0f} ms"
+    if measured.offset_ns is None:
+        failures = "; ".join(f"{s.host}: {s.error}" for s in measured.samples if s.error)
+        problem = (
+            f"the clock offset could not be measured: only {measured.servers_answered} NTP "
+            f"server(s) answered ({failures})"
+        )
+    else:
+        direction = "ahead of" if measured.offset_ns > 0 else "behind"
+        problem = (
+            f"this machine's clock is {abs(measured.offset_ns) / 1e6:.1f} ms {direction} "
+            f"NTP time, above the {limit} limit"
+        )
+    return (
+        f"refusing to record: {problem}. Synchronize the clock (on Windows: start the "
+        "Windows Time service and run 'w32tm /resync'), or record anyway with "
+        "--allow-clock-offset; that is written into the log and reported by the quality checks."
+    )
 
 
 @dataclass(frozen=True)
@@ -123,8 +150,20 @@ async def record(
     connect: Callable[..., Any] = _default_connect,
     fetch: Callable[[str], bytes] = _http_get,
     reconnect_delay: float = 2.0,
+    measure_clock: Callable[[], ClockMeasurement] | None = None,
+    allow_clock_offset: bool = False,
 ) -> Path:
-    """Record for ``duration`` seconds and return the path of the sealed log."""
+    """Record for ``duration`` seconds and return the path of the sealed log.
+
+    The clock is measured first. If it is more than ``MAX_OFFSET_NS`` off, or
+    cannot be measured, nothing is contacted or written and ClockOffsetError
+    is raised, unless ``allow_clock_offset`` is set.
+    """
+    measured = await asyncio.to_thread(measure_clock or measure_offset)
+    within_limit = measured.within(MAX_OFFSET_NS)
+    if not within_limit and not allow_clock_offset:
+        raise ClockOffsetError(_clock_problem(measured))
+
     symbol = spec.symbol(instrument)
     directory = Path(out_dir) / spec.name / instrument
     directory.mkdir(parents=True, exist_ok=True)
@@ -202,6 +241,14 @@ async def record(
             depth=depth,
             recorder_version=RECORDER_VERSION,
         )
+        control(
+            event="clock",
+            offset_ns=measured.offset_ns,
+            limit_ns=MAX_OFFSET_NS,
+            within_limit=within_limit,
+            override=allow_clock_offset,
+            servers=measured.to_json()["servers"],
+        )
         # Instrument metadata first, so it is known before any market data.
         for channel, url in spec.rest(symbol):
             control(event="rest", channel=channel, url=url)
@@ -220,7 +267,7 @@ async def record(
     return sealed
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Record public market data into a raw log.")
     parser.add_argument("--venue", required=True, choices=sorted(VENUES))
     parser.add_argument("--instrument", required=True, help="for example BTC-USD")
@@ -228,18 +275,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--duration", type=float, default=3600, help="seconds to record")
     parser.add_argument("--probe-interval", type=float, default=600, help="seconds between probes")
     parser.add_argument("--depth", type=int, default=25, help="book depth where the venue has one")
-    args = parser.parse_args(argv)
-
-    path = asyncio.run(
-        record(
-            VENUES[args.venue],
-            args.instrument,
-            args.out,
-            duration=args.duration,
-            probe_interval=args.probe_interval,
-            depth=args.depth,
-        )
+    parser.add_argument(
+        "--allow-clock-offset",
+        action="store_true",
+        help=f"record even if the clock is more than {MAX_OFFSET_NS // 1_000_000} ms off or "
+        "cannot be measured; this is written into the log",
     )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        path = asyncio.run(
+            record(
+                VENUES[args.venue],
+                args.instrument,
+                args.out,
+                duration=args.duration,
+                probe_interval=args.probe_interval,
+                depth=args.depth,
+                measure_clock=measure_offset,
+                allow_clock_offset=args.allow_clock_offset,
+            )
+        )
+    except ClockOffsetError as error:
+        print(error, file=sys.stderr)
+        return 2
     print(f"wrote {path} ({path.stat().st_size} bytes)")
     return 0
 

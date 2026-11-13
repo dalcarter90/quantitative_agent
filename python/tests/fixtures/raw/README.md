@@ -17,6 +17,15 @@ python -m quantagent.data.recorder --venue <venue> --instrument BTC-USD \
     --out <dir> --duration 150 --probe-interval 80 --depth 25
 ```
 
+## Clock
+
+These were recorded before the recorder measured its clock (ADR 0011), on a
+machine whose clock ran about 1.4 s ahead. Every `recv_ts` in them is about
+1.4 s late, and the quality check reports `clock_not_recorded` for them. Tests
+that depend on the lag between venue time and receipt time (for example the
+clock skew band test) are written against this. See `docs/data-core.md`,
+section 7.
+
 ## What is inside
 
 Each record has a receive time, a sequence number, the venue, a channel and
