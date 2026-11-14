@@ -9,7 +9,7 @@ computed in plain Python from the batches that were appended.
 import tempfile
 from pathlib import Path
 
-from _builders import INT64_MAX, NS_PER_DAY, T0
+from _builders import INT64_MAX, LOG, NS_PER_DAY, T0
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -30,16 +30,16 @@ def _row(dataset_name: str, key: int, event_ts: int, value: int) -> dict:
         "event_ts": event_ts,
         "event_ts_source": "venue",
         "recv_ts": event_ts + 1,
+        "log_id": LOG,
         "seq": key,
     }
     if dataset_name == "trades":
         return {**header, "trade_id": f"t{key}", "price": value, "qty": 1, "side": Side.BUY}
     if dataset_name == "book_events":
-        # Book events are keyed by (recv_ts, seq, level_index), so recv_ts is
-        # fixed here: a later batch with the same seq is then a correction.
+        # Book events are keyed by (log_id, seq, level_index): a later batch with
+        # the same seq is a correction.
         return {
             **header,
-            "recv_ts": 5,
             "kind": BookEventKind.DELTA,
             "venue_seq_first": None,
             "venue_seq_last": key,
@@ -50,12 +50,14 @@ def _row(dataset_name: str, key: int, event_ts: int, value: int) -> dict:
             "price": 100,
             "qty": value,
         }
-    # Instrument versions are keyed by event_ts, so the key picks the event time.
+    # Instrument versions are keyed by (log_id, seq); the key also picks the
+    # version's effective time, so corrections keep it.
     return {
         "event_ts": EVENT_TIMES[key % len(EVENT_TIMES)],
         "event_ts_source": "venue",
         "recv_ts": 1,
-        "seq": 0,
+        "log_id": LOG,
+        "seq": key,
         "price_exp": 2,
         "qty_exp": 2,
         "tick_size": value,

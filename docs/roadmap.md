@@ -31,6 +31,8 @@ before making it.
 | 2 | Python reference order book reconstructor | Done |
 | 2a | Replay order and monotonic receive time (ADR 0012) | Done |
 | 3 | C++ core types | Done |
+| 3a | Log identity in the store (ADR 0013) | Done |
+| 3b | Coinbase check snapshots judged by stream batch (ADR 0014) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -772,7 +774,8 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
   its signed size.
 - `quality.py`: `check_recording_clock` reports `clock_step` (ERROR) beyond
   `max_clock_step_ns` (default 50 ms) and `clock_steps_not_measurable` (INFO).
-- `book.py`: a stored backward `CLOCK_STEP` raises `ReplayOrderUnreliable`.
+- `book.py`: a stored backward `CLOCK_STEP` raises `ReplayOrderUnreliable`
+  (removed in Phase 3a, when stored data gained its log's identity).
 
 **Verified:**
 
@@ -788,8 +791,8 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
 
 **Notes for the next phases:**
 
-- **Ask the owner: the normalized store does not know which log a row came
-  from** (ADR 0012, "Open"). `seq` restarts in every log, so stored rows
+- **Settled in Phase 3a (ADR 0013).** ~~Ask the owner: the normalized store
+  does not know which log a row came from~~ (ADR 0012, "Open"). `seq` restarts in every log, so stored rows
   cannot be put in `seq`-within-log order, and book and stream event keys
   `(recv_ts, seq, ...)` could collide between two logs of the same venue and
   instrument recorded at the same time. Fixing both needs a `log_id` column
@@ -797,12 +800,14 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
   per venue and instrument at a time, and the reconstructor refuses sessions
   with a backward clock step.
 - **Ask the owner: Coinbase check snapshots are not always exact.** In the
-  new 60-second Coinbase recording, one of its two check snapshots differs
-  from the rebuilt book on 55 of 37,746 levels near the inside of the
-  market, and no position in the stream reproduces it exactly (closest: 33
-  levels, 27 ms after its venue time). The stream had no gaps, and the other
-  snapshot matched exactly. Every earlier Coinbase check matched (1 of 1 on
-  the fixture, 6 of 6 in the hour). The likely cause is that Coinbase's
+  new 60-second Coinbase recording, its only check snapshot differs from the
+  rebuilt book on 55 of 37,746 levels near the inside of the market, and no
+  position in the stream reproduces it exactly (closest: 33 levels, 27 ms
+  after its venue time). The stream had no gaps. Every earlier Coinbase
+  check matched (1 of 1 on the fixture, 6 of 6 in the hour), so Coinbase
+  stands at 7 of 8. *Corrected in Phase 3a: this note first said "one of its
+  two check snapshots" and "the other snapshot matched exactly". The log has
+  one check snapshot; the two that matched were Kraken's.* The likely cause is that Coinbase's
   snapshot is not taken at a message boundary of the update stream. Phase 2's
   criterion "equals every check snapshot on every level" therefore holds
   usually but not always on Coinbase, and Phase 4 inherits it. Options: keep
@@ -893,6 +898,170 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
   `multiply`; it is only exercised once a Linux build exists, and the test
   that compares it with the portable version will cover it then.
 
+### Phase 3a: Log identity in the store (done)
+
+Added after Phase 3 by the owner (ADR 0013), before Phase 4. It settles ADR
+0012's open point.
+
+- [x] Every stored dataset has a `log_id` column naming the raw log each row
+      came from.
+- [x] Book event keys are `(log_id, seq, level_index)` and stream event keys
+      `(log_id, seq, event_index)`. Every other key was reviewed for
+      dependence on `recv_ts`: `instruments` was keyed by `event_ts`, which
+      is the receipt time for both venues' metadata, and is now keyed by
+      `(log_id, seq)`; `trades` keep `trade_id`, the venue's identity.
+- [x] Stored data is ordered by `(log_id, seq)`.
+- [x] The reconstructor's clock-step fail-safe (`ReplayOrderUnreliable`) is
+      removed: with `(log_id, seq)` order a clock step no longer reorders
+      stored data. Steps are still graded by `recording_clock`.
+- [x] Stores rebuilt from the raw logs; the fixtures' derived data and golden
+      files regenerated; no raw log rewritten.
+
+**What was built:**
+
+- `rawlog.log_id_of(first)`: `<UTC start to the ns>Z-<12 hex of SHA-256 of
+  the first record>`. It depends only on the first record, so it is the same
+  sealed or unsealed, cut short, copied or renamed.
+- `schema.py`: `log_id` (required, form checked on write) between `recv_ts`
+  and `seq`; the new keys; `trades`, `book_events`, `instruments` version 3,
+  `stream_events` version 2.
+- Adapters: the normalizer takes each log's id from its `seq` 0 record, so
+  one normalizer can be fed several logs; a record before any log start is
+  rejected (`no_log_start`).
+- `PITSession`: range methods order by `(log_id, seq)`; `instruments` by
+  `event_ts`, then `(log_id, seq)`.
+- `book.py`: `BookMessage.log_id`; replay, errors and keys use
+  `(log_id, seq)`; check snapshots are compared within their own log; golden
+  files have columns `log_id, seq, recv_ts`, then the levels.
+- `quality.py`: findings carry `log_id` and name `(log_id, seq)`; venue time
+  is compared between consecutive messages of one log; backfilled trades are
+  matched by `(log_id, seq)`; snapshots are grouped by `(log_id, seq)`.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,196 Python tests.
+- New `test_log_id.py`: the id's form, that every field of the first record
+  contributes, that it sorts by start time, that it is the same for a sealed,
+  unsealed and truncated copy, that each log fed to one normalizer gets its
+  own id, that a record before any log start is rejected, and that two logs
+  whose records share `recv_ts` and `seq` no longer collide in
+  `book_events`, `instruments` or `stream_events`. Existing tests were
+  updated to the new keys, columns, versions and order. The tests of
+  `ReplayOrderUnreliable` became tests that a clock step no longer stops or
+  reorders the replay. One expectation changed in substance: a trade planted
+  with a late `recv_ts` but its original `seq` is still `late`, but no
+  longer also `event_ts_backwards`, because venue time is now compared in
+  record order. Two hand-built fixtures that gave different records the
+  same `(log_id, seq)`, which no real log can do, were corrected.
+- Golden files regenerated: every row, `seq`, `recv_ts` and level value is
+  identical to the files they replaced; only the `log_id` column is new.
+- `data/normalized` rebuilt from the two one-hour logs: the same row counts
+  as Phase 1c (319,421 / 4,569 / 2 and 871,546 / 18,372 / 1), 6 of 6 check
+  snapshots matching on each venue, never crossed, and the same quality
+  report (two INFO `clock_not_recorded`). The old store is kept as
+  `data/normalized-before-adr0013`.
+- Breakage pass: 17 deliberate breakages of the new code (the id's inputs,
+  its seq-0 rule, the normalizer's per-log id and `no_log_start`, the schema's
+  form check, each of the three keys reverted, the session's order, the
+  reconstructor's message and event order, per-log check snapshots, the
+  golden `log_id` column, the per-log venue-time check, backfill matching,
+  snapshot grouping, and findings' `where`). The first run caught 15. The
+  two that survived (events sorted by `recv_ts`, backfill matched by `seq`
+  alone) got tests, and then all 17 were caught.
+
+**Notes for the next phases:**
+
+- **Phase 4's golden comparison keys rows by `(log_id, seq)`.**
+- **Ask the owner: stores do not check schema versions.** Every file
+  records `qa.schema_version`, but nothing reads it. A store written before
+  this phase fails with DuckDB's "column log_id not found", and appending new
+  rows to such a store makes a mixed store that fails the same way. Neither
+  returns wrong data, but the message does not say what to do. A clear
+  refusal needs either a footer read per file at session open or a small
+  per-store version record, which is a storage change.
+- **Ask the owner: a trade seen twice is one row** (ADR 0013,
+  "Consequences"). No existing log has a repeat.
+- **Settled in Phase 3b (ADR 0014).** ~~Ask the owner: Coinbase check
+  snapshots~~ (Phase 2a note). The owner asked for a 30-minute recording with a check snapshot every 60 s before
+  deciding the rule (kept in `data/raw-probes/`, not in git). Only 6 of its
+  28 snapshots are exact, and 13 differ at the best bid or ask, so "the top
+  N levels are exact" fails for every N. The cause is timing. Coinbase's
+  stream comes in batches about 50 ms apart, each with one venue time. A
+  snapshot is exact exactly when its time equals a batch's time: all 7
+  recorded on 2026-11-11, and 6 of the 29 on 2026-11-13. A snapshot timed
+  between batch A and batch B equals the book after A on every level B does
+  not change, in all 36 snapshots recorded. On B's levels it shows A's
+  value, B's value, or a value the stream never shows. The rule and its ADR
+  come in their own PR, after the owner confirms them.
+
+### Phase 3b: Coinbase check snapshots judged by stream batch (done)
+
+Added by the owner after Phase 3a (ADR 0014), before Phase 4. It settles the
+Phase 2a note on Coinbase check snapshots.
+
+- [x] A 30-minute Coinbase recording with a check snapshot every 60 s,
+      analysed before choosing the rule (`data/raw-probes/`, not in git).
+- [x] The rule, chosen by the owner: exact on every level when the snapshot
+      is timed on a stream batch; between batches A and B, exact on every
+      level B does not list, with B's levels reported as unverified. Kraken
+      exact at all levels. Explained differences are INFO.
+- [x] The Coinbase adapter keeps the full book, compares each check snapshot
+      at its venue time, and writes a `CHECK_SNAPSHOT_COMPARED` stream event
+      with the counts and the shallowest and deepest rank.
+- [x] The reference reconstructor compares independently, and a test shows
+      the two agree.
+- [x] A quality check grades the events.
+
+**What was built:**
+
+- `schema.py`: stream event kind `CHECK_SNAPSHOT_COMPARED` (15).
+- `adapters/coinbase.py`: the stream book with 60 s of undo history
+  (`CHECK_HISTORY_NS`), snapshots waiting for their next batch, and the
+  comparison. `adapters/base.py`: hooks for session start and stop, a
+  disconnect, and a rejected record.
+- `book.py`: `verify_check_snapshots` compares against the stream connection
+  current at the snapshot's record, under the rule. `CheckResult` gains
+  `unverified`, `on_batch`, `next_batch_levels`, `not_compared`, `exact`,
+  `result`, `rank()` and `summary()`. `book verify` reports each result and
+  fails only on a mismatch.
+- `quality.py`: `check_independent_snapshots`.
+- `python/tests/fixtures/between-batches/`: the 60-second 2026-11-13
+  recording, whose check snapshot differs from the rebuilt book on 55 levels,
+  all of them in the next batch.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,224 Python tests.
+- New `test_check_snapshots.py`: every case of the rule, the adapter's
+  timing cases (snapshot before or after the next batch, no later batch, a
+  reconnect, a resent stream snapshot, a gap, a rejected message, a log cut
+  short, history too short), agreement between the adapter and the
+  reconstructor on every case where both compare, both real fixtures, the
+  store round trip and the quality grading. A Kraken test shows it gets no
+  exemption.
+- Local data: on the 30-minute recording, the adapter and the reconstructor
+  agree on all 28 snapshots: 6 exact, 22 explained, 0 mismatched.
+- Breakage pass: 20 deliberate breakages of the rule's code (8 in the
+  reconstructor, 10 in the adapter, 2 in the grading), all caught. Planning
+  them showed three behaviours with no test (a rejected stream message, a
+  stream snapshot resent on the same connection, a log cut short with a
+  snapshot waiting); those got tests first.
+- `data/normalized` re-ingested from the one-hour logs. It is append-only:
+  its rows became corrections, and the six Coinbase events are new rows.
+  6 of 6 check snapshots are exact on each venue, and the quality report is
+  unchanged apart from the new check.
+- The two 2026-11-13 Coinbase recordings, normalized into a scratch store:
+  29 of 29 satisfy the rule (6 exact, 23 between batches, 0 mismatched), and
+  the quality report has 23 INFO findings and nothing worse.
+
+**Notes for the next phases:**
+
+- **Phase 4** compares the C++ book with the venue's snapshots under this
+  rule. The C++ book must still equal the Python reference exactly, at all
+  depths, after every message, for both venues.
+- The adapter keeps 60 s of history; recorded snapshots arrive at most
+  1.7 s after their venue time.
+
 ### Phase 4: C++ order book, verified
 
 - [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
@@ -904,10 +1073,13 @@ Added after Phase 2 by the owner (ADR 0012), before Phase 3.
 - [ ] Matches the Python reference reconstructor: top-of-book and top-20
       depth equal the Phase 2 golden files after every event, for both
       venues, with zero differences.
-- [ ] Matches exchange snapshots: over the Phase 1c fixtures, the book
-      equals every `CHECK_SNAPSHOT` on every level, matched by venue time
-      as in Phase 2, and Kraken's checksum is computed and validated after
-      every message.
+- [ ] Matches exchange snapshots under ADR 0014's rule, as the reference
+      does: over the Phase 1c fixtures the book equals every
+      `CHECK_SNAPSHOT` on every level (both are timed on a stream batch),
+      and on the between-batches fixture it differs only on the next
+      batch's levels. Kraken's checksum is computed and validated after
+      every message. *(Amended in Phase 3b: the comparison point and the
+      Coinbase exemption follow ADR 0014.)*
 - [ ] Both comparisons run as tests in `scripts/check.ps1` on the committed
       fixtures.
 - [ ] Gap handling tested: on the Phase 2 gap fixtures (message removed,

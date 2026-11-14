@@ -11,7 +11,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from _builders import INT64_MAX
+from _builders import INT64_MAX, LOG
 from damage import book_updates, duplicated, removed, sequence_number, swapped, write
 from test_fixtures import FIXTURES, INSTRUMENT, fixture_path
 
@@ -48,6 +48,7 @@ FOLLOW = object()  # default venue sequence number: increasing with seq
 def msg(seq, kind, *levels, venue_seq=FOLLOW, checksum=None, depth=None, event_ts=None):
     """A book message. Coinbase-style sequence numbers follow ``seq`` unless given."""
     return BookMessage(
+        log_id=LOG,
         recv_ts=1_000 + seq,
         seq=seq,
         event_ts=event_ts if event_ts is not None else 500 + seq,
@@ -264,6 +265,7 @@ def test_a_coinbase_message_without_a_sequence_number_cannot_be_verified_and_rai
 def event(seq, kind, connection="ws", expected=None, observed=None, detail=None):
     return {
         "recv_ts": 1_000 + seq,
+        "log_id": LOG,
         "seq": seq,
         "event_index": 0,
         "kind": int(kind),
@@ -346,10 +348,10 @@ def test_harmless_events_are_ignored():
 
 def row(seq, level_index, **overrides):
     values = {
-        "event_ts": 500 + seq, "event_ts_source": "venue", "recv_ts": 1_000 + seq, "seq": seq,
-        "kind": DELTA, "venue_seq_first": None, "venue_seq_last": 10 + seq, "checksum": None,
-        "depth": None, "level_index": level_index, "side": BUY, "price": 100 + level_index,
-        "qty": 1,
+        "event_ts": 500 + seq, "event_ts_source": "venue", "recv_ts": 1_000 + seq,
+        "log_id": LOG, "seq": seq, "kind": DELTA, "venue_seq_first": None,
+        "venue_seq_last": 10 + seq, "checksum": None, "depth": None,
+        "level_index": level_index, "side": BUY, "price": 100 + level_index, "qty": 1,
     }  # fmt: skip
     values.update(overrides)
     return values
@@ -359,7 +361,7 @@ def test_rows_are_grouped_into_messages_in_level_order():
     rows = [row(0, 1, kind=SNAP), row(0, 0, kind=SNAP, side=SELL), row(1, 0)]
     (first, second) = messages_from_table(build(BOOK_EVENTS, rows))
     assert first == BookMessage(
-        recv_ts=1_000, seq=0, event_ts=500, kind=SNAP, venue_seq_last=10, checksum=None,
+        log_id=LOG, recv_ts=1_000, seq=0, event_ts=500, kind=SNAP, venue_seq_last=10, checksum=None,
         depth=None, levels=((SELL, 100, 1), (BUY, 101, 1)),
     )  # fmt: skip
     assert second.levels == ((BUY, 100, 1),)
@@ -465,9 +467,9 @@ def outcome(records, venue, *, use_events=True, verify=True):
 
 
 def books_by_message(records, venue):
-    """The book after every stream message, keyed by (recv_ts, seq)."""
+    """The book after every stream message, keyed by (log_id, seq)."""
     messages, events = from_records(records, venue)
-    return {(m.recv_ts, m.seq): sides(book) for m, book in replay(venue, messages, events)}
+    return {m.key: sides(book) for m, book in replay(venue, messages, events)}
 
 
 def final_book(records, venue):
@@ -631,13 +633,15 @@ def test_golden_file_has_one_row_per_stream_message_with_the_top_of_book(venue):
     assert table.num_rows == len(states)
     assert GOLDEN_LEVELS == 20
     names = table.schema.names
-    assert names[:2] == ["recv_ts", "seq"]
-    assert names[2:6] == ["bid_price_00", "bid_qty_00", "ask_price_00", "ask_qty_00"]
-    assert len(names) == 2 + 4 * GOLDEN_LEVELS
+    assert names[:3] == ["log_id", "seq", "recv_ts"]
+    assert names[3:7] == ["bid_price_00", "bid_qty_00", "ask_price_00", "ask_qty_00"]
+    assert len(names) == 3 + 4 * GOLDEN_LEVELS
     columns = table.to_pydict()
     for index in (0, 1, len(states) // 2, len(states) - 1):
         message, bid, ask, bids, asks = states[index]
-        assert (columns["recv_ts"][index], columns["seq"][index]) == (message.recv_ts, message.seq)
+        assert (columns["log_id"][index], columns["seq"][index], columns["recv_ts"][index]) == (
+            message.log_id, message.seq, message.recv_ts
+        )  # fmt: skip
         assert (columns["bid_price_00"][index], columns["bid_qty_00"][index]) == bid
         assert (columns["ask_price_00"][index], columns["ask_qty_00"][index]) == ask
         for rank in range(GOLDEN_LEVELS):
@@ -737,6 +741,36 @@ def test_the_one_hour_recordings_match_every_check_snapshot(venue, tmp_path):
     assert crossed == 0
 
 
+def test_kraken_check_snapshots_get_no_between_batches_exemption():
+    """ADR 0014's exemption is for Coinbase's timed batches only: a Kraken check
+    snapshot timed between two messages must still match on every level."""
+    messages, events = from_records(kraken_records(), "kraken")
+    (check,) = [m for m in messages if m.kind == CHECK]
+    stream = [m for m in messages if m.kind != CHECK]
+    a = max(i for i, m in enumerate(stream) if m.event_ts <= check.event_ts)
+    b = stream[a + 1]
+    assert stream[a].event_ts + 1 < b.event_ts
+    after_a = None
+    for message, state in replay("kraken", messages, events):
+        if message.key == stream[a].key:
+            after_a = {side: dict(state.top(side, check.depth)) for side in (BUY, SELL)}
+            break
+    # The snapshot shows the book after A with one of B's changes already made.
+    side, price, qty = next((s, p, q) for s, p, q in b.levels if after_a[s].get(p) != (q or None))
+    after_a[side].pop(price, None)
+    if qty:
+        after_a[side][price] = qty
+    levels = tuple((s, p, q) for s in (BUY, SELL) for p, q in sorted(after_a[s].items()))
+    planted = dataclasses.replace(check, event_ts=stream[a].event_ts + 1, levels=levels)
+    (result,) = verify_check_snapshots(
+        "kraken", [m if m is not check else planted for m in messages], events
+    )
+    assert result.result == "mismatch" and result.on_batch is False
+    shown = [(s, p, theirs) for s, p, _, theirs in result.differences]
+    assert shown == [(side, price, qty or None)]
+    assert result.unverified == []
+
+
 def test_a_shallower_check_snapshot_is_compared_only_to_its_depth():
     # The stream keeps 12 levels; the independent snapshot was taken at depth 10.
     bids = [(BUY, 100 - i, 1) for i in range(12)]
@@ -751,29 +785,55 @@ def test_a_shallower_check_snapshot_is_compared_only_to_its_depth():
     assert result.differences == [(BUY, 90, None, 1)]  # level 11 is outside depth 10
 
 
-# --- replay order and wall-clock steps (ADR 0012) ------------------------------------------------
+# --- replay order: (log_id, seq), never recv_ts (ADR 0012, ADR 0013) -------------------------
 
 
-def test_a_backward_wall_clock_step_stops_the_replay():
-    """Stored rows are ordered by (recv_ts, seq). That is arrival order only
-    while the wall clock never goes back, so a backward step raises."""
-    stored = [event(2, K.CLOCK_STEP, expected=None, observed=-1_241_000_000)]
-    with pytest.raises(book_module.ReplayOrderUnreliable) as raised:
-        run("coinbase", coinbase(2, 3, 4), stored)
-    assert (raised.value.recv_ts, raised.value.seq, raised.value.step_ns) == (
-        1_002,
-        2,
-        -1_241_000_000,
-    )
-    assert "1241.0 ms" in str(raised.value) and "ADR 0012" in str(raised.value)
+def test_messages_replay_in_seq_order_whatever_their_receive_times():
+    # The wall clock stepped back between seq 1 and seq 2.
+    messages = coinbase(2, 3, 4)
+    messages[2] = dataclasses.replace(messages[2], recv_ts=messages[0].recv_ts - 1_241_000_000)
+    applied = [m.seq for m, _ in replay("coinbase", messages)]
+    assert applied == [0, 1, 2]
 
 
-def test_a_step_on_any_connection_counts_because_the_clock_is_shared():
-    stored = [event(1, K.CLOCK_STEP, connection="probe", observed=-30_000_000)]
-    with pytest.raises(book_module.ReplayOrderUnreliable):
-        run("coinbase", coinbase(2, 3, 4), stored)
+def test_stored_events_apply_at_their_record_whatever_their_receive_times():
+    """After a backward clock step a later record can carry an earlier recv_ts.
+    The reconnect at seq 2 must still reset the book before message seq 3."""
+    messages = coinbase(2, 3, 4)
+    messages[2] = dataclasses.replace(messages[2], seq=3, recv_ts=1_003)
+    stepped = {**event(9, K.SUBSCRIPTION_ACK), "recv_ts": 1}  # harmless, but first by recv_ts
+    with pytest.raises(DeltaBeforeSnapshot) as raised:
+        run("coinbase", messages, [event(2, K.CONNECT), stepped])
+    assert raised.value.seq == 3
 
 
-def test_a_forward_step_does_not_reorder_and_does_not_stop_the_replay():
-    stored = [event(2, K.CLOCK_STEP, observed=300_000_000)]
+def test_a_backward_wall_clock_step_no_longer_stops_the_replay():
+    """ADR 0012's fail-safe (ReplayOrderUnreliable) existed because stored rows
+    were ordered by recv_ts. They are now ordered by (log_id, seq)."""
+    stored = [event(2, K.CLOCK_STEP, observed=-1_241_000_000)]
     assert sides(run("coinbase", coinbase(2, 3, 4), stored)) == ({100: 5, 99: 2}, {101: 3})
+    assert not hasattr(book_module, "ReplayOrderUnreliable")
+
+
+def test_logs_replay_one_after_another_each_from_its_own_snapshot():
+    later = "20231114T130000.000000000Z-000000000001"
+    first_log = coinbase(2, 3)
+    # Received "earlier" by the wall clock: logs replay in log_id order regardless.
+    second_log = [dataclasses.replace(m, log_id=later, recv_ts=m.recv_ts - 500)
+                  for m in coinbase(7, 8)]  # fmt: skip
+    stored = [event(0, K.SESSION_START, connection=None),
+              {**event(0, K.SESSION_START, connection=None), "log_id": later}]  # fmt: skip
+    order = [(m.log_id, m.seq) for m, _ in replay("coinbase", second_log + first_log, stored)]
+    assert order == [(LOG, 0), (LOG, 1), (later, 0), (later, 1)]
+
+
+def test_check_snapshots_are_compared_with_their_own_logs_stream():
+    later = "20231114T130000.000000000Z-000000000001"
+    first_log = [msg(0, SNAP, (BUY, 100, 5), (SELL, 101, 3), venue_seq=1, event_ts=10),
+                 msg(1, CHECK, (BUY, 100, 5), (SELL, 101, 3), event_ts=20)]  # fmt: skip
+    # The second log's stream begins at an earlier venue time than the first
+    # log's check: compared across logs, the check would meet the wrong book.
+    snapshot = msg(0, SNAP, (BUY, 7, 1), (SELL, 8, 1), venue_seq=1, event_ts=15)
+    second_log = [dataclasses.replace(snapshot, log_id=later)]
+    (result,) = verify_check_snapshots("coinbase", first_log + second_log)
+    assert result.matched and result.snapshot.log_id == LOG

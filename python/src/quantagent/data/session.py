@@ -197,7 +197,7 @@ class PITSession:
         columns = ", ".join(f'"{name}"' for name in INSTRUMENTS.stored_schema.names)
         table = self._run(
             f'SELECT {columns} FROM "instruments" WHERE "venue" = ? AND "instrument" = ? '
-            'ORDER BY "event_ts"',
+            'ORDER BY "event_ts", "log_id", "seq"',
             [venue, instrument],
         )
         return table.cast(INSTRUMENTS.stored_schema)
@@ -273,7 +273,7 @@ class PITSession:
         names = dataset.stored_schema.names
         columns = ", ".join(f'"{name}"' for name in names)
         # Replay order first, then every other column so the order is total.
-        replay_order = ("recv_ts", "seq")
+        replay_order = ("log_id", "seq")  # ADR 0012, ADR 0013
         rest = [name for name in names if name not in replay_order]
         order = ", ".join(f'"{name}"' for name in (*replay_order, *rest))
         table = self._run(

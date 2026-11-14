@@ -27,7 +27,7 @@ from os import PathLike
 from typing import Any
 
 from quantagent.data.fixedpoint import to_mantissa
-from quantagent.data.rawlog import RawRecord, read_raw_log
+from quantagent.data.rawlog import RawRecord, log_id_of, read_raw_log
 from quantagent.data.schema import (
     DATASETS,
     EVENT_TS_RECEIPT,
@@ -295,6 +295,18 @@ class VenueAdapter:
     def on_connect(self, connection: str) -> None:
         """A new connection was opened; per-connection state starts again."""
 
+    def on_disconnect(self, connection: str) -> None:
+        """A connection was closed."""
+
+    def on_session_start(self) -> None:
+        """A recording session (a new raw log) began."""
+
+    def on_session_stop(self) -> None:
+        """The recording session ended."""
+
+    def on_reject(self, record: RawRecord) -> None:
+        """``record`` could not be normalized: whatever it carried was lost."""
+
     def _control(self, record: RawRecord) -> Handled:
         message = as_object(load_json(record.payload), "control record")
         event = message.get("event")
@@ -310,6 +322,7 @@ class VenueAdapter:
             self.instrument, self.symbol = message["instrument"], symbol
             self.start_depth = checked_depth(depth)
             self.exponents = None
+            self.on_session_start()
             self._clock_offset = None  # a new log: its counter reading starts afresh
             about = {
                 k: message.get(k) for k in ("symbol", "depth", "recorder_version", "clock_identity")
@@ -317,6 +330,7 @@ class VenueAdapter:
             about["monotonic_stamps"] = record.recv_mono_ns is not None
             self.note(StreamEventKind.SESSION_START, detail=_compact(about))
         elif event == "stop":
+            self.on_session_stop()
             self.note(StreamEventKind.SESSION_STOP)
         elif event == "clock":
             self._clock(message)
@@ -331,10 +345,10 @@ class VenueAdapter:
                 detail=_compact(message.get("request")),
             )
         elif event == "disconnect":
+            connection = str(message["connection"])
+            self.on_disconnect(connection)
             self.note(
-                StreamEventKind.DISCONNECT,
-                connection=str(message["connection"]),
-                detail=str(message.get("reason")),
+                StreamEventKind.DISCONNECT, connection=connection, detail=str(message.get("reason"))
             )
         return ignored(f"recorder.{event}")
 
@@ -393,12 +407,17 @@ class Normalizer:
         self._rows: dict[RowKey, list[Row]] = {}
         self.pending_rows = 0  # rows produced and not yet taken
         self.report = Report()
+        self._log_id: str | None = None  # the raw log being fed (ADR 0013)
 
     def feed(self, record: RawRecord) -> None:
         report = self.report
         report.records += 1
+        if record.seq == 0:
+            self._log_id = log_id_of(record)  # every raw log begins at seq 0
         adapter = self._adapters.get(record.venue)
         try:
+            if self._log_id is None:
+                raise Rejected("no_log_start", "no record with seq 0 before this one")
             if adapter is None:
                 if record.venue not in self._registry:
                     raise Rejected("unknown_venue", record.venue)
@@ -424,6 +443,7 @@ class Normalizer:
         report.messages[kind] += 1
         instrument = adapter.instrument
         for dataset_name, row in rows:
+            row["log_id"] = self._log_id
             self._rows.setdefault((dataset_name, record.venue, instrument), []).append(row)
             report.rows[dataset_name] += 1
         self.pending_rows += len(rows)
@@ -435,8 +455,9 @@ class Normalizer:
         self.report.rejects.append(
             Reject(record.seq, record.recv_ts, record.channel, reason, detail or reason)
         )
-        if adapter is not None:
+        if adapter is not None and self._log_id is not None:
             # A record that could not be normalized is a hole in the stream.
+            adapter.on_reject(record)
             adapter.note(
                 StreamEventKind.MESSAGE_REJECTED,
                 connection=record.channel,
@@ -459,6 +480,7 @@ class Normalizer:
                     "event_ts": record.recv_ts,
                     "event_ts_source": EVENT_TS_RECEIPT,
                     "recv_ts": record.recv_ts,
+                    "log_id": self._log_id,
                     "seq": record.seq,
                     "event_index": index,
                     **event,

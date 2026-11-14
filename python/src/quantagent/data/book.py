@@ -34,12 +34,22 @@ venue listed them (``level_index``).
 The reconstructor verifies Kraken's checksum itself, independently of the
 adapter, and also raises on the integrity events the adapter stored. The two
 are deliberate redundancy; tests show they agree.
+
+Check snapshots (independent images of the book from a second connection) are
+compared under ADR 0014. A is the last stream message, in its connection, whose
+venue time is at or before the snapshot's time T, and B the message after it.
+The snapshot must equal the book after A on every level. On Coinbase, whose
+stream comes in batches about 50 ms apart each with one venue time, a snapshot
+timed strictly between A and B may also show part of B: B's own levels cannot
+be verified from the stream and are reported apart, as ``unverified``. The
+Coinbase adapter applies the same rule while normalizing and stores the result
+as a CHECK_SNAPSHOT_COMPARED stream event; tests show the two agree.
 """
 
 import argparse
 import sys
 import zlib
-from bisect import bisect_left, insort
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -62,12 +72,12 @@ Level = tuple[int, int, int]  # (side, price mantissa, quantity mantissa)
 
 
 class BookIntegrityError(Exception):
-    """The stream cannot be trusted from this message on."""
+    """The stream cannot be trusted from this message on. ``log_id`` and ``seq``
+    name the raw record (ADR 0013); ``recv_ts`` is when it arrived."""
 
-    def __init__(self, recv_ts: int, seq: int, message: str):
-        super().__init__(f"{message} (raw record recv_ts {recv_ts}, seq {seq})")
-        self.recv_ts = recv_ts
-        self.seq = seq
+    def __init__(self, at: tuple[str, int, int], message: str):
+        self.log_id, self.seq, self.recv_ts = at
+        super().__init__(f"{message} (raw record log {self.log_id}, seq {self.seq})")
 
 
 class DeltaBeforeSnapshot(BookIntegrityError):
@@ -75,10 +85,9 @@ class DeltaBeforeSnapshot(BookIntegrityError):
 
 
 class ChecksumMismatch(BookIntegrityError):
-    def __init__(self, recv_ts: int, seq: int, expected: int, computed: int, source: str):
+    def __init__(self, at: tuple[str, int, int], expected: int, computed: int, source: str):
         super().__init__(
-            recv_ts,
-            seq,
+            at,
             f"book checksum mismatch: the venue's is {expected}, the rebuilt book's is "
             f"{computed} ({source})",
         )
@@ -87,11 +96,10 @@ class ChecksumMismatch(BookIntegrityError):
 
 class SequenceBreak(BookIntegrityError):
     def __init__(
-        self, recv_ts: int, seq: int, kind: str, expected: int, received: int, source: str
+        self, at: tuple[str, int, int], kind: str, expected: int, received: int, source: str
     ):
         super().__init__(
-            recv_ts,
-            seq,
+            at,
             f"sequence {kind}: expected {expected}, received {received} ({source})",
         )
         self.kind, self.expected, self.received, self.source = kind, expected, received, source
@@ -99,20 +107,6 @@ class SequenceBreak(BookIntegrityError):
 
 class StreamFault(BookIntegrityError):
     """A message on the stream could not be normalized, so the stream has a hole."""
-
-
-class ReplayOrderUnreliable(BookIntegrityError):
-    """The wall clock stepped back during the session. Stored rows are ordered
-    by (recv_ts, seq), which is then no longer arrival order (ADR 0012)."""
-
-    def __init__(self, recv_ts: int, seq: int, step_ns: int):
-        super().__init__(
-            recv_ts,
-            seq,
-            f"the wall clock stepped {abs(step_ns) / 1e6:.1f} ms back here, so ordering stored "
-            "rows by (recv_ts, seq) is no longer arrival order (ADR 0012)",
-        )
-        self.step_ns = step_ns
 
 
 # --- the book ---------------------------------------------------------------------------
@@ -214,7 +208,8 @@ def kraken_checksum(book: ReferenceBook) -> int:
 class BookMessage:
     """The book levels of one raw record, in the venue's order."""
 
-    recv_ts: int
+    log_id: str  # the raw log (ADR 0013)
+    recv_ts: int  # a measurement; never used for order (ADR 0012)
     seq: int
     event_ts: int  # the latest venue time among its levels
     kind: BookEventKind
@@ -224,8 +219,13 @@ class BookMessage:
     levels: tuple[Level, ...]
 
     @property
-    def key(self) -> tuple[int, int]:
-        return (self.recv_ts, self.seq)
+    def key(self) -> tuple[str, int]:
+        """Replay order: the log, then the record within it."""
+        return (self.log_id, self.seq)
+
+    @property
+    def at(self) -> tuple[str, int, int]:
+        return (self.log_id, self.seq, self.recv_ts)
 
 
 _HEADER = ("kind", "venue_seq_last", "checksum", "depth")
@@ -233,32 +233,33 @@ _HEADER = ("kind", "venue_seq_last", "checksum", "depth")
 
 def messages_from_table(table: pa.Table) -> Iterator[BookMessage]:
     """Group ``book_events`` rows (from ``PITSession.book_events``) into
-    messages, ordered by (recv_ts, seq), each with its levels in order."""
-    names = ("recv_ts", "seq", "event_ts", *_HEADER, "level_index", "side", "price", "qty")
+    messages, ordered by (log_id, seq), each with its levels in order."""
+    names = ("log_id", "seq", "recv_ts", "event_ts", *_HEADER, "level_index", "side", "price",
+             "qty")  # fmt: skip
     columns = [table.column(name).to_pylist() for name in names]
-    grouped: dict[tuple[int, int], list[tuple]] = {}
+    grouped: dict[tuple[str, int], list[tuple]] = {}
     for values in zip(*columns, strict=True):
         grouped.setdefault((values[0], values[1]), []).append(values)
 
-    for (recv_ts, seq), rows in sorted(grouped.items()):
-        rows.sort(key=lambda r: r[7])
-        if [r[7] for r in rows] != list(range(len(rows))):
-            raise ValueError(f"message (recv_ts {recv_ts}, seq {seq}): level_index is not 0..n-1")
-        header = {r[3:7] for r in rows}
-        if len(header) != 1:
-            raise ValueError(
-                f"message (recv_ts {recv_ts}, seq {seq}): levels disagree on {_HEADER}"
-            )
+    for (log_id, seq), rows in sorted(grouped.items()):
+        rows.sort(key=lambda r: r[8])
+        where = f"message (log {log_id}, seq {seq})"
+        if [r[8] for r in rows] != list(range(len(rows))):
+            raise ValueError(f"{where}: level_index is not 0..n-1")
+        header = {r[4:8] for r in rows}
+        if len(header) != 1 or len({r[2] for r in rows}) != 1:
+            raise ValueError(f"{where}: levels disagree on recv_ts or {_HEADER}")
         kind, venue_seq_last, checksum, depth = header.pop()
         yield BookMessage(
-            recv_ts=recv_ts,
+            log_id=log_id,
+            recv_ts=rows[0][2],
             seq=seq,
-            event_ts=max(r[2] for r in rows),
+            event_ts=max(r[3] for r in rows),
             kind=BookEventKind(kind),
             venue_seq_last=venue_seq_last,
             checksum=checksum,
             depth=depth,
-            levels=tuple((Side(r[8]), r[9], r[10]) for r in rows),
+            levels=tuple((Side(r[9]), r[10], r[11]) for r in rows),
         )
 
 
@@ -271,55 +272,48 @@ _SEQUENCE_KINDS = {
 }
 _RESETS = {StreamEventKind.SESSION_START, StreamEventKind.CONNECT, StreamEventKind.DISCONNECT}
 _VENUES = ("kraken", "coinbase")
+# Venues whose book stream comes in batches, each with one venue time, so that
+# an independent snapshot can be taken between two of them (ADR 0014).
+_TIMED_BATCHES = frozenset({"coinbase"})
 
 
 class _Replayer:
-    """Applies stream messages and stored events in (recv_ts, seq) order."""
+    """Applies stream messages and stored events in (log_id, seq) order."""
 
     def __init__(self, venue: str, events: Iterable[dict[str, Any]], verify: bool):
         if venue not in _VENUES:
             raise ValueError(f"no book rule for venue {venue!r}")
         self.venue, self.verify = venue, verify
-        # The wall clock is shared by every connection, so its steps always count.
-        relevant = [
-            e
-            for e in events
-            if e["connection"] in (_STREAM, None) or e["kind"] == StreamEventKind.CLOCK_STEP
-        ]
-        self._events = sorted(relevant, key=lambda e: (e["recv_ts"], e["seq"], e["event_index"]))
+        relevant = [e for e in events if e["connection"] in (_STREAM, None)]
+        self._events = sorted(relevant, key=lambda e: (e["log_id"], e["seq"], e["event_index"]))
         self._next_event = 0
         self.book: ReferenceBook | None = None
         self._last_venue_seq: int | None = None
 
-    def _events_until(self, key: tuple[int, int]) -> None:
+    def _events_until(self, key: tuple[str, int] | None) -> None:
         """Handle every stored event at or before ``key``. Events at a message's
         own record come first: a reconnect or gap there concerns that message."""
         while self._next_event < len(self._events):
             event = self._events[self._next_event]
-            if (event["recv_ts"], event["seq"]) > key:
+            if key is not None and (event["log_id"], event["seq"]) > key:
                 return
             self._next_event += 1
             self._event(event)
 
     def _event(self, event: dict[str, Any]) -> None:
         kind = StreamEventKind(event["kind"])
-        recv_ts, seq = event["recv_ts"], event["seq"]
+        at = (event["log_id"], event["seq"], event["recv_ts"])
         if kind in _RESETS:
             # A new session or connection starts a new stream: a snapshot must come first.
             self.book, self._last_venue_seq = None, None
         elif kind in _SEQUENCE_KINDS:
             raise SequenceBreak(
-                recv_ts, seq, _SEQUENCE_KINDS[kind], event["expected"], event["observed"],
-                "stream_event",
-            )  # fmt: skip
-        elif kind == StreamEventKind.CHECKSUM_MISMATCH:
-            raise ChecksumMismatch(
-                recv_ts, seq, event["expected"], event["observed"], "stream_event"
+                at, _SEQUENCE_KINDS[kind], event["expected"], event["observed"], "stream_event"
             )
-        elif kind == StreamEventKind.CLOCK_STEP and event["observed"] < 0:
-            raise ReplayOrderUnreliable(recv_ts, seq, event["observed"])
+        elif kind == StreamEventKind.CHECKSUM_MISMATCH:
+            raise ChecksumMismatch(at, event["expected"], event["observed"], "stream_event")
         elif kind == StreamEventKind.MESSAGE_REJECTED:
-            raise StreamFault(recv_ts, seq, f"a stream message was rejected: {event['detail']}")
+            raise StreamFault(at, f"a stream message was rejected: {event['detail']}")
 
     def message(self, message: BookMessage) -> ReferenceBook:
         self._events_until(message.key)
@@ -329,9 +323,7 @@ class _Replayer:
             self._last_venue_seq = None
         elif message.kind == BookEventKind.DELTA:
             if self.book is None:
-                raise DeltaBeforeSnapshot(
-                    message.recv_ts, message.seq, "a book update arrived before any snapshot"
-                )
+                raise DeltaBeforeSnapshot(message.at, "a book update arrived before any snapshot")
             self.book.apply(message.levels)
         else:
             raise ValueError("check snapshots are not part of the stream")
@@ -347,9 +339,7 @@ class _Replayer:
                 raise ValueError(f"Kraken message seq {message.seq} has no checksum to verify")
             computed = kraken_checksum(self.book)
             if computed != message.checksum:
-                raise ChecksumMismatch(
-                    message.recv_ts, message.seq, message.checksum, computed, "computed"
-                )
+                raise ChecksumMismatch(message.at, message.checksum, computed, "computed")
         else:
             number = message.venue_seq_last
             if number is None:
@@ -357,13 +347,11 @@ class _Replayer:
             last = self._last_venue_seq
             if last is not None and number <= last:
                 kind = "repeat" if number == last else "out_of_order"
-                raise SequenceBreak(
-                    message.recv_ts, message.seq, kind, last + 1, number, "computed"
-                )
+                raise SequenceBreak(message.at, kind, last + 1, number, "computed")
             self._last_venue_seq = number
 
     def finish(self) -> None:
-        self._events_until((_INT64_MAX, _INT64_MAX))
+        self._events_until(None)
 
 
 def _stream(messages: Iterable[BookMessage]) -> list[BookMessage]:
@@ -395,67 +383,184 @@ def replay(
     replayer.finish()
 
 
+Difference = tuple[int, int, int | None, int | None]
+Unverified = tuple[int, int, int | None, int | None, int | None]
+
+
 @dataclass(frozen=True)
 class CheckResult:
-    """One independent snapshot compared with the book rebuilt from the stream."""
+    """One independent snapshot compared with the book rebuilt from the stream,
+    under the venue's rule (ADR 0014). Quantities are None where a level is
+    absent."""
 
     snapshot: BookMessage
-    stream_messages_applied: int  # stream messages with venue time at or before the snapshot's
+    stream_messages_applied: int  # messages of its stream connection, up to and including A
     levels_compared: int
-    # (side, price, rebuilt quantity, snapshot quantity); None where a level is missing
-    differences: list[tuple[int, int, int | None, int | None]] = field(default_factory=list)
+    # (side, price, rebuilt quantity, snapshot quantity): levels that break the rule.
+    differences: list[Difference] = field(default_factory=list)
+    # Coinbase, between batches: levels of the next batch B where the snapshot
+    # differs from the book after A, as (side, price, after A, snapshot, after B).
+    unverified: list[Unverified] = field(default_factory=list)
+    on_batch: bool | None = None  # the snapshot's time equals A's
+    next_batch_levels: int = 0  # distinct levels B lists; 0 if there is no B
+    not_compared: str | None = None  # why there was no book to compare with
 
     @property
     def matched(self) -> bool:
-        return self.stream_messages_applied > 0 and not self.differences
+        """The rule holds."""
+        return self.not_compared is None and not self.differences
+
+    @property
+    def exact(self) -> bool:
+        """The snapshot equals the book after A on every level."""
+        return self.matched and not self.unverified
+
+    @property
+    def result(self) -> str:
+        if self.not_compared is not None:
+            return "not_compared"
+        if self.differences:
+            return "mismatch"
+        return "explained" if self.unverified else "exact"
+
+    def rank(self, side: int, price: int) -> int:
+        """How many of the snapshot's levels on ``side`` are better than ``price``."""
+        prices = sorted(p for s, p, _ in self.snapshot.levels if s == side)
+        if side == Side.BUY:
+            return len(prices) - bisect_right(prices, price)
+        return bisect_left(prices, price)
+
+    def summary(self) -> dict[str, Any]:
+        """The facts the adapter's CHECK_SNAPSHOT_COMPARED event records (ADR 0014)."""
+        compared = self.not_compared is None
+
+        def span(levels: Sequence[tuple]) -> tuple[int | None, int | None]:
+            ranks = [self.rank(level[0], level[1]) for level in levels]
+            return (min(ranks), max(ranks)) if ranks else (None, None)
+
+        violations, unverified = span(self.differences), span(self.unverified)
+        return {
+            "snapshot_seq": self.snapshot.seq,
+            "result": self.result,
+            "reason": self.not_compared,
+            "levels": len(self.snapshot.levels),
+            "on_batch": self.on_batch,
+            "next_batch_levels": self.next_batch_levels,
+            "violations": len(self.differences) if compared else None,
+            "violations_shallowest": violations[0],
+            "violations_deepest": violations[1],
+            "unverified": len(self.unverified) if compared else None,
+            "unverified_as_next_batch": sum(u[3] == u[4] for u in self.unverified)
+            if compared
+            else None,
+            "unverified_shallowest": unverified[0],
+            "unverified_deepest": unverified[1],
+        }
 
 
-def _compare(snapshot: BookMessage, book: ReferenceBook | None, applied: int) -> CheckResult:
+def _not_compared(snapshot: BookMessage, reason: str) -> CheckResult:
+    return CheckResult(snapshot, 0, len(snapshot.levels), not_compared=reason)
+
+
+def _compare(
+    venue: str,
+    snapshot: BookMessage,
+    book: ReferenceBook,
+    a: BookMessage,
+    b: BookMessage | None,
+    applied: int,
+) -> CheckResult:
+    """The snapshot against the book after A, exempting B's levels where the
+    venue's rule allows it."""
+    after_b: dict[tuple[Side, int], int | None] = {}
+    for side, price, qty in b.levels if b is not None else ():
+        after_b[(side, price)] = qty or None
+    on_batch = a.event_ts == snapshot.event_ts
+    exempt = after_b if venue in _TIMED_BATCHES and not on_batch else {}
     expected: dict[int, dict[int, int]] = {Side.BUY: {}, Side.SELL: {}}
     for side, price, qty in snapshot.levels:
         expected[side][price] = qty
-    differences = []
+    differences, unverified = [], []
     for side in (Side.BUY, Side.SELL):
-        if book is None:
-            rebuilt = {}
-        elif snapshot.depth is not None:
+        if snapshot.depth is not None:
             rebuilt = dict(book.top(side, snapshot.depth))
         else:
             rebuilt = book.levels(side)
         for price in sorted(set(rebuilt) | set(expected[side])):
-            if rebuilt.get(price) != expected[side].get(price):
-                differences.append((side, price, rebuilt.get(price), expected[side].get(price)))
-    return CheckResult(snapshot, applied, len(snapshot.levels), differences)
+            ours, theirs = rebuilt.get(price), expected[side].get(price)
+            if ours == theirs:
+                continue
+            if (side, price) in exempt:
+                unverified.append((side, price, ours, theirs, exempt[(side, price)]))
+            else:
+                differences.append((side, price, ours, theirs))
+    return CheckResult(snapshot, applied, len(snapshot.levels), differences, unverified,
+                       on_batch, len(after_b))  # fmt: skip
 
 
 def verify_check_snapshots(
     venue: str, messages: Sequence[BookMessage], events: Iterable[dict[str, Any]] = ()
 ) -> list[CheckResult]:
-    """Compare every check snapshot with the book rebuilt from the stream up to
-    and including the last message whose venue time is at or before the
-    snapshot's. Raises on any integrity failure, like ``replay``."""
-    checks = sorted(
-        (m for m in messages if m.kind == BookEventKind.CHECK_SNAPSHOT),
-        key=lambda m: (m.event_ts, m.recv_ts, m.seq),
+    """Compare every check snapshot with the book rebuilt from the stream, under
+    ADR 0014's rule. Raises on any integrity failure, like ``replay``.
+
+    The stream a snapshot is compared with is the connection that was current
+    at the snapshot's record: the stream messages of its log between the last
+    session start, connect or disconnect before that record and the next one.
+    A is the message just before B, the first of those messages whose venue
+    time is after the snapshot's T. Without B (the stream ended first), every
+    level must match. Results come in (log_id, seq) order of the snapshots.
+    """
+    events = list(events)
+    resets = sorted(
+        (e["log_id"], e["seq"])
+        for e in events
+        if e["kind"] in _RESETS and e["connection"] in (_STREAM, None)
     )
+
+    def connection(key: tuple[str, int]) -> tuple[str, int]:
+        return key[0], bisect_right(resets, key)
+
+    stream = _stream(messages)
+    by_connection: dict[tuple[str, int], list[BookMessage]] = {}
+    for message in stream:
+        by_connection.setdefault(connection(message.key), []).append(message)
+    checks = sorted((m for m in messages if m.kind == BookEventKind.CHECK_SNAPSHOT),
+                    key=lambda m: m.key)  # fmt: skip
+    results: dict[tuple[str, int], CheckResult] = {}
+    planned: dict[tuple[str, int], list[tuple[BookMessage, BookMessage | None, int]]] = {}
+    for check in checks:
+        members = by_connection.get(connection(check.key), [])
+        if not any(m.key < check.key for m in members):
+            results[check.key] = _not_compared(check, "no_stream_book")
+            continue
+        b_index = next((i for i, m in enumerate(members) if m.event_ts > check.event_ts), None)
+        if b_index == 0:
+            results[check.key] = _not_compared(check, "before_stream_snapshot")
+            continue
+        a_index = (len(members) if b_index is None else b_index) - 1
+        b = None if b_index is None else members[b_index]
+        if b is not None and b.kind == BookEventKind.SNAPSHOT:
+            results[check.key] = _not_compared(check, "next_message_is_snapshot")
+            continue
+        planned.setdefault(members[a_index].key, []).append((check, b, a_index + 1))
+
     replayer = _Replayer(venue, events, verify=True)
-    results, pending, applied = [], list(checks), 0
-    for message in _stream(messages):
-        while pending and message.event_ts > pending[0].event_ts:
-            results.append(_compare(pending.pop(0), replayer.book, applied))
-        replayer.message(message)
-        applied += 1
+    for message in stream:
+        book = replayer.message(message)
+        for check, b, applied in planned.pop(message.key, ()):
+            results[check.key] = _compare(venue, check, book, message, b, applied)
     replayer.finish()
-    results.extend(_compare(check, replayer.book, applied) for check in pending)
-    return results
+    return [results[check.key] for check in checks]
 
 
 # --- golden files ------------------------------------------------------------------------
 
 
 def golden_schema(levels: int = GOLDEN_LEVELS) -> pa.Schema:
-    fields = [pa.field("recv_ts", pa.int64(), nullable=False),
-              pa.field("seq", pa.uint64(), nullable=False)]  # fmt: skip
+    fields = [pa.field("log_id", pa.string(), nullable=False),
+              pa.field("seq", pa.uint64(), nullable=False),
+              pa.field("recv_ts", pa.int64(), nullable=False)]  # fmt: skip
     for rank in range(levels):
         for side in ("bid", "ask"):
             fields.append(pa.field(f"{side}_price_{rank:02d}", pa.int64()))
@@ -472,15 +577,16 @@ def golden_table(
 ) -> pa.Table:
     """The book's best ``levels`` per side after every stream message.
 
-    One row per stream message: ``recv_ts`` and ``seq`` name the raw record,
+    One row per stream message: ``log_id`` and ``seq`` name the raw record,
     then for each rank, best first, the bid's price and quantity and the ask's
     price and quantity (mantissas; null where the book has fewer levels).
     """
     schema = golden_schema(levels)
     columns: dict[str, list] = {name: [] for name in schema.names}
     for message, book in replay(venue, messages, events):
-        columns["recv_ts"].append(message.recv_ts)
+        columns["log_id"].append(message.log_id)
         columns["seq"].append(message.seq)
+        columns["recv_ts"].append(message.recv_ts)
         for side, name in ((Side.BUY, "bid"), (Side.SELL, "ask")):
             top = book.top(side, levels)
             for rank in range(levels):
@@ -512,16 +618,22 @@ def _verify_command(args: argparse.Namespace) -> int:
     except BookIntegrityError as error:
         print(f"FAILED: {error}")
         return 1
-    matched = sum(result.matched for result in results)
-    print(f"{matched} of {len(results)} check snapshots match the rebuilt book")
+    counts = {name: sum(r.result == name for r in results)
+              for name in ("exact", "explained", "mismatch", "not_compared")}  # fmt: skip
+    matched = counts["exact"] + counts["explained"]
+    print(f"{matched} of {len(results)} check snapshots match the rebuilt book: "
+          f"{counts['exact']} exact, {counts['explained']} between stream batches (ADR 0014), "
+          f"{counts['not_compared']} not compared")  # fmt: skip
     for result in results:
-        if not result.matched:
+        if result.result == "mismatch":
             print(
                 f"  snapshot seq {result.snapshot.seq}: {len(result.differences)} of "
                 f"{result.levels_compared} levels differ"
             )
+        elif result.result == "not_compared":
+            print(f"  snapshot seq {result.snapshot.seq}: not compared ({result.not_compared})")
     print("never crossed" if crossed == 0 else f"crossed after {crossed} messages")
-    ok = matched == len(results) and crossed == 0
+    ok = counts["mismatch"] == 0 and crossed == 0
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -47,7 +47,11 @@ def log(venue, *entries):
 
 
 def rows_of(normalized, dataset, venue, instrument="BTC-USD"):
-    return normalized.rows.get((dataset.name, venue, instrument), [])
+    """The rows of one dataset, without log_id, after checking that every row
+    names the one log they came from (log ids have their own tests)."""
+    rows = normalized.rows.get((dataset.name, venue, instrument), [])
+    assert len({row["log_id"] for row in rows}) <= 1
+    return [{k: v for k, v in row.items() if k != "log_id"} for row in rows]
 
 
 # --- timestamps ------------------------------------------------------------------

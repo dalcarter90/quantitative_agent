@@ -17,8 +17,13 @@ Venue, instrument and date are not columns. They are the store's partition
 directories, so a row's identity is (venue, instrument) plus the dataset's
 ``key`` columns. A correction is a new row with the same key and a later
 ``knowledge_ts``.
+
+``log_id`` names the raw log a row came from (ADR 0013), and ``seq`` is the
+row's raw record in that log. ``(log_id, seq)`` is the order of stored data;
+no key depends on ``recv_ts``, which is a measurement (ADR 0012).
 """
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -83,6 +88,13 @@ class StreamEventKind(IntEnum):
     # book rebuilt from the stream. The book is suspect until the next snapshot.
     CHECKSUM_MISMATCH = 13
     MESSAGE_REJECTED = 14  # the record could not be normalized; detail says why
+    # A check snapshot compared with the book rebuilt from the stream under the
+    # venue's rule (ADR 0014). Noticed at the record where the comparison could
+    # be made: the snapshot's own, or a later one. expected is the number of
+    # levels that break the rule (0 when it holds), observed the number of
+    # levels the rule cannot verify that differ; both null if it could not be
+    # compared. detail is JSON naming the snapshot's record and the result.
+    CHECK_SNAPSHOT_COMPARED = 15
 
 
 EVENT_TS_VENUE = "venue"
@@ -119,20 +131,25 @@ def _required(name: str, type_: pa.DataType) -> pa.Field:
     return pa.field(name, type_, nullable=False)
 
 
-# Common leading columns. ``seq`` is the local sequence number assigned at
-# receipt; (recv_ts, seq) is the total order used for replay.
+# Common leading columns. ``log_id`` is the raw log the row came from and
+# ``seq`` its record number there; (log_id, seq) is the order of stored data
+# (ADR 0012, ADR 0013).
 _HEADER = [
     _required("event_ts", pa.int64()),
     _required("event_ts_source", pa.string()),  # "venue" or "receipt", ADR 0008
     _required("recv_ts", pa.int64()),
+    _required("log_id", pa.string()),
     _required("seq", pa.uint64()),
 ]
+# The form rawlog.log_id_of produces.
+LOG_ID_PATTERN = r"[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9a-f]{12}"
+_LOG_ID = re.compile(LOG_ID_PATTERN)
 _TIMESTAMP_BOUNDS = {"event_ts": (0, None), "recv_ts": (0, None)}
 _EVENT_TS_SOURCES = {"event_ts_source": frozenset({EVENT_TS_VENUE, EVENT_TS_RECEIPT})}
 
 TRADES = Dataset(
     name="trades",
-    version=2,
+    version=3,
     schema=pa.schema(
         [
             *_HEADER,
@@ -148,7 +165,7 @@ TRADES = Dataset(
 )
 
 # One row per price level. A venue message with many levels becomes many rows
-# that share recv_ts, seq and the venue's integrity columns, and are numbered
+# that share log_id, seq and the venue's integrity columns, and are numbered
 # by level_index in the order the venue listed them. That order matters: a
 # venue may update the same price twice in one message.
 #
@@ -160,7 +177,7 @@ TRADES = Dataset(
 # normalizing the same raw log again produces corrections, not duplicates.
 BOOK_EVENTS = Dataset(
     name="book_events",
-    version=2,
+    version=3,
     schema=pa.schema(
         [
             *_HEADER,
@@ -180,7 +197,7 @@ BOOK_EVENTS = Dataset(
             _required("qty", pa.int64()),
         ]
     ),
-    key=("recv_ts", "seq", "level_index"),
+    key=("log_id", "seq", "level_index"),
     allowed={
         **_EVENT_TS_SOURCES,
         "kind": frozenset(int(k) for k in BookEventKind),
@@ -194,11 +211,13 @@ BOOK_EVENTS = Dataset(
     },
 )
 
-# One row per version of an instrument's metadata. ``event_ts`` is when the
-# version takes effect, so it identifies the version.
+# One row per version of an instrument's metadata, observed in one raw record.
+# ``event_ts`` is when the version takes effect. The key is the observation, not
+# event_ts: for metadata without a venue timestamp event_ts is the receipt
+# time, and no key depends on recv_ts (ADR 0013).
 INSTRUMENTS = Dataset(
     name="instruments",
-    version=2,
+    version=3,
     schema=pa.schema(
         [
             *_HEADER,
@@ -208,7 +227,7 @@ INSTRUMENTS = Dataset(
             _required("lot_size", pa.int64()),  # mantissa at qty_exp
         ]
     ),
-    key=("event_ts",),
+    key=("log_id", "seq"),
     allowed=_EVENT_TS_SOURCES,
     bounds={
         **_TIMESTAMP_BOUNDS,
@@ -220,12 +239,12 @@ INSTRUMENTS = Dataset(
 )
 
 # Integrity events for every venue, one row per event. Each refers to the raw
-# record it was noticed at (recv_ts, seq); event_index orders several events
+# record it was noticed at (log_id, seq); event_index orders several events
 # from one record. These are our own observations, so event_ts is always the
 # receipt time (ADR 0008).
 STREAM_EVENTS = Dataset(
     name="stream_events",
-    version=1,
+    version=2,
     schema=pa.schema(
         [
             *_HEADER,
@@ -237,7 +256,7 @@ STREAM_EVENTS = Dataset(
             pa.field("detail", pa.string(), nullable=True),
         ]
     ),
-    key=("recv_ts", "seq", "event_index"),
+    key=("log_id", "seq", "event_index"),
     allowed={
         "event_ts_source": frozenset({EVENT_TS_RECEIPT}),
         "kind": frozenset(int(k) for k in StreamEventKind),
@@ -350,6 +369,12 @@ def validate_table(dataset: Dataset, table: pa.Table) -> None:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['min']} is below {low}")
         if high is not None and extremes["max"] > high:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['max']} is above {high}")
+
+    # ADR 0013: every row names a well-formed raw log.
+    log_ids = table.column("log_id")
+    if not pc.all(pc.match_substring_regex(log_ids, f"^{LOG_ID_PATTERN}$")).as_py():
+        bad = next(v for v in log_ids.to_pylist() if not _LOG_ID.fullmatch(v))
+        raise SchemaError(f"{dataset.name}.log_id: {bad!r} is not a log id")
 
     # ADR 0008: a row without a venue timestamp carries its receipt time.
     receipt = pc.equal(table.column("event_ts_source"), EVENT_TS_RECEIPT)

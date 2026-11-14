@@ -25,6 +25,8 @@ from quantagent.data.schema import (
 )
 from quantagent.data.store import AppendOnlyStore, AppendResult
 
+LOG = "20231114T120000.000000000Z-000000000000"
+
 NS_PER_DAY = 86_400 * 1_000_000_000
 DAY_19675 = 19675 * NS_PER_DAY  # 2023-11-14T00:00:00Z
 T0 = DAY_19675 + 12 * 3600 * 1_000_000_000  # 2023-11-14T12:00:00Z
@@ -49,6 +51,7 @@ def trades(*specs):
             "event_ts": event_ts,
             "event_ts_source": "venue",
             "recv_ts": event_ts + 5_000_000,
+            "log_id": LOG,
             "seq": i,
             "trade_id": trade_id,
             "price": price,
@@ -60,12 +63,13 @@ def trades(*specs):
     return table_from_rows(TRADES, rows)
 
 
-def instrument(event_ts, *, price_exp=2, qty_exp=5, tick_size=1, lot_size=1):
+def instrument(event_ts, *, price_exp=2, qty_exp=5, tick_size=1, lot_size=1, seq=0):
     row = {
         "event_ts": event_ts,
         "event_ts_source": "venue",
         "recv_ts": event_ts + 5_000_000,
-        "seq": 0,
+        "log_id": LOG,
+        "seq": seq,
         "price_exp": price_exp,
         "qty_exp": qty_exp,
         "tick_size": tick_size,
@@ -179,6 +183,7 @@ def test_book_events_snapshot_and_delta_are_stored(root):
             "event_ts": T0,
             "event_ts_source": "venue",
             "recv_ts": T0 + 1,
+            "log_id": LOG,
             "seq": 0,
             "kind": BookEventKind.SNAPSHOT,
             "venue_seq_first": None,
@@ -194,6 +199,7 @@ def test_book_events_snapshot_and_delta_are_stored(root):
             "event_ts": T0 + 10,
             "event_ts_source": "venue",
             "recv_ts": T0 + 11,
+            "log_id": LOG,
             "seq": 1,
             "kind": BookEventKind.DELTA,
             "venue_seq_first": 101,
@@ -382,12 +388,12 @@ def test_instrument_metadata_is_stored_bitemporally(root):
     later = T0 + 30 * NS_PER_DAY
     store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=1))
     # The venue changes the tick size: a new version, effective later.
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(later, tick_size=10))
+    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(later, tick_size=10, seq=1))
     # We learn the first version was recorded wrongly: same key, later knowledge.
     store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=5))
 
     rows = read_all(root, INSTRUMENTS)
-    assert INSTRUMENTS.key == ("event_ts",)
+    assert INSTRUMENTS.key == ("log_id", "seq")
     assert [(r["event_ts"], r["tick_size"], r["knowledge_ts"]) for r in rows] == [
         (T0, 1, 1_000),
         (later, 10, 2_000),

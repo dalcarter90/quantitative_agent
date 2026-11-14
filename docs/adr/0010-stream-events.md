@@ -1,6 +1,6 @@
 # 0010: `stream_events`, a dataset of integrity events
 
-Status: Accepted (owner decision; additions confirmed by the owner 2026-11-12), amended by 0011
+Status: Accepted (owner decision; additions confirmed by the owner 2026-11-12), amended by 0011, 0013 and 0014
 Date: 2026-11-11
 Amends: 0006, 0009
 

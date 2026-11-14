@@ -66,7 +66,8 @@ class Finding:
     venue: str
     instrument: str
     dataset: str
-    recv_ts: int  # with seq, the raw record the finding points at
+    log_id: str  # with seq, the raw record the finding points at (ADR 0013)
+    recv_ts: int  # when that record arrived
     seq: int
     message: str
 
@@ -74,7 +75,7 @@ class Finding:
     def where(self) -> str:
         return (
             f"{self.venue}/{self.instrument} {self.dataset} "
-            f"record (recv_ts {self.recv_ts}, seq {self.seq})"
+            f"record (log {self.log_id}, seq {self.seq})"
         )
 
 
@@ -189,8 +190,9 @@ class _Scope:
         return max(self.config.max_findings - len(self.findings), 0) + 1
 
     def add(
-        self, severity: Severity, what: str, dataset: str, recv_ts: int, seq: int, message: str
+        self, severity: Severity, what: str, dataset: str, at: dict[str, Any], message: str
     ) -> None:
+        """``at`` is the raw record: a row or event with log_id, seq and recv_ts."""
         if len(self.findings) >= self.config.max_findings:
             self.truncated = True
             return
@@ -202,8 +204,9 @@ class _Scope:
                 venue=self.venue,
                 instrument=self.instrument,
                 dataset=dataset,
-                recv_ts=recv_ts,
-                seq=seq,
+                log_id=at["log_id"],
+                recv_ts=at["recv_ts"],
+                seq=at["seq"],
                 message=message,
             )
         )
@@ -253,7 +256,7 @@ def check_stream_integrity(
         connection, detail = event["connection"], event["detail"]
 
         def add(severity: Severity, what: str, message: str, event: dict = event) -> None:
-            scope.add(severity, what, "stream_events", event["recv_ts"], event["seq"], message)
+            scope.add(severity, what, "stream_events", event, message)
 
         if kind == StreamEventKind.SESSION_START:
             stream_connected = False
@@ -288,6 +291,84 @@ def check_stream_integrity(
             )
         elif kind == StreamEventKind.MESSAGE_REJECTED:
             add(Severity.ERROR, "message_rejected", f"on {connection}: {detail}")
+    return scope.result()
+
+
+# --- check snapshots --------------------------------------------------------------------
+
+
+def _ranks(shallowest: Any, deepest: Any) -> str:
+    return f"rank {shallowest}" if shallowest == deepest else f"ranks {shallowest} to {deepest}"
+
+
+def check_independent_snapshots(
+    session: PITSession, venue: str, instrument: str, start: int, end: int, config: QualityConfig
+) -> CheckResult:
+    """Independent check snapshots against the book rebuilt from the stream,
+    from the adapters' CHECK_SNAPSHOT_COMPARED events (ADR 0014).
+
+    A level that breaks the rule is an ERROR: the rebuilt book or the stream
+    is wrong. A Coinbase snapshot taken between two stream batches that
+    differs only on the next batch's levels is INFO: the stream cannot show
+    the book between batches, and every other level matched. A snapshot that
+    could not be compared is INFO. Exact snapshots are counted, not reported.
+
+    Only the Coinbase adapter writes these events. Kraken's check snapshots are
+    compared by the reference reconstructor (``book verify``), and its stream
+    is verified by checksum after every message.
+    """
+    scope = _Scope("independent_snapshots", session, venue, instrument, start, end, config)
+    kind = int(StreamEventKind.CHECK_SNAPSHOT_COMPARED)
+    events = [e for e in session.stream_events(venue, instrument, start, end).to_pylist()
+              if e["kind"] == kind]  # fmt: skip
+    counts: Counter = Counter()
+    for event in events:
+        detail = _start_detail(event)
+        result, seq = detail.get("result"), detail.get("snapshot_seq")
+        counts[result] += 1
+        if result == "mismatch":
+            scope.add(
+                Severity.ERROR,
+                "check_snapshot_mismatch",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} differs from the rebuilt book on "
+                f"{detail.get('violations')} levels "
+                f"({_ranks(detail.get('violations_shallowest'), detail.get('violations_deepest'))})"
+                " that the stream fully determines (ADR 0014)",
+            )
+        elif result == "explained":
+            ranks = _ranks(detail.get("unverified_shallowest"), detail.get("unverified_deepest"))
+            scope.add(
+                Severity.INFO,
+                "check_snapshot_between_batches",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} was taken between two stream batches: it "
+                f"differs on {detail.get('unverified')} of the next batch's "
+                f"{detail.get('next_batch_levels')} levels ({ranks}; "
+                f"{detail.get('unverified_as_next_batch')} as that batch has them) and matches "
+                "on every other level (ADR 0014)",
+            )
+        elif result == "not_compared":
+            scope.add(
+                Severity.INFO,
+                "check_snapshot_not_compared",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} could not be compared with the rebuilt book: "
+                f"{detail.get('reason')}",
+            )
+        elif result != "exact":
+            scope.add(Severity.WARNING, "check_snapshot_unreadable", "stream_events", event,
+                      f"the comparison event has no known result: {event['detail']!r}")  # fmt: skip
+    scope.stats = {
+        "snapshots": len(events),
+        "exact": counts["exact"],
+        "explained": counts["explained"],
+        "mismatched": counts["mismatch"],
+        "not_compared": counts["not_compared"],
+    }
     return scope.result()
 
 
@@ -343,8 +424,7 @@ def check_recording_clock(
                     Severity.INFO,
                     "clock_not_recorded",
                     "stream_events",
-                    begin["recv_ts"],
-                    begin["seq"],
+                    begin,
                     "this session was recorded before the clock was measured and before "
                     "records had monotonic stamps, so its recv_ts may be off by an unknown "
                     "amount and clock steps cannot be detected (docs/data-core.md, section 7)",
@@ -354,8 +434,7 @@ def check_recording_clock(
                 Severity.WARNING,
                 "clock_unmeasured",
                 "stream_events",
-                clock["recv_ts"],
-                clock["seq"],
+                clock,
                 "the recording clock could not be measured at session start",
             )
         else:
@@ -367,8 +446,7 @@ def check_recording_clock(
                     Severity.ERROR,
                     "clock_offset_exceeded",
                     "stream_events",
-                    clock["recv_ts"],
-                    clock["seq"],
+                    clock,
                     f"the recording clock was {offset / 1e6:+.1f} ms from NTP time (positive: "
                     f"ahead), beyond the {config.max_clock_offset_ns / 1e6:.1f} ms limit; "
                     f"recv_ts and knowledge_ts are off by about that much{note}",
@@ -380,8 +458,7 @@ def check_recording_clock(
                 Severity.INFO,
                 "clock_steps_not_measurable",
                 "stream_events",
-                begin["recv_ts"],
-                begin["seq"],
+                begin,
                 "this session's records have no monotonic stamps, so wall-clock steps "
                 "during it cannot be detected (ADR 0012)",
             )
@@ -394,16 +471,10 @@ def check_recording_clock(
                     Severity.ERROR,
                     "clock_step",
                     "stream_events",
-                    step["recv_ts"],
-                    step["seq"],
+                    step,
                     f"the wall clock stepped {abs(size) / 1e6:.1f} ms {direction} against the "
                     f"monotonic counter here, beyond the {config.max_clock_step_ns / 1e6:.1f} "
                     "ms limit; recv_ts before and after this record are not comparable"
-                    + (
-                        ", and stored rows ordered by recv_ts are out of arrival order"
-                        if size < 0
-                        else ""
-                    )  # fmt: skip
                     + " (ADR 0012)",
                 )
         if override is not None:
@@ -411,8 +482,7 @@ def check_recording_clock(
                 Severity.INFO,
                 "clock_override",
                 "stream_events",
-                override["recv_ts"],
-                override["seq"],
+                override,
                 f"recorded with --allow-clock-offset ({override['detail']})",
             )
 
@@ -444,7 +514,7 @@ _VENUE_TIME = "event_ts_source = 'venue'"
 _IS_BACKFILL = (
     "EXISTS (SELECT 1 FROM stream_events e WHERE e.venue = t.venue "
     f"AND e.instrument = t.instrument AND e.kind = {int(StreamEventKind.TRADE_BACKFILL)} "
-    "AND e.recv_ts = t.recv_ts AND e.seq = t.seq)"
+    "AND e.log_id = t.log_id AND e.seq = t.seq)"
 )
 
 
@@ -495,8 +565,9 @@ def check_clock_skew(
     for dataset, source, p in sources:
         lag = f"{p}recv_ts - {p}event_ts"
         for row in scope.rows(
-            f"SELECT {p}recv_ts AS recv_ts, {p}seq AS seq, min({lag}) AS lo, max({lag}) AS hi "
-            f"{source} GROUP BY {p}recv_ts, {p}seq "
+            f"SELECT {p}log_id AS log_id, {p}seq AS seq, max({p}recv_ts) AS recv_ts, "
+            f"min({lag}) AS lo, max({lag}) AS hi "
+            f"{source} GROUP BY {p}log_id, {p}seq "
             f"HAVING min({lag}) < {low} OR max({lag}) > {high} "
             f"ORDER BY 1, 2 LIMIT {scope.room}"
         ):
@@ -506,8 +577,7 @@ def check_clock_skew(
                     Severity.WARNING,
                     "early",
                     dataset,
-                    row["recv_ts"],
-                    row["seq"],
+                    row,
                     f"received {_seconds(row['lo'])} after venue time, below the allowed "
                     f"{_seconds(low)}{note}",
                 )
@@ -516,14 +586,14 @@ def check_clock_skew(
                     Severity.WARNING,
                     "late",
                     dataset,
-                    row["recv_ts"],
-                    row["seq"],
+                    row,
                     f"received {_seconds(row['hi'])} after venue time, above the allowed "
                     f"{_seconds(high)}",
                 )
 
-    # Venue time stepping back between consecutive messages of one stream.
-    # Check snapshots come from another connection and are not part of it.
+    # Venue time stepping back between consecutive messages of one stream: one
+    # log, in record order. Check snapshots come from another connection and are
+    # not part of it.
     in_stream = f"kind <> {int(BookEventKind.CHECK_SNAPSHOT)}"
     streams = (
         ("book_events", f"{book} AND {_VENUE_TIME} AND {in_stream}", ""),
@@ -531,18 +601,17 @@ def check_clock_skew(
     )
     for dataset, source, p in streams:
         for row in scope.rows(
-            "SELECT recv_ts, seq, step FROM ("
-            "SELECT recv_ts, seq, ts - lag(ts) OVER (ORDER BY recv_ts, seq) AS step FROM ("
-            f"SELECT {p}recv_ts AS recv_ts, {p}seq AS seq, max({p}event_ts) AS ts "
-            f"{source} GROUP BY {p}recv_ts, {p}seq) m) d "
+            "SELECT log_id, seq, recv_ts, step FROM (SELECT log_id, seq, recv_ts, "
+            "ts - lag(ts) OVER (PARTITION BY log_id ORDER BY seq) AS step FROM ("
+            f"SELECT {p}log_id AS log_id, {p}seq AS seq, max({p}recv_ts) AS recv_ts, "
+            f"max({p}event_ts) AS ts {source} GROUP BY {p}log_id, {p}seq) m) d "
             f"WHERE step < {-config.max_backwards_ns} ORDER BY 1, 2 LIMIT {scope.room}"
         ):
             scope.add(
                 Severity.WARNING,
                 "event_ts_backwards",
                 dataset,
-                row["recv_ts"],
-                row["seq"],
+                row,
                 f"venue time is {_seconds(-row['step'])} before the previous message's",
             )
     return scope.result()
@@ -565,11 +634,11 @@ def check_crossed_books(
     scope = _Scope("crossed_books", session, venue, instrument, start, end, config)
     bid, ask = int(Side.BUY), int(Side.SELL)
     snapshots = scope.rows(
-        "SELECT recv_ts, seq, "
+        "SELECT log_id, seq, max(recv_ts) AS recv_ts, "
         f"max(CASE WHEN side = {bid} THEN price END) AS bid, "
         f"min(CASE WHEN side = {ask} THEN price END) AS ask "
         f"FROM book_events WHERE {scope.where()} AND kind <> {int(BookEventKind.DELTA)} "
-        "GROUP BY recv_ts, seq ORDER BY recv_ts, seq"
+        "GROUP BY log_id, seq ORDER BY log_id, seq"
     )
     scope.stats = {"snapshots_checked": len(snapshots)}
     for row in snapshots:
@@ -580,8 +649,7 @@ def check_crossed_books(
                 Severity.WARNING,
                 "one_sided",
                 "book_events",
-                row["recv_ts"],
-                row["seq"],
+                row,
                 f"the snapshot has no {side}",
             )
         elif best_bid >= best_ask:
@@ -590,8 +658,7 @@ def check_crossed_books(
                 Severity.ERROR,
                 what,
                 "book_events",
-                row["recv_ts"],
-                row["seq"],
+                row,
                 f"best bid {best_bid} is {'equal to' if what == 'locked' else 'above'} "
                 f"best ask {best_ask} (price mantissas)",
             )
@@ -634,20 +701,19 @@ def check_outliers(
     """
     scope = _Scope("outliers", session, venue, instrument, start, end, config)
     trades = session.sql(
-        "SELECT recv_ts, seq, trade_id, price, qty FROM trades "
-        f"WHERE {scope.where()} ORDER BY event_ts, recv_ts, seq, trade_id"
-    )
-    columns = [trades.column(name).to_pylist() for name in trades.schema.names]
+        "SELECT log_id, seq, recv_ts, trade_id, price, qty FROM trades "
+        f"WHERE {scope.where()} ORDER BY event_ts, log_id, seq, trade_id"
+    ).to_pylist()
     reference = _RollingMedian(config.outlier_window)
     judged = 0
-    for recv_ts, seq, trade_id, price, qty in zip(*columns, strict=True):
+    for trade in trades:
+        trade_id, price, qty = trade["trade_id"], trade["price"], trade["qty"]
         if qty <= 0:
             scope.add(
                 Severity.ERROR,
                 "nonpositive_quantity",
                 "trades",
-                recv_ts,
-                seq,
+                trade,
                 f"trade {trade_id}: quantity mantissa {qty}",
             )
         if price <= 0:
@@ -655,8 +721,7 @@ def check_outliers(
                 Severity.ERROR,
                 "nonpositive_price",
                 "trades",
-                recv_ts,
-                seq,
+                trade,
                 f"trade {trade_id}: price mantissa {price}",
             )
             continue
@@ -669,8 +734,7 @@ def check_outliers(
                     Severity.WARNING,
                     "price_outlier",
                     "trades",
-                    recv_ts,
-                    seq,
+                    trade,
                     f"trade {trade_id}: price {price} is {away} bps from {middle}, the "
                     f"median of the previous {len(reference)} trades (price mantissas)",
                 )
@@ -679,17 +743,17 @@ def check_outliers(
     snapshot_kinds = f"kind <> {int(BookEventKind.DELTA)}"
     (book,) = scope.rows(f"SELECT count(*) AS n FROM book_events WHERE {scope.where()}")
     scope.stats = {
-        "trades_checked": trades.num_rows,
+        "trades_checked": len(trades),
         "trades_with_reference": judged,
         "book_rows_checked": book["n"],
     }
     for row in scope.rows(
-        "SELECT recv_ts, seq, level_index, kind, price, qty FROM book_events "
+        "SELECT log_id, seq, recv_ts, level_index, kind, price, qty FROM book_events "
         f"WHERE {scope.where()} AND (price <= 0 OR qty < 0 OR (qty = 0 AND {snapshot_kinds})) "
-        f"ORDER BY recv_ts, seq, level_index LIMIT {scope.room}"
+        f"ORDER BY log_id, seq, level_index LIMIT {scope.room}"
     ):
         level = f"level {row['level_index']}"
-        at = ("book_events", row["recv_ts"], row["seq"])
+        at = ("book_events", row)
         if row["price"] <= 0:
             message = f"{level}: price mantissa {row['price']}"
             scope.add(Severity.ERROR, "nonpositive_price", *at, message)
@@ -705,6 +769,7 @@ def check_outliers(
 
 CHECKS: tuple[Check, ...] = (
     check_stream_integrity,
+    check_independent_snapshots,
     check_recording_clock,
     check_clock_skew,
     check_crossed_books,

@@ -6,8 +6,9 @@ are generated deterministically instead of committed, because they differ
 from the fixture by one record. Phase 4 uses the same functions.
 
 Every function takes the fixture's records and returns a new list in which
-each record keeps its receive time, so the stream is replayed in the same
-order apart from the damage. ``write`` turns a list into a raw log.
+each record keeps its receive time and its place in the log (record numbers
+stay in order), so the stream is replayed in the same order apart from the
+damage. ``write`` turns a list into a raw log.
 """
 
 import json

@@ -279,6 +279,7 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 | `knowledge_ts` | When the record became available to queries in the store | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
 | `recv_mono_ns` | The system's monotonic high-resolution counter, read with `recv_ts` | Feed thread (recorder). Comparable only between logs from the same machine, boot and counter (ADR 0012) |
 | `seq` | Local sequence number at receipt | Feed thread. **Within one raw log, replay order is `seq` alone**; logs are merged by `recv_mono_ns`. `recv_ts` is a measurement, never an ordering key (ADR 0012) |
+| `log_id` | The raw log a stored row came from, derived from that log's first record (not a time field; listed because it orders stored data with `seq`) | Normalizer. Stored rows are keyed and ordered by `(log_id, seq)`, never by `recv_ts` (ADR 0013) |
 
 **Wall-clock times assume a synchronized clock** (ADR 0011). `recv_ts` and
 `knowledge_ts` are only as accurate as the clock of the machine that stamped
@@ -369,7 +370,7 @@ Details and alternatives are in ADR 0006.
 | Tier | Content | Format | Used by |
 |------|---------|--------|---------|
 | Raw log | Exact bytes received, with `recv_ts` and `seq` | Append-only length-prefixed binary, zstd per segment | Replay engine, normalizer. Never rewritten |
-| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps; bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/date, integer mantissas | `PITSession`, via DuckDB |
+| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps, and the raw record each row came from (`log_id`, `seq`; ADR 0013); bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/date, integer mantissas | `PITSession`, via DuckDB |
 | Journal | Every hot-path decision, order, risk result and fill | Append-only fixed-record binary | Reconciliation, audit, monitoring |
 | Experiment registry | Hypotheses, configs, results, trial counts | DuckDB/SQLite file | Validation harness, agent |
 | Audit log | Every agent tool call with its reasoning | Append-only JSON lines | Humans |
