@@ -13,6 +13,10 @@ store. The rules that hold for every venue live here:
   pass through ``float``.
 - ``event_ts`` and ``event_ts_source`` follow ADR 0008: the source is decided
   by the kind of message, never by comparing timestamps.
+- A trade seen again (same venue, instrument and ``trade_id``) is compared
+  with its first observation in this normalizer, across every log fed to it.
+  The store keeps one row per trade; an observation that differs in price,
+  quantity or side is a TRADE_CONFLICT stream event (ADR 0015).
 """
 
 import calendar
@@ -51,6 +55,8 @@ _MAX_EVENT_DETAIL = 200
 # (up to 15.6 ms) plus the time between the two reads; far below any step
 # that matters.
 CLOCK_STEP_FLOOR_NS = 25_000_000
+# What must agree between two observations of one trade (ADR 0015).
+_TRADE_FIELDS = ("price", "qty", "side")
 
 
 def _compact(value: Any) -> str:
@@ -120,6 +126,7 @@ class Report:
     rejects: list[Reject] = field(default_factory=list)
     sequence_anomalies: list[SequenceAnomaly] = field(default_factory=list)
     events: Counter = field(default_factory=Counter)  # stream events by kind name
+    trade_repeats: int = 0  # trades seen again, conflicting or not (ADR 0015)
     truncated: bool = False  # the raw log ended in a partial record
 
     @property
@@ -136,6 +143,8 @@ class Report:
             f"rejected: {listed(self.rejected)}",
             f"sequence anomalies: {len(self.sequence_anomalies)}",
             f"checksum mismatches: {self.events['CHECKSUM_MISMATCH']}",
+            f"trade conflicts: {self.events['TRADE_CONFLICT']} "
+            f"(trades seen again: {self.trade_repeats})",
         ]
         if self.truncated:
             lines.append("the raw log ended in a partial record")
@@ -408,6 +417,8 @@ class Normalizer:
         self.pending_rows = 0  # rows produced and not yet taken
         self.report = Report()
         self._log_id: str | None = None  # the raw log being fed (ADR 0013)
+        # The first observation of every trade fed so far (ADR 0015).
+        self._trades: dict[tuple[str, str | None, str], dict[str, Any]] = {}
 
     def feed(self, record: RawRecord) -> None:
         report = self.report
@@ -434,6 +445,7 @@ class Normalizer:
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
             self._reject(record, adapter, "malformed_message", f"{type(error).__name__}: {error}")
             return
+        self._compare_trades(record, adapter, rows)
         self._store_events(record, adapter)
 
         report.outcomes[outcome] += 1
@@ -464,6 +476,27 @@ class Normalizer:
                 detail=f"{reason}: {detail}"[:_MAX_EVENT_DETAIL],
             )
             self._store_events(record, adapter)
+
+    def _compare_trades(
+        self, record: RawRecord, adapter: VenueAdapter, rows: list[tuple[str, Row]]
+    ) -> None:
+        """Compare each trade with the first observation of its trade_id."""
+        for dataset_name, row in rows:
+            if dataset_name != "trades":
+                continue
+            key = (record.venue, adapter.instrument, row["trade_id"])
+            now = {"price": row["price"], "qty": row["qty"], "side": int(row["side"])}
+            first = self._trades.get(key)
+            if first is None:
+                self._trades[key] = {"log_id": self._log_id, "seq": record.seq, **now}
+                continue
+            self.report.trade_repeats += 1
+            differs = [name for name in _TRADE_FIELDS if first[name] != now[name]]
+            if differs:
+                detail = {"trade_id": row["trade_id"], "differs": differs, "first": first,
+                          "now": now}  # fmt: skip
+                adapter.note(StreamEventKind.TRADE_CONFLICT, connection=record.channel,
+                             detail=_compact(detail))  # fmt: skip
 
     def _store_events(self, record: RawRecord, adapter: VenueAdapter) -> None:
         """Turn the events the adapter noted for ``record`` into stream_events rows."""

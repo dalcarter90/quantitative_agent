@@ -1,6 +1,6 @@
 # 0013: Stored rows name their raw log; keys and order use `(log_id, seq)`
 
-Status: Accepted (owner decision), with implementation choices awaiting the owner's confirmation (see "Review")
+Status: Accepted (owner decision; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015
 Date: 2026-11-12
 Amends: 0006, 0009, 0010, 0012
 
@@ -136,3 +136,10 @@ Choices made during implementation, to be confirmed by the owner:
 3. Rejecting records that come before any `seq` 0 record (`no_log_start`)
    instead of guessing their log.
 4. Not storing `recv_mono_ns` (see "Alternatives considered").
+
+**Confirmed by the owner, 2026-11-13: all four, as written.** The owner also
+decided the two questions this ADR's consequences left open, recorded in ADR
+0015: `PITSession` now refuses store files of another schema version with a
+message to rebuild the store, and a trade seen twice stays one row, but a
+repeat that differs in price, quantity or side is a `TRADE_CONFLICT` stream
+event, graded ERROR.

@@ -33,6 +33,7 @@ before making it.
 | 3 | C++ core types | Done |
 | 3a | Log identity in the store (ADR 0013) | Done |
 | 3b | Coinbase check snapshots judged by stream batch (ADR 0014) | Done |
+| 3c | Owner review of ADRs 0013 and 0014 (ADR 0015) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -972,17 +973,23 @@ Added after Phase 3 by the owner (ADR 0013), before Phase 4. It settles ADR
 **Notes for the next phases:**
 
 - **Phase 4's golden comparison keys rows by `(log_id, seq)`.**
-- **Ask the owner: stores do not check schema versions.** Every file
+- **Settled in Phase 3c (ADR 0015): `PITSession` now checks every file it
+  opens.** ~~Ask the owner: stores do not check schema versions.~~ Every file
   records `qa.schema_version`, but nothing reads it. A store written before
   this phase fails with DuckDB's "column log_id not found", and appending new
   rows to such a store makes a mixed store that fails the same way. Neither
   returns wrong data, but the message does not say what to do. A clear
   refusal needs either a footer read per file at session open or a small
   per-store version record, which is a storage change.
-- **Ask the owner: a trade seen twice is one row** (ADR 0013,
-  "Consequences"). No existing log has a repeat.
+- **Settled in Phase 3c (ADR 0015): it stays one row, and a repeat that
+  differs in price, quantity or side is an ERROR.** ~~Ask the owner: a trade
+  seen twice is one row~~ (ADR 0013, "Consequences"). No existing log has a
+  repeat. *Corrected in Phase 3c: that was checked only on the 2026-11-11
+  logs. The 30-minute 2026-11-13 recording has 64 identical repeats in
+  Coinbase's live stream (ADR 0015).*
 - **Settled in Phase 3b (ADR 0014).** ~~Ask the owner: Coinbase check
-  snapshots~~ (Phase 2a note). The owner asked for a 30-minute recording with a check snapshot every 60 s before
+  snapshots~~ (Phase 2a note). The owner asked for a 30-minute recording
+  with a check snapshot every 60 s before
   deciding the rule (kept in `data/raw-probes/`, not in git). Only 6 of its
   28 snapshots are exact, and 13 differ at the best bid or ask, so "the top
   N levels are exact" fails for every N. The cause is timing. Coinbase's
@@ -1061,6 +1068,83 @@ Phase 2a note on Coinbase check snapshots.
   depths, after every message, for both venues.
 - The adapter keeps 60 s of history; recorded snapshots arrive at most
   1.7 s after their venue time.
+
+### Phase 3c: Owner review of ADRs 0013 and 0014 (done)
+
+Added by the owner after Phase 3b (ADR 0015), before Phase 4. The owner
+confirmed every implementation choice listed in the "Review" sections of ADRs
+0013 and 0014, with these changes.
+
+- [x] A check snapshot that could not be compared stays INFO, but a session
+      where no check snapshot could be compared at all is a WARNING.
+- [x] `PITSession` checks the schema version of every file it opens and
+      refuses a mismatch with a clear message saying the store must be
+      rebuilt from the raw logs. A test uses an old-schema store.
+- [x] A trade seen twice stays one row, but if the observations differ in
+      price, quantity or side, the adapter writes a stream event and the
+      quality check reports it as an ERROR.
+- [x] Both ADRs' "Review" sections are marked confirmed.
+
+**What was built:**
+
+- `quality.py`: `independent_snapshots` reports `no_check_snapshot_compared`
+  (WARNING) once per session whose check snapshots in the range were all not
+  compared, with how many and why; its statistics gain `sessions` and
+  `sessions_without_comparison`. `stream_integrity` reports
+  `trade_conflict` (ERROR).
+- `session.py`: `StoreVersionError`; before creating any view, every visible
+  file's footer must name its dataset, the current schema version and that
+  version's columns. The `quality` and `book` command lines print the
+  refusal and exit 2.
+- `adapters/base.py`: the normalizer compares each trade with the first
+  observation of its (venue, instrument, `trade_id`) across every log fed to
+  it, and writes `TRADE_CONFLICT` (stream event kind 16) when the price,
+  quantity or side differ. The report counts trades seen again and conflicts.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,245 Python tests.
+- New `test_session_versions.py`: an old-schema (version 2, no `log_id`)
+  store is refused, naming the file within the store, both versions and the
+  rebuild; also one old file among current ones, a file with no version, a
+  file holding another dataset's rows, a file whose columns are not its
+  version's, a file written after `as_of` (not opened, so not refused), and
+  both command lines.
+- New `test_trade_repeats.py`: an unchanged repeat is one row and no event;
+  a change in each of price, quantity and side is a conflict naming the
+  field and both observations; several fields are named in order; repeats
+  are compared with the first observation; Coinbase as well as Kraken; two
+  logs fed to one normalizer; the report; the ERROR grading, with the store
+  still holding one row.
+- `test_check_snapshots.py`: a session with no compared snapshot is one
+  WARNING; one compared snapshot clears its session; sessions are judged
+  separately. The test whose only snapshot was made not-compared now also
+  expects its session's WARNING.
+- Every raw log on the owner's machine and every fixture, normalized: no
+  trade conflict. The 30-minute 2026-11-13 Coinbase recording has 64 trades
+  (0.07%) sent twice in the live stream, with no reconnect, 5.5 to 267 ms
+  apart, all identical; the other logs have none.
+- On the owner's machine, `data/normalized-before-adr0013` is refused, naming
+  one of its version 2 `trades` files, and `quality` exits 2 on it. The
+  footer check costs about 0.27 ms per file (12 ms for the 46 files of
+  `data/normalized`).
+- Breakage pass: 16 deliberate breakages (each part of the version check,
+  both command lines, the trade comparison and its counting, the per-log
+  memory, both gradings, and the per-session judgement): all caught on the
+  first run.
+
+**Notes for the next phases:**
+
+- **Ask the owner: which observation of a repeated trade should be kept?**
+  For an identical repeat the store keeps the later one, so its `recv_ts` is
+  the second arrival (up to 267 ms late in the recording above). That
+  cannot cause look-ahead, but it shifts the apparent latency of those
+  trades. Keeping the first would mean the normalizer drops identical
+  repeats, or a change to how the store picks between versions.
+- **Trades repeated across logs loaded in separate runs are not compared**
+  (ADR 0015, "Consequences"). `ingest` loads one raw log per run.
+- **Session open reads one footer per file.** About 3 s at 10,000 files; if
+  stores grow that large, fewer, larger files are the remedy.
 
 ### Phase 4: C++ order book, verified
 

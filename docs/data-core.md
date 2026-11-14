@@ -83,10 +83,12 @@ taken on a second connection; it is not part of the update stream.
 `DISCONNECT`, `SUBSCRIBE_REQUEST`, `SUBSCRIPTION_ACK`, `TRADE_BACKFILL`,
 `CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `CLOCK_STEP` (ADR 0012),
 `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
-`CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`, `CHECK_SNAPSHOT_COMPARED` (ADR 0014).
-ADR 0010 lists what each means and what `expected`, `observed` and `detail`
-hold for it; ADR 0011 the two clock kinds; ADR 0014 the check-snapshot
-comparison, which the Coinbase adapter writes once per check snapshot.
+`CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`, `CHECK_SNAPSHOT_COMPARED` (ADR 0014),
+`TRADE_CONFLICT` (ADR 0015). ADR 0010 lists what each means and what
+`expected`, `observed` and `detail` hold for it; ADR 0011 the two clock kinds;
+ADR 0014 the check-snapshot comparison, which the Coinbase adapter writes once
+per check snapshot; ADR 0015 a trade seen again with a different price,
+quantity or side.
 
 The schema rejects structural errors only: wrong types, nulls in required
 columns, unknown enum values, negative timestamps, invalid metadata, and a
@@ -119,10 +121,13 @@ bools and numeric strings that pyarrow would silently convert.
   after another, in the order they began, each in the order its records
   arrived. Logs are not interleaved in the store; merging logs by arrival is
   done on raw logs (`logorder.merge_logs`, section 5).
-- **Schema versions** are written into every file (`qa.schema_version`).
-  Files of an older version cannot be read with the current code: a store
-  written before ADR 0013 has no `log_id` and must be rebuilt from its raw
-  logs.
+- **Schema versions** are written into every file (`qa.dataset`,
+  `qa.schema_version`). `PITSession` checks every file it opens and refuses
+  one of another dataset, version or set of columns with a
+  `StoreVersionError` saying to rebuild the store from the raw logs (ADR
+  0015). A store written before ADR 0013 is refused this way. To rebuild,
+  load each raw log into a new directory with
+  `python -m quantagent.data.adapters <log> --store <new store>`.
 - Limits: one writer per store root (assumed, not locked); hard links need
   NTFS or ext4; venue and instrument names are restricted to
   `A-Z a-z 0-9 . _ -`.
@@ -142,8 +147,13 @@ with PITSession(store_root, as_of=t) as s:
 Every method returns the latest version of each record among the rows with
 `knowledge_ts <= as_of`, as a pyarrow table (or an `InstrumentMeta`). Range
 methods return rows in `(log_id, seq)` order (section 3); `instruments` by
-`event_ts`, then `(log_id, seq)`. The views are `trades`, `book_events`, `instruments` and `stream_events`, each
-with `venue`, `instrument`, `date` and then the stored columns.
+`event_ts`, then `(log_id, seq)`. The views are `trades`, `book_events`,
+`instruments` and `stream_events`, each with `venue`, `instrument`, `date` and
+then the stored columns.
+
+Opening a session reads the footer of every file it will open and refuses the
+store if any was written with another schema (section 3); that costs about
+0.3 ms per file.
 
 Look-ahead is blocked in three independent layers:
 
@@ -230,6 +240,16 @@ Kraken's checksum covers only ten levels per side and is checked after each
 message, so it misses some lost updates: on the recorded fixture, of 250
 single updates removed one at a time, 64% were caught and 36% never were.
 
+**A trade seen again** (ADR 0015). A venue resends history after a
+reconnect, and Coinbase sometimes sends a trade again in a later message of
+its live stream (0.07% of trades in the 30-minute 2026-11-13 recording, always
+identical). The normalizer compares each trade with the first observation of
+its `trade_id`, across every log fed to it. The store keeps one row per
+trade, from the later observation. If the price, quantity or side differ, the
+normalizer writes a `TRADE_CONFLICT` event at the later record, naming the
+fields and both observations. The report counts trades seen again and
+conflicts. Logs loaded in separate runs are not compared with each other.
+
 ## 6. Quality checks
 
 ```
@@ -259,10 +279,11 @@ the cap was hit.
 | | A session whose clock could not be measured (`clock_unmeasured`) | WARNING |
 | | A wall-clock step against the monotonic counter beyond `max_clock_step_ns` (`clock_step`), with its size and direction (ADR 0012) | ERROR |
 | | A session recorded before clocks were measured (`clock_not_recorded`); a measured session without monotonic stamps (`clock_steps_not_measurable`); any use of `--allow-clock-offset` (`clock_override`) | INFO |
-| `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected` | ERROR |
+| `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected`, and `trade_conflict` (a trade seen again with a different price, quantity or side; ADR 0015) | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
 | | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
 | `independent_snapshots` | From `CHECK_SNAPSHOT_COMPARED` events (ADR 0014): a check snapshot that differs from the rebuilt book on a level the stream fully determines (`check_snapshot_mismatch`), with the count and the shallowest and deepest rank | ERROR |
+| | A session (one raw log) none of whose check snapshots in the range could be compared (`no_check_snapshot_compared`, ADR 0015), with how many there were and why | WARNING |
 | | A Coinbase check snapshot taken between two stream batches that differs only on the next batch's levels (`check_snapshot_between_batches`); a check snapshot that could not be compared (`check_snapshot_not_compared`), with the reason | INFO |
 | `clock_skew` | `recv_ts - event_ts` below `min_lag_ns` (`early`, including venue time later than receipt) or above `max_lag_ns` (`late`); venue time stepping back between consecutive messages of one log (in `seq` order) by more than `max_backwards_ns` (`event_ts_backwards`). One finding per message. Only rows with `event_ts_source = "venue"`; backfilled trades (marked by `TRADE_BACKFILL`) are excluded, because their receipt time says nothing about when they happened | WARNING |
 | `crossed_books` | A snapshot (stream or check) whose best bid is at (`locked`) or above (`crossed`) its best ask | ERROR |

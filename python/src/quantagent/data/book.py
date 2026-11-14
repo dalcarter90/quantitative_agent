@@ -58,7 +58,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from quantagent.data.schema import BookEventKind, Side, StreamEventKind
-from quantagent.data.session import PITSession
+from quantagent.data.session import PITSession, StoreVersionError
 
 GOLDEN_LEVELS = 20
 KRAKEN_CHECKSUM_LEVELS = 10
@@ -664,9 +664,13 @@ def main(argv: list[str] | None = None) -> int:
         if name == "golden":
             command.add_argument("--out", required=True)
     args = parser.parse_args(argv)
-    if args.command == "verify":
-        return _verify_command(args)
-    return _golden_command(args)
+    try:
+        if args.command == "verify":
+            return _verify_command(args)
+        return _golden_command(args)
+    except StoreVersionError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

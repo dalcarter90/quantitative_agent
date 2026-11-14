@@ -121,6 +121,7 @@ def test_stream_event_kinds_cover_every_class_of_integrity_event():
         "CHECKSUM_MISMATCH",
         "MESSAGE_REJECTED",
         "CHECK_SNAPSHOT_COMPARED",
+        "TRADE_CONFLICT",
     }
     assert len({int(k) for k in K}) == len(K)
 
@@ -460,6 +461,7 @@ def test_clean_fixture_has_session_events_and_no_integrity_failures(capture):
         "SEQUENCE_OUT_OF_ORDER",
         "CHECKSUM_MISMATCH",
         "MESSAGE_REJECTED",
+        "TRADE_CONFLICT",
     ):
         assert kinds[failure] == 0, failure
     assert normalized.report.events == kinds
