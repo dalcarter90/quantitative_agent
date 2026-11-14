@@ -34,12 +34,22 @@ venue listed them (``level_index``).
 The reconstructor verifies Kraken's checksum itself, independently of the
 adapter, and also raises on the integrity events the adapter stored. The two
 are deliberate redundancy; tests show they agree.
+
+Check snapshots (independent images of the book from a second connection) are
+compared under ADR 0014. A is the last stream message, in its connection, whose
+venue time is at or before the snapshot's time T, and B the message after it.
+The snapshot must equal the book after A on every level. On Coinbase, whose
+stream comes in batches about 50 ms apart each with one venue time, a snapshot
+timed strictly between A and B may also show part of B: B's own levels cannot
+be verified from the stream and are reported apart, as ``unverified``. The
+Coinbase adapter applies the same rule while normalizing and stores the result
+as a CHECK_SNAPSHOT_COMPARED stream event; tests show the two agree.
 """
 
 import argparse
 import sys
 import zlib
-from bisect import bisect_left, insort
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -262,6 +272,9 @@ _SEQUENCE_KINDS = {
 }
 _RESETS = {StreamEventKind.SESSION_START, StreamEventKind.CONNECT, StreamEventKind.DISCONNECT}
 _VENUES = ("kraken", "coinbase")
+# Venues whose book stream comes in batches, each with one venue time, so that
+# an independent snapshot can be taken between two of them (ADR 0014).
+_TIMED_BATCHES = frozenset({"coinbase"})
 
 
 class _Replayer:
@@ -370,68 +383,175 @@ def replay(
     replayer.finish()
 
 
+Difference = tuple[int, int, int | None, int | None]
+Unverified = tuple[int, int, int | None, int | None, int | None]
+
+
 @dataclass(frozen=True)
 class CheckResult:
-    """One independent snapshot compared with the book rebuilt from the stream."""
+    """One independent snapshot compared with the book rebuilt from the stream,
+    under the venue's rule (ADR 0014). Quantities are None where a level is
+    absent."""
 
     snapshot: BookMessage
-    stream_messages_applied: int  # stream messages with venue time at or before the snapshot's
+    stream_messages_applied: int  # messages of its stream connection, up to and including A
     levels_compared: int
-    # (side, price, rebuilt quantity, snapshot quantity); None where a level is missing
-    differences: list[tuple[int, int, int | None, int | None]] = field(default_factory=list)
+    # (side, price, rebuilt quantity, snapshot quantity): levels that break the rule.
+    differences: list[Difference] = field(default_factory=list)
+    # Coinbase, between batches: levels of the next batch B where the snapshot
+    # differs from the book after A, as (side, price, after A, snapshot, after B).
+    unverified: list[Unverified] = field(default_factory=list)
+    on_batch: bool | None = None  # the snapshot's time equals A's
+    next_batch_levels: int = 0  # distinct levels B lists; 0 if there is no B
+    not_compared: str | None = None  # why there was no book to compare with
 
     @property
     def matched(self) -> bool:
-        return self.stream_messages_applied > 0 and not self.differences
+        """The rule holds."""
+        return self.not_compared is None and not self.differences
+
+    @property
+    def exact(self) -> bool:
+        """The snapshot equals the book after A on every level."""
+        return self.matched and not self.unverified
+
+    @property
+    def result(self) -> str:
+        if self.not_compared is not None:
+            return "not_compared"
+        if self.differences:
+            return "mismatch"
+        return "explained" if self.unverified else "exact"
+
+    def rank(self, side: int, price: int) -> int:
+        """How many of the snapshot's levels on ``side`` are better than ``price``."""
+        prices = sorted(p for s, p, _ in self.snapshot.levels if s == side)
+        if side == Side.BUY:
+            return len(prices) - bisect_right(prices, price)
+        return bisect_left(prices, price)
+
+    def summary(self) -> dict[str, Any]:
+        """The facts the adapter's CHECK_SNAPSHOT_COMPARED event records (ADR 0014)."""
+        compared = self.not_compared is None
+
+        def span(levels: Sequence[tuple]) -> tuple[int | None, int | None]:
+            ranks = [self.rank(level[0], level[1]) for level in levels]
+            return (min(ranks), max(ranks)) if ranks else (None, None)
+
+        violations, unverified = span(self.differences), span(self.unverified)
+        return {
+            "snapshot_seq": self.snapshot.seq,
+            "result": self.result,
+            "reason": self.not_compared,
+            "levels": len(self.snapshot.levels),
+            "on_batch": self.on_batch,
+            "next_batch_levels": self.next_batch_levels,
+            "violations": len(self.differences) if compared else None,
+            "violations_shallowest": violations[0],
+            "violations_deepest": violations[1],
+            "unverified": len(self.unverified) if compared else None,
+            "unverified_as_next_batch": sum(u[3] == u[4] for u in self.unverified)
+            if compared
+            else None,
+            "unverified_shallowest": unverified[0],
+            "unverified_deepest": unverified[1],
+        }
 
 
-def _compare(snapshot: BookMessage, book: ReferenceBook | None, applied: int) -> CheckResult:
+def _not_compared(snapshot: BookMessage, reason: str) -> CheckResult:
+    return CheckResult(snapshot, 0, len(snapshot.levels), not_compared=reason)
+
+
+def _compare(
+    venue: str,
+    snapshot: BookMessage,
+    book: ReferenceBook,
+    a: BookMessage,
+    b: BookMessage | None,
+    applied: int,
+) -> CheckResult:
+    """The snapshot against the book after A, exempting B's levels where the
+    venue's rule allows it."""
+    after_b: dict[tuple[Side, int], int | None] = {}
+    for side, price, qty in b.levels if b is not None else ():
+        after_b[(side, price)] = qty or None
+    on_batch = a.event_ts == snapshot.event_ts
+    exempt = after_b if venue in _TIMED_BATCHES and not on_batch else {}
     expected: dict[int, dict[int, int]] = {Side.BUY: {}, Side.SELL: {}}
     for side, price, qty in snapshot.levels:
         expected[side][price] = qty
-    differences = []
+    differences, unverified = [], []
     for side in (Side.BUY, Side.SELL):
-        if book is None:
-            rebuilt = {}
-        elif snapshot.depth is not None:
+        if snapshot.depth is not None:
             rebuilt = dict(book.top(side, snapshot.depth))
         else:
             rebuilt = book.levels(side)
         for price in sorted(set(rebuilt) | set(expected[side])):
-            if rebuilt.get(price) != expected[side].get(price):
-                differences.append((side, price, rebuilt.get(price), expected[side].get(price)))
-    return CheckResult(snapshot, applied, len(snapshot.levels), differences)
+            ours, theirs = rebuilt.get(price), expected[side].get(price)
+            if ours == theirs:
+                continue
+            if (side, price) in exempt:
+                unverified.append((side, price, ours, theirs, exempt[(side, price)]))
+            else:
+                differences.append((side, price, ours, theirs))
+    return CheckResult(snapshot, applied, len(snapshot.levels), differences, unverified,
+                       on_batch, len(after_b))  # fmt: skip
 
 
 def verify_check_snapshots(
     venue: str, messages: Sequence[BookMessage], events: Iterable[dict[str, Any]] = ()
 ) -> list[CheckResult]:
-    """Compare every check snapshot with the book rebuilt from its own log's
-    stream, up to and including the last message whose venue time is at or
-    before the snapshot's. Raises on any integrity failure, like ``replay``."""
-    checks: dict[str, list[BookMessage]] = {}
-    for message in sorted(messages, key=lambda m: (m.event_ts, m.key)):
-        if message.kind == BookEventKind.CHECK_SNAPSHOT:
-            checks.setdefault(message.log_id, []).append(message)
+    """Compare every check snapshot with the book rebuilt from the stream, under
+    ADR 0014's rule. Raises on any integrity failure, like ``replay``.
+
+    The stream a snapshot is compared with is the connection that was current
+    at the snapshot's record: the stream messages of its log between the last
+    session start, connect or disconnect before that record and the next one.
+    A is the message just before B, the first of those messages whose venue
+    time is after the snapshot's T. Without B (the stream ended first), every
+    level must match. Results come in (log_id, seq) order of the snapshots.
+    """
+    events = list(events)
+    resets = sorted(
+        (e["log_id"], e["seq"])
+        for e in events
+        if e["kind"] in _RESETS and e["connection"] in (_STREAM, None)
+    )
+
+    def connection(key: tuple[str, int]) -> tuple[str, int]:
+        return key[0], bisect_right(resets, key)
+
+    stream = _stream(messages)
+    by_connection: dict[tuple[str, int], list[BookMessage]] = {}
+    for message in stream:
+        by_connection.setdefault(connection(message.key), []).append(message)
+    checks = sorted((m for m in messages if m.kind == BookEventKind.CHECK_SNAPSHOT),
+                    key=lambda m: m.key)  # fmt: skip
+    results: dict[tuple[str, int], CheckResult] = {}
+    planned: dict[tuple[str, int], list[tuple[BookMessage, BookMessage | None, int]]] = {}
+    for check in checks:
+        members = by_connection.get(connection(check.key), [])
+        if not any(m.key < check.key for m in members):
+            results[check.key] = _not_compared(check, "no_stream_book")
+            continue
+        b_index = next((i for i, m in enumerate(members) if m.event_ts > check.event_ts), None)
+        if b_index == 0:
+            results[check.key] = _not_compared(check, "before_stream_snapshot")
+            continue
+        a_index = (len(members) if b_index is None else b_index) - 1
+        b = None if b_index is None else members[b_index]
+        if b is not None and b.kind == BookEventKind.SNAPSHOT:
+            results[check.key] = _not_compared(check, "next_message_is_snapshot")
+            continue
+        planned.setdefault(members[a_index].key, []).append((check, b, a_index + 1))
+
     replayer = _Replayer(venue, events, verify=True)
-    results: list[CheckResult] = []
-    current, pending, applied = None, [], 0
-    for message in _stream(messages):
-        if message.log_id != current:
-            # The previous log has ended: its remaining checks meet its final book,
-            # before the next log's events reset it.
-            results.extend(_compare(check, replayer.book, applied) for check in pending)
-            current, pending, applied = message.log_id, checks.pop(message.log_id, []), 0
-        while pending and message.event_ts > pending[0].event_ts:
-            results.append(_compare(pending.pop(0), replayer.book, applied))
-        replayer.message(message)
-        applied += 1
-    # Compare before the last log's trailing events (its disconnect) reset the book.
-    results.extend(_compare(check, replayer.book, applied) for check in pending)
+    for message in stream:
+        book = replayer.message(message)
+        for check, b, applied in planned.pop(message.key, ()):
+            results[check.key] = _compare(venue, check, book, message, b, applied)
     replayer.finish()
-    for orphans in checks.values():  # logs with checks but no stream messages
-        results.extend(_compare(check, None, 0) for check in orphans)
-    return results
+    return [results[check.key] for check in checks]
 
 
 # --- golden files ------------------------------------------------------------------------
@@ -457,7 +577,7 @@ def golden_table(
 ) -> pa.Table:
     """The book's best ``levels`` per side after every stream message.
 
-    One row per stream message: ``recv_ts`` and ``seq`` name the raw record,
+    One row per stream message: ``log_id`` and ``seq`` name the raw record,
     then for each rank, best first, the bid's price and quantity and the ask's
     price and quantity (mantissas; null where the book has fewer levels).
     """
@@ -498,16 +618,22 @@ def _verify_command(args: argparse.Namespace) -> int:
     except BookIntegrityError as error:
         print(f"FAILED: {error}")
         return 1
-    matched = sum(result.matched for result in results)
-    print(f"{matched} of {len(results)} check snapshots match the rebuilt book")
+    counts = {name: sum(r.result == name for r in results)
+              for name in ("exact", "explained", "mismatch", "not_compared")}  # fmt: skip
+    matched = counts["exact"] + counts["explained"]
+    print(f"{matched} of {len(results)} check snapshots match the rebuilt book: "
+          f"{counts['exact']} exact, {counts['explained']} between stream batches (ADR 0014), "
+          f"{counts['not_compared']} not compared")  # fmt: skip
     for result in results:
-        if not result.matched:
+        if result.result == "mismatch":
             print(
                 f"  snapshot seq {result.snapshot.seq}: {len(result.differences)} of "
                 f"{result.levels_compared} levels differ"
             )
+        elif result.result == "not_compared":
+            print(f"  snapshot seq {result.snapshot.seq}: not compared ({result.not_compared})")
     print("never crossed" if crossed == 0 else f"crossed after {crossed} messages")
-    ok = matched == len(results) and crossed == 0
+    ok = counts["mismatch"] == 0 and crossed == 0
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

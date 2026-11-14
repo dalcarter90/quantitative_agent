@@ -88,6 +88,13 @@ class StreamEventKind(IntEnum):
     # book rebuilt from the stream. The book is suspect until the next snapshot.
     CHECKSUM_MISMATCH = 13
     MESSAGE_REJECTED = 14  # the record could not be normalized; detail says why
+    # A check snapshot compared with the book rebuilt from the stream under the
+    # venue's rule (ADR 0014). Noticed at the record where the comparison could
+    # be made: the snapshot's own, or a later one. expected is the number of
+    # levels that break the rule (0 when it holds), observed the number of
+    # levels the rule cannot verify that differ; both null if it could not be
+    # compared. detail is JSON naming the snapshot's record and the result.
+    CHECK_SNAPSHOT_COMPARED = 15
 
 
 EVENT_TS_VENUE = "venue"

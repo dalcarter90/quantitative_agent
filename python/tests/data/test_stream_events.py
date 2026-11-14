@@ -120,6 +120,7 @@ def test_stream_event_kinds_cover_every_class_of_integrity_event():
         "SEQUENCE_OUT_OF_ORDER",
         "CHECKSUM_MISMATCH",
         "MESSAGE_REJECTED",
+        "CHECK_SNAPSHOT_COMPARED",
     }
     assert len({int(k) for k in K}) == len(K)
 
@@ -477,6 +478,10 @@ def test_fixture_events_point_at_real_raw_records(capture):
         kind = K(row["kind"])
         if kind in (K.SUBSCRIPTION_ACK, K.TRADE_BACKFILL):
             assert record.channel == row["connection"]
+        elif kind == K.CHECK_SNAPSHOT_COMPARED:
+            # Decided at the check snapshot's own record: the next batch had come.
+            assert record.channel == row["connection"] == "probe"
+            assert json.loads(row["detail"])["snapshot_seq"] == record.seq
         else:
             assert record.channel == "recorder"
     table_from_rows(STREAM_EVENTS, rows)

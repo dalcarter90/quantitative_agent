@@ -81,10 +81,12 @@ taken on a second connection; it is not part of the update stream.
 
 `stream_events` kinds: `SESSION_START`, `SESSION_STOP`, `CONNECT`,
 `DISCONNECT`, `SUBSCRIBE_REQUEST`, `SUBSCRIPTION_ACK`, `TRADE_BACKFILL`,
-`CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `CLOCK_STEP` (ADR 0012), `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
-`CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`. ADR 0010 lists what each means and
-what `expected`, `observed` and `detail` hold for it; ADR 0011 the two clock
-kinds.
+`CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `CLOCK_STEP` (ADR 0012),
+`SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
+`CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`, `CHECK_SNAPSHOT_COMPARED` (ADR 0014).
+ADR 0010 lists what each means and what `expected`, `observed` and `detail`
+hold for it; ADR 0011 the two clock kinds; ADR 0014 the check-snapshot
+comparison, which the Coinbase adapter writes once per check snapshot.
 
 The schema rejects structural errors only: wrong types, nulls in required
 columns, unknown enum values, negative timestamps, invalid metadata, and a
@@ -260,6 +262,8 @@ the cap was hit.
 | `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected` | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
 | | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
+| `independent_snapshots` | From `CHECK_SNAPSHOT_COMPARED` events (ADR 0014): a check snapshot that differs from the rebuilt book on a level the stream fully determines (`check_snapshot_mismatch`), with the count and the shallowest and deepest rank | ERROR |
+| | A Coinbase check snapshot taken between two stream batches that differs only on the next batch's levels (`check_snapshot_between_batches`); a check snapshot that could not be compared (`check_snapshot_not_compared`), with the reason | INFO |
 | `clock_skew` | `recv_ts - event_ts` below `min_lag_ns` (`early`, including venue time later than receipt) or above `max_lag_ns` (`late`); venue time stepping back between consecutive messages of one log (in `seq` order) by more than `max_backwards_ns` (`event_ts_backwards`). One finding per message. Only rows with `event_ts_source = "venue"`; backfilled trades (marked by `TRADE_BACKFILL`) are excluded, because their receipt time says nothing about when they happened | WARNING |
 | `crossed_books` | A snapshot (stream or check) whose best bid is at (`locked`) or above (`crossed`) its best ask | ERROR |
 | | A snapshot with only one side (`one_sided`) | WARNING |
@@ -349,9 +353,20 @@ python -m quantagent.data.book golden --store ... --venue ... --instrument ... -
 - **It raises; it never repairs.** `DeltaBeforeSnapshot`, `ChecksumMismatch`,
   `SequenceBreak` and `StreamFault` carry the raw record (`log_id`, `seq`,
   with its `recv_ts`) and the values involved.
-- **Check snapshots** are compared with the book rebuilt from their own log's
-  stream, up to the last message whose venue time is at or before the
-  snapshot's, level by level within the snapshot's depth.
+- **Check snapshots** (ADR 0014) are compared with the book rebuilt from the
+  stream connection that was current at the snapshot's record, level by level
+  within the snapshot's depth. A is the last message of that connection whose
+  venue time is at or before the snapshot's time T, and B the message after
+  it. The snapshot must equal the book after A on every level, except on
+  Coinbase when T falls strictly between A's and B's times: then B's levels
+  are reported as `unverified`, because Coinbase sends its stream in batches
+  about 50 ms apart and a snapshot taken between them already shows part of
+  B. `CheckResult.result` is `exact`, `explained` (only B's levels differ),
+  `mismatch` or `not_compared` (with the reason), and `summary()` gives the
+  same facts as the Coinbase adapter's `CHECK_SNAPSHOT_COMPARED` event. Tests
+  show the two agree. On the recordings so far, every snapshot timed on a
+  batch was exact, and every one timed between batches differed only on B's
+  levels.
 - **Order.** Stored rows are replayed in `(log_id, seq)` order: each log in
   the order its records arrived, from its own snapshot, whatever the wall
   clock did (ADR 0013). A clock step is reported by the `recording_clock`

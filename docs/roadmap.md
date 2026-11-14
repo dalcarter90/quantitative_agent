@@ -32,6 +32,7 @@ before making it.
 | 2a | Replay order and monotonic receive time (ADR 0012) | Done |
 | 3 | C++ core types | Done |
 | 3a | Log identity in the store (ADR 0013) | Done |
+| 3b | Coinbase check snapshots judged by stream batch (ADR 0014) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -980,8 +981,8 @@ Added after Phase 3 by the owner (ADR 0013), before Phase 4. It settles ADR
   per-store version record, which is a storage change.
 - **Ask the owner: a trade seen twice is one row** (ADR 0013,
   "Consequences"). No existing log has a repeat.
-- **Ask the owner: Coinbase check snapshots** (Phase 2a note). The owner
-  asked for a 30-minute recording with a check snapshot every 60 s before
+- **Settled in Phase 3b (ADR 0014).** ~~Ask the owner: Coinbase check
+  snapshots~~ (Phase 2a note). The owner asked for a 30-minute recording with a check snapshot every 60 s before
   deciding the rule (kept in `data/raw-probes/`, not in git). Only 6 of its
   28 snapshots are exact, and 13 differ at the best bid or ask, so "the top
   N levels are exact" fails for every N. The cause is timing. Coinbase's
@@ -992,6 +993,74 @@ Added after Phase 3 by the owner (ADR 0013), before Phase 4. It settles ADR
   not change, in all 36 snapshots recorded. On B's levels it shows A's
   value, B's value, or a value the stream never shows. The rule and its ADR
   come in their own PR, after the owner confirms them.
+
+### Phase 3b: Coinbase check snapshots judged by stream batch (done)
+
+Added by the owner after Phase 3a (ADR 0014), before Phase 4. It settles the
+Phase 2a note on Coinbase check snapshots.
+
+- [x] A 30-minute Coinbase recording with a check snapshot every 60 s,
+      analysed before choosing the rule (`data/raw-probes/`, not in git).
+- [x] The rule, chosen by the owner: exact on every level when the snapshot
+      is timed on a stream batch; between batches A and B, exact on every
+      level B does not list, with B's levels reported as unverified. Kraken
+      exact at all levels. Explained differences are INFO.
+- [x] The Coinbase adapter keeps the full book, compares each check snapshot
+      at its venue time, and writes a `CHECK_SNAPSHOT_COMPARED` stream event
+      with the counts and the shallowest and deepest rank.
+- [x] The reference reconstructor compares independently, and a test shows
+      the two agree.
+- [x] A quality check grades the events.
+
+**What was built:**
+
+- `schema.py`: stream event kind `CHECK_SNAPSHOT_COMPARED` (15).
+- `adapters/coinbase.py`: the stream book with 60 s of undo history
+  (`CHECK_HISTORY_NS`), snapshots waiting for their next batch, and the
+  comparison. `adapters/base.py`: hooks for session start and stop, a
+  disconnect, and a rejected record.
+- `book.py`: `verify_check_snapshots` compares against the stream connection
+  current at the snapshot's record, under the rule. `CheckResult` gains
+  `unverified`, `on_batch`, `next_batch_levels`, `not_compared`, `exact`,
+  `result`, `rank()` and `summary()`. `book verify` reports each result and
+  fails only on a mismatch.
+- `quality.py`: `check_independent_snapshots`.
+- `python/tests/fixtures/between-batches/`: the 60-second 2026-11-13
+  recording, whose check snapshot differs from the rebuilt book on 55 levels,
+  all of them in the next batch.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,224 Python tests.
+- New `test_check_snapshots.py`: every case of the rule, the adapter's
+  timing cases (snapshot before or after the next batch, no later batch, a
+  reconnect, a resent stream snapshot, a gap, a rejected message, a log cut
+  short, history too short), agreement between the adapter and the
+  reconstructor on every case where both compare, both real fixtures, the
+  store round trip and the quality grading. A Kraken test shows it gets no
+  exemption.
+- Local data: on the 30-minute recording, the adapter and the reconstructor
+  agree on all 28 snapshots: 6 exact, 22 explained, 0 mismatched.
+- Breakage pass: 20 deliberate breakages of the rule's code (8 in the
+  reconstructor, 10 in the adapter, 2 in the grading), all caught. Planning
+  them showed three behaviours with no test (a rejected stream message, a
+  stream snapshot resent on the same connection, a log cut short with a
+  snapshot waiting); those got tests first.
+- `data/normalized` re-ingested from the one-hour logs. It is append-only:
+  its rows became corrections, and the six Coinbase events are new rows.
+  6 of 6 check snapshots are exact on each venue, and the quality report is
+  unchanged apart from the new check.
+- The two 2026-11-13 Coinbase recordings, normalized into a scratch store:
+  29 of 29 satisfy the rule (6 exact, 23 between batches, 0 mismatched), and
+  the quality report has 23 INFO findings and nothing worse.
+
+**Notes for the next phases:**
+
+- **Phase 4** compares the C++ book with the venue's snapshots under this
+  rule. The C++ book must still equal the Python reference exactly, at all
+  depths, after every message, for both venues.
+- The adapter keeps 60 s of history; recorded snapshots arrive at most
+  1.7 s after their venue time.
 
 ### Phase 4: C++ order book, verified
 
@@ -1004,10 +1073,13 @@ Added after Phase 3 by the owner (ADR 0013), before Phase 4. It settles ADR
 - [ ] Matches the Python reference reconstructor: top-of-book and top-20
       depth equal the Phase 2 golden files after every event, for both
       venues, with zero differences.
-- [ ] Matches exchange snapshots: over the Phase 1c fixtures, the book
-      equals every `CHECK_SNAPSHOT` on every level, matched by venue time
-      as in Phase 2, and Kraken's checksum is computed and validated after
-      every message.
+- [ ] Matches exchange snapshots under ADR 0014's rule, as the reference
+      does: over the Phase 1c fixtures the book equals every
+      `CHECK_SNAPSHOT` on every level (both are timed on a stream batch),
+      and on the between-batches fixture it differs only on the next
+      batch's levels. Kraken's checksum is computed and validated after
+      every message. *(Amended in Phase 3b: the comparison point and the
+      Coinbase exemption follow ADR 0014.)*
 - [ ] Both comparisons run as tests in `scripts/check.ps1` on the committed
       fixtures.
 - [ ] Gap handling tested: on the Phase 2 gap fixtures (message removed,
