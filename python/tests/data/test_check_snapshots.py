@@ -408,7 +408,8 @@ def test_an_exact_snapshot_is_counted_and_not_reported(tmp_path):
     result = graded(tmp_path, normalize(read_raw_log(fixture_path("coinbase"))))
     assert result.findings == []
     assert result.stats == {"snapshots": 1, "exact": 1, "explained": 0, "mismatched": 0,
-                            "not_compared": 0}  # fmt: skip
+                            "not_compared": 0, "sessions": 1,
+                            "sessions_without_comparison": 0}  # fmt: skip
 
 
 def test_a_snapshot_between_batches_is_information(tmp_path):
@@ -445,9 +446,70 @@ def test_a_snapshot_that_could_not_be_compared_is_information(tmp_path):
         return {**row, "expected": None, "observed": None, "detail": json.dumps(detail)}
 
     result = graded(tmp_path, normalize(read_raw_log(fixture_path("coinbase"))), edit)
-    (finding,) = result.findings
-    assert (finding.what, finding.severity) == ("check_snapshot_not_compared", Severity.INFO)
-    assert "stream_unreliable" in finding.message
+    # The fixture's session has only this snapshot, so the session is a warning too.
+    snapshot, session = result.findings
+    assert (snapshot.what, snapshot.severity) == ("check_snapshot_not_compared", Severity.INFO)
+    assert "stream_unreliable" in snapshot.message
+    assert (session.what, session.severity) == ("no_check_snapshot_compared", Severity.WARNING)
+
+
+# --- a session where no check snapshot could be compared (ADR 0015) ------------------------
+
+
+def unreliable_session():
+    """Two check snapshots, neither comparable: the stream lost a message."""
+    session = Session()
+    session.snapshot(0, *START)
+    session.numbers["ws"] += 1  # a lost message: the stream book is unreliable from here
+    session.update(50, *BATCH_50)
+    session.check(75, *AFTER_50)
+    session.update(100, *BATCH_100)
+    session.check(150, *AFTER_50)
+    session.end()
+    return session
+
+
+def test_a_session_where_no_check_snapshot_could_be_compared_is_a_warning(tmp_path):
+    result = graded(tmp_path, unreliable_session().normalize())
+    assert sorted((f.what, f.severity) for f in result.findings) == [
+        ("check_snapshot_not_compared", Severity.INFO),
+        ("check_snapshot_not_compared", Severity.INFO),
+        ("no_check_snapshot_compared", Severity.WARNING),
+    ]
+    (warning,) = [f for f in result.findings if f.severity == Severity.WARNING]
+    assert "none of this session's 2 check snapshots" in warning.message
+    assert "stream_unreliable" in warning.message
+    assert (result.stats["sessions"], result.stats["sessions_without_comparison"]) == (1, 1)
+
+
+def test_one_compared_snapshot_is_enough_for_its_session(tmp_path):
+    session = Session()
+    session.snapshot(0, *START)
+    session.check(-10, *START)  # before the stream's snapshot: not compared
+    session.update(50, *BATCH_50)
+    session.check(50, *AFTER_50)  # on a batch time: exact
+    session.update(100, *BATCH_100)
+    session.end()
+    result = graded(tmp_path, session.normalize())
+    assert [(f.what, f.severity) for f in result.findings] == [
+        ("check_snapshot_not_compared", Severity.INFO)
+    ]
+    assert result.stats["sessions_without_comparison"] == 0
+
+
+def test_each_session_is_judged_on_its_own(tmp_path):
+    from quantagent.data.rawlog import RawRecord
+
+    bad = log("coinbase", *unreliable_session().entries)
+    good, _ = standard(50, AFTER_50)
+    later = [RawRecord(r.recv_ts + 10**12, r.seq, r.venue, r.channel, r.payload)
+             for r in log("coinbase", *good.entries)]  # fmt: skip
+    normalized = normalize(bad + later)
+    result = graded(tmp_path, normalized)
+    (warning,) = [f for f in result.findings if f.severity == Severity.WARNING]
+    first_log = normalized.rows[("book_events", "coinbase", INSTRUMENT)][0]["log_id"]
+    assert warning.log_id == first_log
+    assert (result.stats["sessions"], result.stats["sessions_without_comparison"]) == (2, 1)
 
 
 @pytest.mark.local_data

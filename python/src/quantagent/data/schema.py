@@ -95,6 +95,10 @@ class StreamEventKind(IntEnum):
     # levels the rule cannot verify that differ; both null if it could not be
     # compared. detail is JSON naming the snapshot's record and the result.
     CHECK_SNAPSHOT_COMPARED = 15
+    # A trade_id seen again with a different price, quantity or side (ADR 0015).
+    # Noticed at the later observation's record; detail is JSON with the
+    # trade_id, the fields that differ, and both observations.
+    TRADE_CONFLICT = 16
 
 
 EVENT_TS_VENUE = "venue"

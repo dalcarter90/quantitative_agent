@@ -1,6 +1,6 @@
 # 0014: Coinbase check snapshots are judged by stream batch
 
-Status: Accepted (owner decision, 2026-11-13), with implementation choices awaiting the owner's confirmation (see "Review")
+Status: Accepted (owner decision, 2026-11-13; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015
 Date: 2026-11-13
 Amends: 0009, 0010
 
@@ -132,3 +132,8 @@ Choices made during implementation, to be confirmed by the owner:
 3. The adapter keeps 60 s of history and has the reasons listed above.
 4. No comparison event for Kraken.
 5. Committing the 60-second recording as a fixture.
+
+**Confirmed by the owner, 2026-11-13: all five, with one change to item 1**,
+recorded in ADR 0015. A single check snapshot that could not be compared stays
+INFO, but a session in which no check snapshot could be compared at all is a
+WARNING (`no_check_snapshot_compared`).

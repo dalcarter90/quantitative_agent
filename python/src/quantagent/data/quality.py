@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from quantagent.data.schema import BookEventKind, Side, StreamEventKind
-from quantagent.data.session import PITSession
+from quantagent.data.session import PITSession, StoreVersionError
 from quantagent.data.store import _check_name
 
 _INT64_MAX = 2**63 - 1
@@ -238,8 +238,9 @@ def check_stream_integrity(
 
     Errors mean market data is missing or cannot be trusted from that point:
     a sequence gap (Coinbase), a checksum mismatch (Kraken), a message that
-    could not be normalized. A dropped stream connection and its reconnect are
-    warnings, because whatever happened in between was not seen.
+    could not be normalized, or a trade the venue sent twice with a different
+    price, quantity or side (ADR 0015). A dropped stream connection and its
+    reconnect are warnings, because whatever happened in between was not seen.
 
     An absence of findings is not proof of a complete stream. Kraken's
     checksum covers only the ten best levels per side, and events are only
@@ -291,6 +292,18 @@ def check_stream_integrity(
             )
         elif kind == StreamEventKind.MESSAGE_REJECTED:
             add(Severity.ERROR, "message_rejected", f"on {connection}: {detail}")
+        elif kind == StreamEventKind.TRADE_CONFLICT:
+            facts = _start_detail(event)
+            first, now = facts.get("first") or {}, facts.get("now") or {}
+            differs = facts.get("differs") or []
+            changes = ", ".join(f"{n} {first.get(n)} then {now.get(n)}" for n in differs)
+            add(
+                Severity.ERROR,
+                "trade_conflict",
+                f"trade {facts.get('trade_id')} was seen again with a different "
+                f"{' and '.join(differs)} ({changes}; first at log {first.get('log_id')}, "
+                f"seq {first.get('seq')}); the store keeps one row for it (ADR 0015)",
+            )
     return scope.result()
 
 
@@ -311,7 +324,10 @@ def check_independent_snapshots(
     is wrong. A Coinbase snapshot taken between two stream batches that
     differs only on the next batch's levels is INFO: the stream cannot show
     the book between batches, and every other level matched. A snapshot that
-    could not be compared is INFO. Exact snapshots are counted, not reported.
+    could not be compared is INFO, but a session (one raw log) none of whose
+    snapshots in the range could be compared is a WARNING: its book was never
+    checked against the venue's (ADR 0015). Exact snapshots are counted, not
+    reported.
 
     Only the Coinbase adapter writes these events. Kraken's check snapshots are
     compared by the reference reconstructor (``book verify``), and its stream
@@ -362,12 +378,37 @@ def check_independent_snapshots(
         elif result != "exact":
             scope.add(Severity.WARNING, "check_snapshot_unreadable", "stream_events", event,
                       f"the comparison event has no known result: {event['detail']!r}")  # fmt: skip
+
+    # A session (one raw log) none of whose check snapshots could be compared
+    # was never checked against the venue's own book (ADR 0015).
+    sessions: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        sessions.setdefault(event["log_id"], []).append(event)
+    uncompared = 0
+    for session_events in sessions.values():
+        details = [_start_detail(e) for e in session_events]
+        if any(d.get("result") != "not_compared" for d in details):
+            continue
+        uncompared += 1
+        reasons = Counter(str(d.get("reason")) for d in details)
+        listed = ", ".join(f"{reason} {count}" for reason, count in sorted(reasons.items()))
+        scope.add(
+            Severity.WARNING,
+            "no_check_snapshot_compared",
+            "stream_events",
+            session_events[0],
+            f"none of this session's {len(details)} check snapshots in this range could be "
+            f"compared with the rebuilt book ({listed}), so its book was never checked "
+            "against the venue's (ADR 0015)",
+        )
     scope.stats = {
         "snapshots": len(events),
         "exact": counts["exact"],
         "explained": counts["explained"],
         "mismatched": counts["mismatch"],
         "not_compared": counts["not_compared"],
+        "sessions": len(sessions),
+        "sessions_without_comparison": uncompared,
     }
     return scope.result()
 
@@ -890,10 +931,14 @@ def main(argv: list[str] | None = None) -> int:
     as_of = time.time_ns() if args.as_of is None else args.as_of
     fail_on = Severity[args.fail_on.upper()]
 
-    with PITSession(args.store, as_of=as_of) as session:
-        results = run_checks(
-            session, start, end, config, venue=args.venue, instrument=args.instrument
-        )
+    try:
+        with PITSession(args.store, as_of=as_of) as session:
+            results = run_checks(
+                session, start, end, config, venue=args.venue, instrument=args.instrument
+            )
+    except StoreVersionError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
 
     print(f"Data quality, {args.start} to {args.end} (UTC), as known at {as_of}")
     severities = [finding.severity for result in results for finding in result.findings]

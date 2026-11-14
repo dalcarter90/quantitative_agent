@@ -17,6 +17,11 @@ independent ways (architecture section 3.2):
 
 A session is a snapshot: files appended after it was opened are not visible
 to it. It is not safe to share between threads.
+
+Before anything else, a session checks every file it will open: the dataset,
+schema version and columns its Parquet metadata records must be what this code
+reads. A store written by another version of the code is refused with a
+``StoreVersionError`` saying to rebuild it from the raw logs (ADR 0015).
 """
 
 import json
@@ -27,6 +32,7 @@ from typing import Any
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from quantagent.data.fixedpoint import INT64_MAX
 from quantagent.data.schema import (
@@ -40,7 +46,7 @@ from quantagent.data.schema import (
 from quantagent.data.sqlguard import MAX_QUERY_LENGTH, QueryRejected, validate
 from quantagent.data.store import _PART, _check_name
 
-__all__ = ["InstrumentMeta", "PITSession", "QueryError", "QueryRejected"]
+__all__ = ["InstrumentMeta", "PITSession", "QueryError", "QueryRejected", "StoreVersionError"]
 
 _PARTITION_COLUMNS = {"venue": "VARCHAR", "instrument": "VARCHAR", "date": "DATE"}
 _VIEW_NAMES = frozenset(DATASETS)
@@ -51,6 +57,51 @@ _PARTITION_DIRECTORY = re.compile(r"(venue|instrument|date)=[^=]+")
 
 class QueryError(RuntimeError):
     """An allowed statement failed while running (for example, an unknown column)."""
+
+
+class StoreVersionError(ValueError):
+    """A store file was not written with the schema this code reads (ADR 0015)."""
+
+
+_REBUILD = (
+    "the store was written by another version of the code; rebuild it from the raw logs "
+    "into a new directory (python -m quantagent.data.adapters <raw log> --store <new store>; "
+    "docs/data-core.md, section 3)"
+)
+
+
+def _check_versions(root: Path, files: dict[str, list[str]]) -> None:
+    """Refuse any file whose recorded dataset, schema version or columns are not
+    what this code reads. Only the footer of each file is read."""
+    for name, paths in files.items():
+        dataset = DATASETS[name]
+        expected = dataset.stored_schema.remove_metadata()
+        for path in paths:
+            where = f"store file {Path(path).relative_to(root).as_posix()}"
+            try:
+                schema = pq.read_schema(path)
+            except (OSError, pa.ArrowException) as error:
+                problem = f"cannot be read as Parquet ({type(error).__name__})"
+                raise StoreVersionError(f"{where} {problem}; {_REBUILD}") from None
+            metadata = schema.metadata or {}
+            found = metadata.get(b"qa.dataset", b"").decode("utf-8", "replace")
+            version = metadata.get(b"qa.schema_version", b"").decode("utf-8", "replace")
+            if not found or not version:
+                raise StoreVersionError(f"{where} has no schema version; {_REBUILD}")
+            if found != name:
+                raise StoreVersionError(
+                    f"{where} is in the {name} directory but holds {found} rows; {_REBUILD}"
+                )
+            if version != str(dataset.version):
+                raise StoreVersionError(
+                    f"{where} holds {name} schema version {version}, but this code reads "
+                    f"version {dataset.version}: {_REBUILD}"
+                )
+            if not schema.remove_metadata().equals(expected):
+                raise StoreVersionError(
+                    f"{where} says {name} schema version {version}, but its columns are not "
+                    f"that version's; {_REBUILD}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +201,7 @@ class PITSession:
             )
 
         files = _visible_files(root_path, as_of)
+        _check_versions(root_path, files)
         readable = [path for paths in files.values() for path in paths]
 
         con = duckdb.connect(":memory:", config={"python_enable_replacements": False})
