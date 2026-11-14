@@ -99,6 +99,12 @@ class StreamEventKind(IntEnum):
     # Noticed at the later observation's record; detail is JSON with the
     # trade_id, the fields that differ, and both observations.
     TRADE_CONFLICT = 16
+    # A trade_id seen again with the same price, quantity and side (ADR 0016).
+    # The repeat is dropped: the store keeps the first observation. Noticed at
+    # the repeat's record; observed is how many ns of recv_ts after the first
+    # observation it arrived, and detail is JSON with the trade_id and the first
+    # observation's log_id and seq.
+    TRADE_REPEAT = 17
 
 
 EVENT_TS_VENUE = "venue"
