@@ -100,10 +100,19 @@ def test_each_log_fed_to_one_normalizer_gets_its_own_id():
     one = log("kraken", KRAKEN_START, KRAKEN_INSTRUMENT, KRAKEN_TRADES)
     two = [RawRecord(r.recv_ts + 10**12, r.seq, r.venue, r.channel, r.payload) for r in one]
     normalized = normalize(one + two)
+    first, second = log_id_of(one[0]), log_id_of(two[0])
+    assert first != second
+    instruments = normalized.rows[("instruments", "kraken", "BTC-USD")]
+    assert [row["log_id"] for row in instruments] == [first, second]
+    events = normalized.rows[("stream_events", "kraken", "BTC-USD")]
+    starts = [row["log_id"] for row in events if row["kind"] == StreamEventKind.SESSION_START]
+    assert starts == [first, second]
+    # The second log resends the same trades unchanged: the rows kept are the
+    # first log's, and the repeats are events in the second (ADR 0016).
     trades = normalized.rows[("trades", "kraken", "BTC-USD")]
-    ids = [row["log_id"] for row in trades]
-    assert ids[:2] == [log_id_of(one[0])] * 2 and ids[2:] == [log_id_of(two[0])] * 2
-    assert log_id_of(one[0]) != log_id_of(two[0])
+    assert [row["log_id"] for row in trades] == [first] * 2
+    repeats = [row["log_id"] for row in events if row["kind"] == StreamEventKind.TRADE_REPEAT]
+    assert repeats == [second] * 2
 
 
 def test_records_before_any_log_start_are_rejected():
