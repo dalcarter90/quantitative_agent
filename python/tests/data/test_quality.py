@@ -24,6 +24,7 @@ from quantagent.data.quality import (
     Severity,
     check_clock_skew,
     check_crossed_books,
+    check_independent_snapshots,
     check_outliers,
     check_recording_clock,
     check_stream_integrity,
@@ -42,10 +43,13 @@ from quantagent.data.store import AppendOnlyStore
 
 NS = 1_000_000_000
 ALL = (0, INT64_MAX)
-# The checks of the data itself. check_recording_clock is tested separately:
+# The checks of the data itself (check_independent_snapshots grades the
+# check-snapshot events; its own tests are in test_check_snapshots.py).
+# check_recording_clock is tested separately:
 # the committed fixtures were recorded before the clock was measured, so it
 # reports that on them (and should).
-CHECKS = [check_stream_integrity, check_clock_skew, check_crossed_books, check_outliers]
+CHECKS = [check_stream_integrity, check_independent_snapshots, check_clock_skew,
+          check_crossed_books, check_outliers]  # fmt: skip
 TRADES = ("trades", "kraken", INSTRUMENT)
 BOOK = ("book_events", "kraken", INSTRUMENT)
 EVENTS = ("stream_events", "kraken", INSTRUMENT)

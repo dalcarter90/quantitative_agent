@@ -89,6 +89,8 @@ def independent_counts(venue, records):
                     record.channel == "ws" or event["type"] == "snapshot"
                 ):
                     expected["book_events"] += len(event["updates"])
+                    # Each check snapshot is compared with the stream (ADR 0014).
+                    expected["stream_events"] += record.channel == "probe"
     return expected, kinds
 
 

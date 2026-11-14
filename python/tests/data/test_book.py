@@ -741,6 +741,36 @@ def test_the_one_hour_recordings_match_every_check_snapshot(venue, tmp_path):
     assert crossed == 0
 
 
+def test_kraken_check_snapshots_get_no_between_batches_exemption():
+    """ADR 0014's exemption is for Coinbase's timed batches only: a Kraken check
+    snapshot timed between two messages must still match on every level."""
+    messages, events = from_records(kraken_records(), "kraken")
+    (check,) = [m for m in messages if m.kind == CHECK]
+    stream = [m for m in messages if m.kind != CHECK]
+    a = max(i for i, m in enumerate(stream) if m.event_ts <= check.event_ts)
+    b = stream[a + 1]
+    assert stream[a].event_ts + 1 < b.event_ts
+    after_a = None
+    for message, state in replay("kraken", messages, events):
+        if message.key == stream[a].key:
+            after_a = {side: dict(state.top(side, check.depth)) for side in (BUY, SELL)}
+            break
+    # The snapshot shows the book after A with one of B's changes already made.
+    side, price, qty = next((s, p, q) for s, p, q in b.levels if after_a[s].get(p) != (q or None))
+    after_a[side].pop(price, None)
+    if qty:
+        after_a[side][price] = qty
+    levels = tuple((s, p, q) for s in (BUY, SELL) for p, q in sorted(after_a[s].items()))
+    planted = dataclasses.replace(check, event_ts=stream[a].event_ts + 1, levels=levels)
+    (result,) = verify_check_snapshots(
+        "kraken", [m if m is not check else planted for m in messages], events
+    )
+    assert result.result == "mismatch" and result.on_batch is False
+    shown = [(s, p, theirs) for s, p, _, theirs in result.differences]
+    assert shown == [(side, price, qty or None)]
+    assert result.unverified == []
+
+
 def test_a_shallower_check_snapshot_is_compared_only_to_its_depth():
     # The stream keeps 12 levels; the independent snapshot was taken at depth 10.
     bids = [(BUY, 100 - i, 1) for i in range(12)]

@@ -295,6 +295,18 @@ class VenueAdapter:
     def on_connect(self, connection: str) -> None:
         """A new connection was opened; per-connection state starts again."""
 
+    def on_disconnect(self, connection: str) -> None:
+        """A connection was closed."""
+
+    def on_session_start(self) -> None:
+        """A recording session (a new raw log) began."""
+
+    def on_session_stop(self) -> None:
+        """The recording session ended."""
+
+    def on_reject(self, record: RawRecord) -> None:
+        """``record`` could not be normalized: whatever it carried was lost."""
+
     def _control(self, record: RawRecord) -> Handled:
         message = as_object(load_json(record.payload), "control record")
         event = message.get("event")
@@ -310,6 +322,7 @@ class VenueAdapter:
             self.instrument, self.symbol = message["instrument"], symbol
             self.start_depth = checked_depth(depth)
             self.exponents = None
+            self.on_session_start()
             self._clock_offset = None  # a new log: its counter reading starts afresh
             about = {
                 k: message.get(k) for k in ("symbol", "depth", "recorder_version", "clock_identity")
@@ -317,6 +330,7 @@ class VenueAdapter:
             about["monotonic_stamps"] = record.recv_mono_ns is not None
             self.note(StreamEventKind.SESSION_START, detail=_compact(about))
         elif event == "stop":
+            self.on_session_stop()
             self.note(StreamEventKind.SESSION_STOP)
         elif event == "clock":
             self._clock(message)
@@ -331,10 +345,10 @@ class VenueAdapter:
                 detail=_compact(message.get("request")),
             )
         elif event == "disconnect":
+            connection = str(message["connection"])
+            self.on_disconnect(connection)
             self.note(
-                StreamEventKind.DISCONNECT,
-                connection=str(message["connection"]),
-                detail=str(message.get("reason")),
+                StreamEventKind.DISCONNECT, connection=connection, detail=str(message.get("reason"))
             )
         return ignored(f"recorder.{event}")
 
@@ -443,6 +457,7 @@ class Normalizer:
         )
         if adapter is not None and self._log_id is not None:
             # A record that could not be normalized is a hole in the stream.
+            adapter.on_reject(record)
             adapter.note(
                 StreamEventKind.MESSAGE_REJECTED,
                 connection=record.channel,

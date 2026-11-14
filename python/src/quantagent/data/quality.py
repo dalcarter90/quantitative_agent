@@ -294,6 +294,84 @@ def check_stream_integrity(
     return scope.result()
 
 
+# --- check snapshots --------------------------------------------------------------------
+
+
+def _ranks(shallowest: Any, deepest: Any) -> str:
+    return f"rank {shallowest}" if shallowest == deepest else f"ranks {shallowest} to {deepest}"
+
+
+def check_independent_snapshots(
+    session: PITSession, venue: str, instrument: str, start: int, end: int, config: QualityConfig
+) -> CheckResult:
+    """Independent check snapshots against the book rebuilt from the stream,
+    from the adapters' CHECK_SNAPSHOT_COMPARED events (ADR 0014).
+
+    A level that breaks the rule is an ERROR: the rebuilt book or the stream
+    is wrong. A Coinbase snapshot taken between two stream batches that
+    differs only on the next batch's levels is INFO: the stream cannot show
+    the book between batches, and every other level matched. A snapshot that
+    could not be compared is INFO. Exact snapshots are counted, not reported.
+
+    Only the Coinbase adapter writes these events. Kraken's check snapshots are
+    compared by the reference reconstructor (``book verify``), and its stream
+    is verified by checksum after every message.
+    """
+    scope = _Scope("independent_snapshots", session, venue, instrument, start, end, config)
+    kind = int(StreamEventKind.CHECK_SNAPSHOT_COMPARED)
+    events = [e for e in session.stream_events(venue, instrument, start, end).to_pylist()
+              if e["kind"] == kind]  # fmt: skip
+    counts: Counter = Counter()
+    for event in events:
+        detail = _start_detail(event)
+        result, seq = detail.get("result"), detail.get("snapshot_seq")
+        counts[result] += 1
+        if result == "mismatch":
+            scope.add(
+                Severity.ERROR,
+                "check_snapshot_mismatch",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} differs from the rebuilt book on "
+                f"{detail.get('violations')} levels "
+                f"({_ranks(detail.get('violations_shallowest'), detail.get('violations_deepest'))})"
+                " that the stream fully determines (ADR 0014)",
+            )
+        elif result == "explained":
+            ranks = _ranks(detail.get("unverified_shallowest"), detail.get("unverified_deepest"))
+            scope.add(
+                Severity.INFO,
+                "check_snapshot_between_batches",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} was taken between two stream batches: it "
+                f"differs on {detail.get('unverified')} of the next batch's "
+                f"{detail.get('next_batch_levels')} levels ({ranks}; "
+                f"{detail.get('unverified_as_next_batch')} as that batch has them) and matches "
+                "on every other level (ADR 0014)",
+            )
+        elif result == "not_compared":
+            scope.add(
+                Severity.INFO,
+                "check_snapshot_not_compared",
+                "stream_events",
+                event,
+                f"the check snapshot at seq {seq} could not be compared with the rebuilt book: "
+                f"{detail.get('reason')}",
+            )
+        elif result != "exact":
+            scope.add(Severity.WARNING, "check_snapshot_unreadable", "stream_events", event,
+                      f"the comparison event has no known result: {event['detail']!r}")  # fmt: skip
+    scope.stats = {
+        "snapshots": len(events),
+        "exact": counts["exact"],
+        "explained": counts["explained"],
+        "mismatched": counts["mismatch"],
+        "not_compared": counts["not_compared"],
+    }
+    return scope.result()
+
+
 # --- recording clock --------------------------------------------------------------------
 
 
@@ -691,6 +769,7 @@ def check_outliers(
 
 CHECKS: tuple[Check, ...] = (
     check_stream_integrity,
+    check_independent_snapshots,
     check_recording_clock,
     check_clock_skew,
     check_crossed_books,
