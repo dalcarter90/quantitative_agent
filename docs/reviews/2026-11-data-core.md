@@ -31,6 +31,13 @@ Run the failing tests with:
 .venv\Scripts\python -m pytest python\tests\data\test_review_2026_11.py
 ```
 
+**Update, 2026-11-15.** The review and its tests reached `main` together with
+PR #15. To keep `main` green, every test in that file is now marked
+`xfail(strict=True)` with its finding number as the reason. Each still fails
+for the reason given here and is reported as `XFAIL`. The marker is strict:
+when a finding is fixed its test passes, the suite fails on the unexpected
+pass, and the marker is removed in the same change.
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |
