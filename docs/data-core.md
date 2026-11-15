@@ -84,11 +84,11 @@ taken on a second connection; it is not part of the update stream.
 `CLOCK_OFFSET`, `CLOCK_OVERRIDE` (ADR 0011), `CLOCK_STEP` (ADR 0012),
 `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
 `CHECKSUM_MISMATCH`, `MESSAGE_REJECTED`, `CHECK_SNAPSHOT_COMPARED` (ADR 0014),
-`TRADE_CONFLICT` (ADR 0015). ADR 0010 lists what each means and what
+`TRADE_CONFLICT` (ADR 0015), `TRADE_REPEAT` (ADR 0016). ADR 0010 lists what each means and what
 `expected`, `observed` and `detail` hold for it; ADR 0011 the two clock kinds;
 ADR 0014 the check-snapshot comparison, which the Coinbase adapter writes once
 per check snapshot; ADR 0015 a trade seen again with a different price,
-quantity or side.
+quantity or side; ADR 0016 one seen again unchanged.
 
 The schema rejects structural errors only: wrong types, nulls in required
 columns, unknown enum values, negative timestamps, invalid metadata, and a
@@ -240,15 +240,24 @@ Kraken's checksum covers only ten levels per side and is checked after each
 message, so it misses some lost updates: on the recorded fixture, of 250
 single updates removed one at a time, 64% were caught and 36% never were.
 
-**A trade seen again** (ADR 0015). A venue resends history after a
+**A trade seen again** (ADRs 0015 and 0016). A venue resends history after a
 reconnect, and Coinbase sometimes sends a trade again in a later message of
 its live stream (0.07% of trades in the 30-minute 2026-11-13 recording, always
 identical). The normalizer compares each trade with the first observation of
 its `trade_id`, across every log fed to it. The store keeps one row per
-trade, from the later observation. If the price, quantity or side differ, the
-normalizer writes a `TRADE_CONFLICT` event at the later record, naming the
-fields and both observations. The report counts trades seen again and
-conflicts. Logs loaded in separate runs are not compared with each other.
+trade.
+- **An identical repeat** (same price, quantity and side) is dropped, so the
+  stored row is the first observation, with its `seq` and `recv_ts`. The
+  normalizer writes a `TRADE_REPEAT` event at the repeat's record: `observed`
+  is the delay after the first observation in ns, and `detail` names the
+  `trade_id` and the first observation's `log_id` and `seq`.
+- **A repeat that differs** is stored, so the store shows the later value. The
+  normalizer writes a `TRADE_CONFLICT` event at the later record, naming the
+  fields and both observations.
+
+The report counts trades seen again, conflicts and identical repeats dropped.
+The raw log keeps every observation. Logs loaded in separate runs are not
+compared with each other; for those the store keeps the later observation.
 
 ## 6. Quality checks
 
@@ -281,7 +290,7 @@ the cap was hit.
 | | A session recorded before clocks were measured (`clock_not_recorded`); a measured session without monotonic stamps (`clock_steps_not_measurable`); any use of `--allow-clock-offset` (`clock_override`) | INFO |
 | `stream_integrity` | From `stream_events`: `sequence_gap`, `checksum_mismatch`, `message_rejected`, and `trade_conflict` (a trade seen again with a different price, quantity or side; ADR 0015) | ERROR |
 | | `sequence_repeat`, `sequence_out_of_order`; the stream connection dropping (`disconnect`) or reopening (`reconnect`) | WARNING |
-| | A probe connection that did not deliver its snapshot (`probe_failed`) | INFO |
+| | A probe connection that did not deliver its snapshot (`probe_failed`); trades sent again unchanged and dropped (`trades_repeated`, ADR 0016), one finding per session with the count and the range of delays | INFO |
 | `independent_snapshots` | From `CHECK_SNAPSHOT_COMPARED` events (ADR 0014): a check snapshot that differs from the rebuilt book on a level the stream fully determines (`check_snapshot_mismatch`), with the count and the shallowest and deepest rank | ERROR |
 | | A session (one raw log) none of whose check snapshots in the range could be compared (`no_check_snapshot_compared`, ADR 0015), with how many there were and why | WARNING |
 | | A Coinbase check snapshot taken between two stream batches that differs only on the next batch's levels (`check_snapshot_between_batches`); a check snapshot that could not be compared (`check_snapshot_not_compared`), with the reason | INFO |

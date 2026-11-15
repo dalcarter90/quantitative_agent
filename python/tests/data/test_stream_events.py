@@ -122,6 +122,7 @@ def test_stream_event_kinds_cover_every_class_of_integrity_event():
         "MESSAGE_REJECTED",
         "CHECK_SNAPSHOT_COMPARED",
         "TRADE_CONFLICT",
+        "TRADE_REPEAT",
     }
     assert len({int(k) for k in K}) == len(K)
 
@@ -249,7 +250,12 @@ def test_a_trade_snapshot_is_marked_as_backfill_and_an_update_is_not():
     normalized = kraken_session(kraken_snapshot, KRAKEN_TRADES)
     backfill = [r for r in events_of(normalized, "kraken") if r["kind"] == K.TRADE_BACKFILL]
     assert brief(backfill) == [(3, 0, K.TRADE_BACKFILL, "ws", None, None)]
-    assert len(normalized.rows[("trades", "kraken", "BTC-USD")]) == 4  # the trades are still stored
+    # The backfilled trades are still stored. The update resends the same two
+    # trades unchanged, so those copies are dropped as repeats (ADR 0016).
+    trades = normalized.rows[("trades", "kraken", "BTC-USD")]
+    assert [r["seq"] for r in trades] == [3, 3]
+    repeats = [r for r in events_of(normalized, "kraken") if r["kind"] == K.TRADE_REPEAT]
+    assert [r["seq"] for r in repeats] == [4, 4]
 
     coinbase_snapshot = ("ws", COINBASE_TRADES[1].replace('"type":"update"', '"type":"snapshot"'))
     normalized = coinbase_session(renumbered(coinbase_snapshot, 2))
@@ -462,6 +468,7 @@ def test_clean_fixture_has_session_events_and_no_integrity_failures(capture):
         "CHECKSUM_MISMATCH",
         "MESSAGE_REJECTED",
         "TRADE_CONFLICT",
+        "TRADE_REPEAT",
     ):
         assert kinds[failure] == 0, failure
     assert normalized.report.events == kinds

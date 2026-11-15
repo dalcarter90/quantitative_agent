@@ -241,6 +241,8 @@ def check_stream_integrity(
     could not be normalized, or a trade the venue sent twice with a different
     price, quantity or side (ADR 0015). A dropped stream connection and its
     reconnect are warnings, because whatever happened in between was not seen.
+    Trades the venue sent again unchanged, which the adapters dropped, are one
+    INFO finding per session (ADR 0016).
 
     An absence of findings is not proof of a complete stream. Kraken's
     checksum covers only the ten best levels per side, and events are only
@@ -252,6 +254,7 @@ def check_stream_integrity(
     scope.stats = {"events": len(events), "sessions": kinds["SESSION_START"], **kinds}
 
     stream_connected = False
+    repeats: dict[str, list[dict]] = {}  # TRADE_REPEAT events by session (log_id)
     for event in events:
         kind = StreamEventKind(event["kind"])
         connection, detail = event["connection"], event["detail"]
@@ -304,7 +307,30 @@ def check_stream_integrity(
                 f"{' and '.join(differs)} ({changes}; first at log {first.get('log_id')}, "
                 f"seq {first.get('seq')}); the store keeps one row for it (ADR 0015)",
             )
+        elif kind == StreamEventKind.TRADE_REPEAT:
+            repeats.setdefault(event["log_id"], []).append(event)
+    # Identical repeats are summarized once per session, after the loop, so
+    # that a venue that resends trades all day cannot fill the finding limit
+    # ahead of an error (ADR 0016).
+    for session_repeats in repeats.values():
+        n = len(session_repeats)
+        delays = [e["observed"] for e in session_repeats if e["observed"] is not None]
+        when = (f", {_ms(min(delays))} to {_ms(max(delays))} after the first observation"
+                if delays else "")  # fmt: skip
+        scope.add(
+            Severity.INFO,
+            "trades_repeated",
+            "stream_events",
+            session_repeats[0],
+            f"{n} trade{'s' if n != 1 else ''} {'were' if n != 1 else 'was'} sent again "
+            f"unchanged in this session{when}; the repeats were dropped and the store keeps "
+            "each trade's first observation (ADR 0016)",
+        )
     return scope.result()
+
+
+def _ms(nanoseconds: int) -> str:
+    return f"{nanoseconds / 1_000_000:.3f} ms"
 
 
 # --- check snapshots --------------------------------------------------------------------

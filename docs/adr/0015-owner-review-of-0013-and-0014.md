@@ -1,6 +1,6 @@
 # 0015: Schema versions are checked, conflicting trades are errors, uncompared sessions are warnings
 
-Status: Accepted (owner decision, 2026-11-13)
+Status: Accepted (owner decision, 2026-11-13), amended by 0016
 Date: 2026-11-13
 Amends: 0006, 0010, 0013, 0014
 

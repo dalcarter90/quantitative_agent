@@ -34,6 +34,7 @@ before making it.
 | 3a | Log identity in the store (ADR 0013) | Done |
 | 3b | Coinbase check snapshots judged by stream batch (ADR 0014) | Done |
 | 3c | Owner review of ADRs 0013 and 0014 (ADR 0015) | Done |
+| 3d | Keep the first observation of a repeated trade (ADR 0016) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -1135,16 +1136,87 @@ confirmed every implementation choice listed in the "Review" sections of ADRs
 
 **Notes for the next phases:**
 
-- **Ask the owner: which observation of a repeated trade should be kept?**
-  For an identical repeat the store keeps the later one, so its `recv_ts` is
-  the second arrival (up to 267 ms late in the recording above). That
-  cannot cause look-ahead, but it shifts the apparent latency of those
-  trades. Keeping the first would mean the normalizer drops identical
-  repeats, or a change to how the store picks between versions.
+- ~~**Ask the owner: which observation of a repeated trade should be
+  kept?**~~ **Settled in Phase 3d (ADR 0016): the first.** The normalizer
+  drops identical repeats and records each as a `TRADE_REPEAT` event.
+  *Previously:* for an identical repeat the store kept the later one, so its
+  `recv_ts` was the second arrival (up to 267 ms late in the recording
+  above).
 - **Trades repeated across logs loaded in separate runs are not compared**
   (ADR 0015, "Consequences"). `ingest` loads one raw log per run.
 - **Session open reads one footer per file.** About 3 s at 10,000 files; if
   stores grow that large, fewer, larger files are the remedy.
+
+### Phase 3d: Keep the first observation of a repeated trade (done)
+
+Added by the owner after Phase 3c (ADR 0016), before Phase 4.
+
+- [x] ADR 0015's reading of "no check snapshot compared" is confirmed:
+      sessions with no check snapshots at all do not warn.
+- [x] For an identical repeated trade, the first observation is kept. The
+      adapter drops identical repeats instead of storing them and records
+      each one as an INFO stream event, so repeats stay visible.
+- [x] Conflicting repeats stay as they are (`TRADE_CONFLICT`, ERROR). The raw
+      log is unchanged.
+- [x] On `data/raw-probes`, all 64 repeats keep the first arrival's
+      `recv_ts`.
+
+**What was built:**
+
+- `schema.py`: `StreamEventKind.TRADE_REPEAT = 17`.
+- `adapters/base.py`: an identical repeat's row is not passed on to the
+  store. A `TRADE_REPEAT` event is written at the repeat's record:
+  `observed` is the delay after the first observation in ns, and `detail`
+  names the `trade_id` and the first observation's `log_id` and `seq`. The
+  report's line reads `trade conflicts: N (trades seen again: M; identical
+  repeats dropped: K)`.
+- `quality.py`: `stream_integrity` reports `trades_repeated` (INFO) once per
+  session with repeats, giving the count and the range of delays, after its
+  other findings. One finding per repeat would let a day of Coinbase data
+  fill `max_findings` and hide a later ERROR.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,255 Python tests.
+- `test_trade_repeats.py`:
+  - an identical repeat is dropped, and the store keeps the first
+    observation's `seq` and `recv_ts`;
+  - the `TRADE_REPEAT` event and its fields, with each delay measured from
+    the first observation;
+  - only the repeated trades of a message are dropped, and a trade twice in
+    one message is kept once;
+  - Coinbase as well as Kraken, and a second log fed to the same normalizer;
+  - conflicting repeats are still stored and are not `TRADE_REPEAT`s;
+  - the report line;
+  - one INFO finding per session, and repeats never crowd out an ERROR when
+    `max_findings` is small.
+- **Two existing tests fed the same trades twice and expected both copies
+  stored.** The second copies are now dropped, as decided.
+  - `test_stream_events.py`: the backfill test still checks that the
+    backfilled trades are stored, and now also that the update's copies are
+    repeats.
+  - `test_log_id.py`: the test that each log gets its own id now checks the
+    instruments rows, the session starts and the repeat events of both logs.
+- The 30-minute 2026-11-13 Coinbase recording, checked against its raw log
+  read directly:
+  - all 95,825 stored trades are their first arrival, including all 64
+    repeated ones;
+  - there are 64 `TRADE_REPEAT` events and no conflict;
+  - the delays run from 5.5 to 267.4 ms, median 92.7 ms;
+  - quality reports one `trades_repeated` INFO finding.
+- The 2026-11-11 logs and the fixtures have no repeats, so `data/normalized`
+  and the golden files are unchanged.
+- Breakage pass: 11 deliberate breakages. 10 were caught on the first run.
+  The survivor measured each repeat's delay from the previous repeat; a test
+  now catches it.
+
+**Notes for the next phases:**
+
+- **After a conflict, a later repeat matching the first observation is
+  dropped**, so the store holds the conflicting value (ADR 0016,
+  "Consequences"). The conflict is already an ERROR.
+- **A trade seen first in a trade-history snapshot and later live keeps the
+  backfilled observation.** No recording shows this.
 
 ### Phase 4: C++ order book, verified
 
