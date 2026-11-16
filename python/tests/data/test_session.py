@@ -292,9 +292,35 @@ def test_both_cutoffs_apply_together(history):
 
 
 def test_the_version_is_chosen_among_the_rows_available(root):
-    """A trade seen twice: live, and resent an hour later by a later batch.
-    Before the resend arrives, the session shows the live observation, not
-    nothing and not the later row."""
+    """A record corrected by a later batch, and the correction says it was
+    received an hour later. Before then, the session shows the original, not
+    nothing and not the correction.
+
+    (Until ADR 0018 this test used a trade resent an hour later in another
+    record: trades were keyed by trade_id, so the resend was a version of the
+    same record. Trades are keyed by raw record now, so the correction reuses
+    the record; the next test covers the resend.)"""
+    hour = 3600 * NS_PER_SECOND
+    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
+    store.append(TRADES, *KRK, trade_table(("t", T0, 100)))
+    store.append(TRADES, *KRK, trade_table(("t", T0 + hour, 100)))  # the same record, seq 0
+
+    def seen(available_at, version=None):
+        with PITSession(root, available_at=available_at, version=version) as session:
+            rows = session.trades(*KRK, *ALL_TIME).to_pylist()
+        return [(r["seq"], r["recv_ts"], r["knowledge_ts"]) for r in rows]
+
+    assert seen(RECV_A - 1) == []
+    assert seen(RECV_A) == [(0, RECV_A, 1_000)]
+    assert seen(RECV_A + hour - 1) == [(0, RECV_A, 1_000)]
+    assert seen(RECV_A + hour) == [(0, RECV_A + hour, 2_000)]  # the latest version available
+    assert seen(INT64_MAX, version=1_000) == [(0, RECV_A, 1_000)]
+
+
+def test_a_trade_resent_later_is_shown_as_its_first_observation(root):
+    """A trade seen twice: live, and resent an hour later in another record of
+    a later batch. The session shows one row, the first observation in
+    (log_id, seq) order among those it can see (ADR 0018)."""
     hour = 3600 * NS_PER_SECOND
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
     store.append(TRADES, *KRK, trade_table(("t", T0, 100)))
@@ -306,10 +332,8 @@ def test_the_version_is_chosen_among_the_rows_available(root):
         return [(r["seq"], r["recv_ts"], r["knowledge_ts"]) for r in rows]
 
     assert seen(RECV_A - 1) == []
-    assert seen(RECV_A) == [(0, RECV_A, 1_000)]
-    assert seen(RECV_A + hour - 1) == [(0, RECV_A, 1_000)]
-    assert seen(RECV_A + hour) == [(7, RECV_A + hour, 2_000)]  # the latest version available
-    assert seen(INT64_MAX, version=1_000) == [(0, RECV_A, 1_000)]
+    for available_at in (RECV_A, RECV_A + hour, INT64_MAX):
+        assert seen(available_at) == [(0, RECV_A, 1_000)]
 
 
 # --- time ranges: receipt time (ADR 0017) ---------------------------------------
@@ -643,7 +667,7 @@ def test_error_messages_do_not_reveal_store_paths(history):
 def test_the_data_package_exports_no_other_read_path():
     # The store is write-only and nothing else in the package reads files back.
     public_store = {n for n in dir(AppendOnlyStore) if not n.startswith("_")}
-    assert public_store == {"append", "batch"}
+    assert public_store == {"append", "batch", "load"}
     modules = {
         name for name in dir(data_package) if not name.startswith("_") and name != "annotations"
     }

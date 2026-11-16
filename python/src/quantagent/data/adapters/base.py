@@ -8,7 +8,15 @@ store. The rules that hold for every venue live here:
   heartbeat) or ``rejected`` (malformed or unknown). Nothing is dropped
   without being counted, and a bad message never stops the run.
 - A message is all or nothing. If any part of it is malformed, none of its
-  rows are kept.
+  rows are kept. That includes a value the store's schema could not hold (a
+  venue time after 2262, a sequence number beyond int64): every row and event
+  is checked against the schema before it is kept, and a message with one the
+  schema refuses is rejected (``schema_refused``, ADR 0018).
+- Records are fed one raw log at a time, each in ``seq`` order. A record whose
+  ``seq`` is neither 0 (the next log) nor the previous one plus one means logs
+  were fed interleaved; the normalizer cannot tell which log such a record is
+  from, so it raises ``InterleavedLogs`` and refuses everything after
+  (ADR 0018).
 - Prices and quantities become int64 mantissas through ``fixedpoint`` and never
   pass through ``float``.
 - ``event_ts`` and ``event_ts_source`` follow ADR 0008: the source is decided
@@ -18,10 +26,12 @@ store. The rules that hold for every venue live here:
   An identical repeat (same price, quantity and side) is dropped, so the store
   keeps the first observation, and is a TRADE_REPEAT stream event (ADR 0016).
   A repeat that differs is kept and is a TRADE_CONFLICT stream event (ADR
-  0015). The raw log keeps both.
+  0015). The raw log keeps both. Whatever is stored, a session shows one row
+  per trade: its first observation (ADR 0018).
 """
 
 import calendar
+import itertools
 import json
 import re
 from collections import Counter
@@ -38,7 +48,10 @@ from quantagent.data.schema import (
     DATASETS,
     EVENT_TS_RECEIPT,
     EVENT_TS_VENUE,
+    STREAM_EVENTS,
+    SchemaError,
     StreamEventKind,
+    check_row,
     table_from_rows,
 )
 from quantagent.data.store import AppendOnlyStore, _check_name
@@ -86,6 +99,10 @@ def parse_rfc3339_ns(text: str) -> int:
     if seconds < 0:
         raise ValueError(f"timestamp before 1970: {text!r}")
     return seconds * 1_000_000_000 + int((match.group(7) or "").ljust(9, "0"))
+
+
+class InterleavedLogs(ValueError):
+    """Records were not fed one raw log at a time, in ``seq`` order (ADR 0018)."""
 
 
 class Rejected(Exception):
@@ -420,11 +437,14 @@ class Normalizer:
         self.pending_rows = 0  # rows produced and not yet taken
         self.report = Report()
         self._log_id: str | None = None  # the raw log being fed (ADR 0013)
+        self._previous_seq: int | None = None
+        self._refused: str | None = None  # set once records were fed interleaved (ADR 0018)
         # The first observation of every trade fed so far, and its recv_ts
         # (ADRs 0015 and 0016).
         self._trades: dict[tuple[str, str | None, str], tuple[dict[str, Any], int]] = {}
 
     def feed(self, record: RawRecord) -> None:
+        self._check_order(record)
         report = self.report
         report.records += 1
         if record.seq == 0:
@@ -449,6 +469,12 @@ class Normalizer:
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
             self._reject(record, adapter, "malformed_message", f"{type(error).__name__}: {error}")
             return
+        for _, row in rows:
+            row["log_id"] = self._log_id
+        refused = self._unstorable(record, adapter, rows)
+        if refused is not None:
+            self._reject(record, adapter, "schema_refused", refused)
+            return
         rows = self._compare_trades(record, adapter, rows)
         self._store_events(record, adapter)
 
@@ -459,10 +485,70 @@ class Normalizer:
         report.messages[kind] += 1
         instrument = adapter.instrument
         for dataset_name, row in rows:
-            row["log_id"] = self._log_id
             self._rows.setdefault((dataset_name, record.venue, instrument), []).append(row)
             report.rows[dataset_name] += 1
         self.pending_rows += len(rows)
+
+    def _check_order(self, record: RawRecord) -> None:
+        """Refuse records of several logs fed interleaved (ADR 0018).
+
+        A raw record does not say which log it is from; the normalizer knows
+        only by order. Every log is numbered 0, 1, 2, ... by its writer, so a
+        record that is neither the next one nor a new log's first is either
+        another log's or out of order, and from then on no row can be trusted
+        to name the right log.
+        """
+        if self._refused is not None:
+            raise InterleavedLogs(self._refused)
+        previous = self._previous_seq
+        if record.seq != 0 and previous is not None and record.seq != previous + 1:
+            self._refused = (
+                f"record seq {record.seq} after seq {previous}: records of several raw logs "
+                "were fed interleaved, or one log's records out of order. A record does not say "
+                "which log it is from, so its rows could name the wrong log. Feed one log at a "
+                "time, each in seq order (ADR 0018). This normalizer accepts nothing more."
+            )
+            raise InterleavedLogs(self._refused)
+        self._previous_seq = record.seq
+
+    def _unstorable(
+        self, record: RawRecord, adapter: VenueAdapter, rows: list[tuple[str, Row]]
+    ) -> str | None:
+        """Why the store could not hold a row or an event of ``record``, or None."""
+        problems = []
+        for dataset_name, row in rows:
+            try:
+                check_row(DATASETS[dataset_name], row)
+            except SchemaError as error:
+                problems.append(str(error))
+                break  # the message is rejected whole; one reason is enough
+        problems += self._drop_unstorable_events(record, adapter)
+        return "; ".join(problems) or None
+
+    def _drop_unstorable_events(self, record: RawRecord, adapter: VenueAdapter) -> list[str]:
+        """Drop the events noted for ``record`` that the schema cannot hold, and
+        say why. The others stay, to be stored."""
+        storable, problems = [], []
+        for event in adapter.events:
+            try:
+                check_row(STREAM_EVENTS, self._event_row(record, 0, event))
+            except SchemaError as error:
+                problems.append(str(error))
+            else:
+                storable.append(event)
+        adapter.events = storable
+        return problems
+
+    def _event_row(self, record: RawRecord, index: int, event: Row) -> Row:
+        return {
+            "event_ts": record.recv_ts,
+            "event_ts_source": EVENT_TS_RECEIPT,
+            "recv_ts": record.recv_ts,
+            "log_id": self._log_id,
+            "seq": record.seq,
+            "event_index": index,
+            **event,
+        }
 
     def _reject(
         self, record: RawRecord, adapter: VenueAdapter | None, reason: str, detail: str
@@ -474,10 +560,16 @@ class Normalizer:
         if adapter is not None and self._log_id is not None:
             # A record that could not be normalized is a hole in the stream.
             adapter.on_reject(record)
+            # Events noted before the record failed are kept if the store can
+            # hold them, like the rest of what was noticed about the stream.
+            dropped = self._drop_unstorable_events(record, adapter)
+            text = f"{reason}: {detail}"
+            if dropped:
+                text += f"; not stored: {'; '.join(dropped)}"
             adapter.note(
                 StreamEventKind.MESSAGE_REJECTED,
                 connection=record.channel,
-                detail=f"{reason}: {detail}"[:_MAX_EVENT_DETAIL],
+                detail=text[:_MAX_EVENT_DETAIL],
             )
             self._store_events(record, adapter)
 
@@ -528,23 +620,15 @@ class Normalizer:
         key = ("stream_events", record.venue, adapter.instrument)
         rows = self._rows.setdefault(key, [])
         for index, event in enumerate(noted):
-            rows.append(
-                {
-                    "event_ts": record.recv_ts,
-                    "event_ts_source": EVENT_TS_RECEIPT,
-                    "recv_ts": record.recv_ts,
-                    "log_id": self._log_id,
-                    "seq": record.seq,
-                    "event_index": index,
-                    **event,
-                }
-            )
+            rows.append(self._event_row(record, index, event))
             self.report.events[event["kind"].name] += 1
         self.report.rows["stream_events"] += len(noted)
         self.pending_rows += len(noted)
 
     def take_rows(self) -> dict[RowKey, list[Row]]:
         """Return the rows produced since the last call and forget them."""
+        if self._refused is not None:
+            raise InterleavedLogs(self._refused)  # its rows may name the wrong log
         rows, self._rows = self._rows, {}
         self.pending_rows = 0
         return rows
@@ -566,10 +650,13 @@ def ingest(
 ) -> Report:
     """Normalize a raw log into ``store`` and return what happened to every record.
 
-    One load is one batch (ADR 0017): every row of the log, in every dataset,
-    gets the same ``knowledge_ts``, and none of it is readable until the whole
-    log has been written and the batch is committed. If the load fails,
-    nothing of it was ever readable and its files are removed.
+    Every ingest is a load of the log (ADR 0018), in one batch (ADR 0017):
+    every row of the log, in every dataset, gets the same ``knowledge_ts``, and
+    none of it is readable until the whole log has been written and the batch
+    is committed. Sessions then read the log from this load only, so loading a
+    log again replaces what the earlier load said about it. If the load
+    fails, nothing of it was ever readable and its files are removed. An empty
+    raw log loads nothing.
 
     Rows are written whenever ``batch_rows`` of them are pending, one file per
     dataset, instrument and day. That bounds memory (a single book snapshot can
@@ -578,20 +665,23 @@ def ingest(
     """
     reader = read_raw_log(path)
     normalizer = Normalizer()
+    records = iter(reader)
+    first = next(records, None)  # seq 0, which names the log
+    if first is not None:
+        with store.load(log_id_of(first)).batch(last=True) as batch:
 
-    with store.batch() as batch:
+            def flush() -> None:
+                pending = normalizer.take_rows()
+                for key in sorted(pending, key=lambda k: (_APPEND_ORDER[k[0]], k)):
+                    dataset_name, venue, instrument = key
+                    dataset = DATASETS[dataset_name]
+                    table = table_from_rows(dataset, pending[key])
+                    batch.append(dataset, venue, instrument, table)
 
-        def flush() -> None:
-            pending = normalizer.take_rows()
-            for key in sorted(pending, key=lambda k: (_APPEND_ORDER[k[0]], k)):
-                dataset_name, venue, instrument = key
-                dataset = DATASETS[dataset_name]
-                batch.append(dataset, venue, instrument, table_from_rows(dataset, pending[key]))
-
-        for record in reader:
-            normalizer.feed(record)
-            if normalizer.pending_rows >= batch_rows:
-                flush()
-        flush()
+            for record in itertools.chain((first,), records):
+                normalizer.feed(record)
+                if normalizer.pending_rows >= batch_rows:
+                    flush()
+            flush()
     normalizer.report.truncated = reader.truncated
     return normalizer.report

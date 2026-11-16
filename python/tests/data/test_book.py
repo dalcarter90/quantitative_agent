@@ -12,7 +12,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from _builders import INT64_MAX, LOG
-from damage import book_updates, duplicated, removed, sequence_number, swapped, write
+from damage import (
+    book_updates,
+    duplicated,
+    original_seq,
+    removed,
+    sequence_number,
+    swapped,
+    write,
+)
 from test_fixtures import FIXTURES, INSTRUMENT, fixture_path
 
 from quantagent.data import book as book_module
@@ -490,7 +498,10 @@ def test_kraken_a_lost_top_of_book_update_raises_at_the_next_message():
 
     def caught_at_once(i):
         error = outcome(removed(records, updates[i].seq), "kraken")
-        return isinstance(error, ChecksumMismatch) and error.seq == updates[i + 1].seq
+        return (
+            isinstance(error, ChecksumMismatch)
+            and original_seq(error.seq, updates[i].seq) == updates[i + 1].seq
+        )
 
     i = first(SPREAD, caught_at_once)
     error = outcome(removed(records, updates[i].seq), "kraken")
@@ -533,13 +544,16 @@ def test_kraken_cannot_see_a_lost_update_below_the_top_ten_levels():
             damaged = books_by_message(removed(records, updates[i].seq), "kraken")
         except ChecksumMismatch:
             return False
-        return any(damaged[key] != clean[key] for key in damaged)
+        return any(damaged[key] != clean[as_clean(key, i)] for key in damaged)
+
+    def as_clean(key, i):  # the same message in the undamaged log
+        return key[0], original_seq(key[1], updates[i].seq)
 
     i = first(SPREAD, unseen)
     assert outcome(removed(records, updates[i].seq), "kraken") is None
     # The wrong book later heals: a newer update overwrites the level.
     damaged = books_by_message(removed(records, updates[i].seq), "kraken")
-    wrong = [key for key in damaged if damaged[key] != clean[key]]
+    wrong = [key for key in damaged if damaged[key] != clean[as_clean(key, i)]]
     assert wrong and wrong[-1] != max(damaged)
 
 
@@ -575,8 +589,9 @@ def test_coinbase_a_lost_message_raises_a_gap_with_the_sequence_numbers():
     assert isinstance(error, SequenceBreak)
     assert (error.kind, error.source) == ("gap", "stream_event")
     assert (error.expected, error.received) == (sequence_number(lost), sequence_number(lost) + 1)
-    assert error.seq == next(r.seq for r in records if r.seq > lost.seq and r.channel == "ws")
-    assert following.seq >= error.seq
+    noticed = original_seq(error.seq, lost.seq)
+    assert noticed == next(r.seq for r in records if r.seq > lost.seq and r.channel == "ws")
+    assert following.seq >= noticed
 
 
 def test_coinbase_a_gap_is_invisible_from_the_book_messages_alone():

@@ -46,8 +46,8 @@ def write_file(root, table, knowledge_ts=500, partition=PARTITION):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"part-{knowledge_ts:020d}-000000.parquet"
     pq.write_table(table, path)
-    marker = {"layout": 2, "knowledge_ts": knowledge_ts,
-              "files": [path.relative_to(root).as_posix()], "rows": {}}  # fmt: skip
+    marker = {"layout": 3, "knowledge_ts": knowledge_ts,
+              "files": [path.relative_to(root).as_posix()], "rows": {}, "load": None}  # fmt: skip
     (root / "_batches").mkdir(exist_ok=True)
     (root / "_batches" / f"batch-{knowledge_ts:020d}.json").write_text(json.dumps(marker))
     return path
@@ -173,7 +173,8 @@ def test_data_files_with_no_marker_directory_at_all_are_refused(tmp_path):
     ("change", "problem"),
     [
         ({"layout": 1}, "layout"),
-        ({"layout": 3}, "layout"),
+        ({"layout": 2}, "layout"),  # ADR 0017's, before loads (ADR 0018)
+        ({"layout": 4}, "layout"),
         ({"knowledge_ts": 1_001}, "knowledge"),
         ({"files": ["trades/venue=kraken/instrument=ETH-USD/../../../../outside.parquet"]}, "file"),
         ({"files": "not a list"}, "file"),

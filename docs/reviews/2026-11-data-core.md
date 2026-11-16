@@ -47,6 +47,18 @@ else stands. The findings below are left as they were written: where they
 say `as_of`, a session now has `available_at` (receipt time) and `version`
 (what `as_of` was).
 
+**Update, 2026-11-15 (Phase 3f, ADR 0018).** R04, R05, R10 and R11 are fixed
+and their tests are unmarked. Every ingest of a raw log is a load, and a
+session reads each log from its latest complete load (R04). A value the
+schema refuses rejects its record (R05). A session shows each trade as its
+first observation in `(log_id, seq)` order (R10). A normalizer fed records
+out of order raises `InterleavedLogs` (R11). The tests of R10's conflicting
+repeat and of R11 had to change shape, because the owner decided a behavior
+other than the one they required; ADR 0018's "Review" section says why. X4
+is corrected in data-core, the tie-break X5 describes is replaced by ADR
+0018's rule, and what X6 and X7 quote holds again. R06, R07 and R08, and the
+design, test and documentation findings not named here, are open.
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |

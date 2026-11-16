@@ -7,8 +7,8 @@ Unix epoch, UTC:
   no timestamp, it holds ``recv_ts`` and ``event_ts_source`` is ``"receipt"``
   (ADR 0008).
 - ``recv_ts``: when our process received it.
-- ``knowledge_ts``: when the row became available in the store. Assigned by
-  the store's writer; callers never supply it.
+- ``knowledge_ts``: the batch of the store the row was written in: its version
+  (ADR 0017). Assigned by the store's writer; callers never supply it.
 
 Prices and quantities are int64 mantissas at the instrument's ``price_exp``
 and ``qty_exp`` (see ``fixedpoint``). There are no floating-point columns.
@@ -16,7 +16,9 @@ and ``qty_exp`` (see ``fixedpoint``). There are no floating-point columns.
 Venue, instrument and date are not columns. They are the store's partition
 directories, so a row's identity is (venue, instrument) plus the dataset's
 ``key`` columns. A correction is a new row with the same key and a later
-``knowledge_ts``.
+``knowledge_ts``. Every key names the raw record the row came from; for
+``trades``, the session shows one row per ``one_row_per`` (the trade id): its
+first observation (ADR 0018).
 
 ``log_id`` names the raw log a row came from (ADR 0013), and ``seq`` is the
 row's raw record in that log. ``(log_id, seq)`` is the order of stored data;
@@ -116,9 +118,12 @@ class Dataset:
     """A table in the normalized store.
 
     ``schema`` is what callers supply. ``stored_schema`` adds ``knowledge_ts``.
-    ``allowed`` and ``bounds`` are structural rules (enum membership, inclusive
-    ranges). They are not data quality checks: implausible market values are
-    stored as received and flagged later by the quality checks.
+    ``key`` is a record's identity. ``one_row_per``, if set, is what a session
+    shows one row of: the first record in ``(log_id, seq)`` order among those
+    with the same values there (ADR 0018). ``allowed`` and ``bounds`` are
+    structural rules (enum membership, inclusive ranges). They are not data
+    quality checks: implausible market values are stored as received and
+    flagged later by the quality checks.
     """
 
     name: str
@@ -127,6 +132,7 @@ class Dataset:
     key: tuple[str, ...]
     allowed: Mapping[str, frozenset[int] | frozenset[str]] = field(default_factory=dict)
     bounds: Mapping[str, tuple[int | None, int | None]] = field(default_factory=dict)
+    one_row_per: tuple[str, ...] = ()
 
     @property
     def stored_schema(self) -> pa.Schema:
@@ -157,6 +163,11 @@ _LOG_ID = re.compile(LOG_ID_PATTERN)
 _TIMESTAMP_BOUNDS = {"event_ts": (0, None), "recv_ts": (0, None)}
 _EVENT_TS_SOURCES = {"event_ts_source": frozenset({EVENT_TS_VENUE, EVENT_TS_RECEIPT})}
 
+# One row per observation of a trade: the raw record it was seen in, and the
+# venue's trade id (one message can carry several trades). Every observation
+# the normalizer keeps is stored. A session shows one row per trade_id, its
+# first observation in replay order (ADR 0018), so a trade seen in two logs,
+# or loaded twice, is still one trade to research.
 TRADES = Dataset(
     name="trades",
     version=3,
@@ -169,9 +180,10 @@ TRADES = Dataset(
             _required("side", pa.int8()),  # aggressor, a Side value
         ]
     ),
-    key=("trade_id",),
+    key=("log_id", "seq", "trade_id"),
     allowed={**_EVENT_TS_SOURCES, "side": frozenset(int(s) for s in Side)},
     bounds=_TIMESTAMP_BOUNDS,
+    one_row_per=("trade_id",),
 )
 
 # One row per price level. A venue message with many levels becomes many rows
@@ -305,6 +317,82 @@ def _check_value(dataset: Dataset, column: pa.Field, value: Any, row: int) -> An
             raise SchemaError(f"{where}: expected str, got {type(value).__name__} {value!r}")
         return value
     raise SchemaError(f"{where}: unsupported column type {column.type}")
+
+
+@dataclass(frozen=True, slots=True)
+class _ColumnRule:
+    name: str
+    nullable: bool
+    integer: bool
+    low: int | None  # the type's range, for integer columns
+    high: int | None
+    bounds: tuple[int | None, int | None] | None
+    allowed: frozenset | None
+
+
+_RULES: dict[Dataset, tuple[_ColumnRule, ...]] = {}  # Dataset hashes by identity
+
+
+def _rules(dataset: Dataset) -> tuple[_ColumnRule, ...]:
+    rules = _RULES.get(dataset)
+    if rules is None:
+        made = []
+        for column in dataset.schema:
+            integer = pa.types.is_integer(column.type)
+            low, high = _integer_range(column.type) if integer else (None, None)
+            made.append(_ColumnRule(column.name, column.nullable, integer, low, high,
+                                    dataset.bounds.get(column.name),
+                                    dataset.allowed.get(column.name)))  # fmt: skip
+        rules = _RULES[dataset] = tuple(made)
+    return rules
+
+
+def check_row(dataset: Dataset, row: Mapping[str, Any]) -> None:
+    """Raise SchemaError unless ``row`` would be accepted by ``table_from_rows``.
+
+    The same rules, for one row and without building a table, so the
+    normalizer can refuse a message whose values the store could not hold
+    before it becomes a row (ADR 0018).
+    """
+    names = dataset.schema.names
+    if KNOWLEDGE_TS in row:
+        raise SchemaError(
+            f"{dataset.name}: {KNOWLEDGE_TS} is assigned by the store and cannot be supplied"
+        )
+    if len(row) != len(names) or any(name not in row for name in names):
+        missing = sorted(set(names) - set(row))
+        unknown = sorted(set(row) - set(names))
+        raise SchemaError(f"{dataset.name}: missing columns {missing}, unknown columns {unknown}")
+    for rule in _rules(dataset):
+        value = row[rule.name]
+        where = f"{dataset.name}.{rule.name}"
+        if value is None:
+            if not rule.nullable:
+                raise SchemaError(f"{where}: null in a required column")
+            continue
+        if rule.integer:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise SchemaError(f"{where}: expected int, got {type(value).__name__} {value!r}")
+            if not rule.low <= value <= rule.high:
+                column_type = dataset.schema.field(rule.name).type
+                raise SchemaError(f"{where}: {value} does not fit in {column_type}")
+            if rule.bounds is not None:
+                low, high = rule.bounds
+                if low is not None and value < low:
+                    raise SchemaError(f"{where}: {value} is below {low}")
+                if high is not None and value > high:
+                    raise SchemaError(f"{where}: {value} is above {high}")
+        elif not isinstance(value, str):
+            raise SchemaError(f"{where}: expected str, got {type(value).__name__} {value!r}")
+        if rule.allowed is not None and value not in rule.allowed:
+            raise SchemaError(f"{where}: value not in {sorted(rule.allowed)}")
+    if not _LOG_ID.fullmatch(row["log_id"]):
+        raise SchemaError(f"{dataset.name}.log_id: {row['log_id']!r} is not a log id")
+    if row["event_ts_source"] == EVENT_TS_RECEIPT and row["event_ts"] != row["recv_ts"]:
+        raise SchemaError(
+            f"{dataset.name}: a row with event_ts_source 'receipt' must have "
+            "event_ts equal to recv_ts"
+        )
 
 
 def table_from_rows(dataset: Dataset, rows: Sequence[Mapping[str, Any]]) -> pa.Table:

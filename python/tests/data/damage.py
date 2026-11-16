@@ -6,9 +6,10 @@ are generated deterministically instead of committed, because they differ
 from the fixture by one record. Phase 4 uses the same functions.
 
 Every function takes the fixture's records and returns a new list in which
-each record keeps its receive time and its place in the log (record numbers
-stay in order), so the stream is replayed in the same order apart from the
-damage. ``write`` turns a list into a raw log.
+each record keeps its receive time and its order, so the stream is replayed
+in the same order apart from the damage. Record numbers stay consecutive from
+0, as in any raw log (its writer numbers what it receives), so a normalizer
+accepts the list as one log (ADR 0018). ``write`` turns a list into a raw log.
 """
 
 import json
@@ -26,9 +27,21 @@ def write(records: list[RawRecord], path: Path) -> Path:
 
 
 def removed(records: list[RawRecord], seq: int) -> list[RawRecord]:
-    """The log without the record ``seq``: a message lost in transit."""
+    """The log without the record ``seq``: a message lost in transit. The
+    recorder never saw it, so record numbers after it shift down by one,
+    exactly as they would when the log is written."""
     assert any(r.seq == seq for r in records)
-    return [r for r in records if r.seq != seq]
+    return [
+        RawRecord(r.recv_ts, r.seq - (r.seq > seq), r.venue, r.channel, r.payload, r.recv_mono_ns)
+        for r in records
+        if r.seq != seq
+    ]
+
+
+def original_seq(damaged_seq: int, removed_seq: int) -> int:
+    """The record number in the undamaged log of record ``damaged_seq`` of
+    ``removed(records, removed_seq)``."""
+    return damaged_seq + (damaged_seq >= removed_seq)
 
 
 def duplicated(records: list[RawRecord], seq: int) -> list[RawRecord]:

@@ -11,10 +11,13 @@ passes, the suite fails on the unexpected pass, and the marker has to be
 removed in the same change. From then on the test is the finding's regression
 test.
 
-Fixed so far, and unmarked: R01, R02, R03 and R09 (the time model, ADR 0017).
-Their tests now use the session's two cutoffs. Two of them could not keep
-their original shape, because the fix makes the situation they set up
-impossible; each says so where it stands.
+Fixed so far, and unmarked: R01, R02, R03 and R09 (the time model, ADR 0017),
+and R04, R05, R10 and R11 (loads and the normalizer's input, ADR 0018). The
+tests of R01 to R03 and R09 use the session's two cutoffs. Four tests could
+not keep their original shape: R03's and R09's because the fix makes the
+situation they set up impossible, R10's conflict test and R11's because the
+owner decided a behavior other than the one they required. Each says so
+where it stands.
 
 If the owner decides a behavior is intended, the test is replaced by one that
 pins the decision, in the same change as the ADR that records it. Do not
@@ -42,7 +45,7 @@ from test_adapters import (
 from test_fixtures import INSTRUMENT, fixture_path
 
 from quantagent.data import book, quality
-from quantagent.data.adapters import Normalizer, ingest, normalize
+from quantagent.data.adapters import InterleavedLogs, Normalizer, ingest, normalize
 from quantagent.data.quality import QualityConfig, Severity
 from quantagent.data.rawlog import RawLogWriter, RawRecord, log_id_of, read_raw_log
 from quantagent.data.schema import (
@@ -315,14 +318,15 @@ def test_r03_a_session_opened_after_a_batchs_knowledge_time_always_sees_it(root,
             assert session.trades("kraken", "ETH-USD", *ALL).num_rows == 1
 
 
-# --- R04: a correction cannot take a row away -------------------------------------------
+# --- R04: a reload takes away the rows it no longer produces (fixed, ADR 0018) ----------
 #
 # ADR 0009: keying rows by their raw record "is what makes it safe to fix an
-# adapter bug and re-ingest". True for rows the fixed adapter still produces.
-# Rows it no longer produces stay, and here one of them is an integrity error.
+# adapter bug and re-ingest". That was true for rows the fixed adapter still
+# produced; the rows it no longer produced stayed, and here one of them is an
+# integrity error. Every ingest is now a load, and a session reads each log
+# from its latest complete load only.
 
 
-@pytest.mark.xfail(strict=True, reason="R04")
 def test_r04_loading_a_log_again_after_a_fix_clears_what_the_fix_resolved(tmp_path):
     records = records_of("kraken")
     updates = stream_book_updates(records)
@@ -345,11 +349,11 @@ def test_r04_loading_a_log_again_after_a_fix_clears_what_the_fix_resolved(tmp_pa
     with PITSession(root, available_at=INT64_MAX) as session:
         result = quality.check_stream_integrity(session, "kraken", INSTRUMENT, *ALL,
                                                 QualityConfig())  # fmt: skip
-    # Fails: message_rejected is still reported, at the record that now parses.
+    # Failed: message_rejected was still reported, at the record that now parses.
     assert [(f.what, f.seq) for f in result.findings] == []
 
 
-# --- R05: a message the adapter accepts but the schema refuses stops the whole load -----
+# --- R05: a value the schema refuses is a rejected message (fixed, ADR 0018) ------------
 #
 # Roadmap Phase 1c: "Malformed or unknown messages are counted and reported,
 # never silently dropped and never a crash."
@@ -384,10 +388,9 @@ OUT_OF_RANGE = {
 
 
 @pytest.mark.parametrize("case", sorted(OUT_OF_RANGE))
-@pytest.mark.xfail(strict=True, reason="R05")
 def test_r05_a_value_that_does_not_fit_the_schema_is_a_reject_not_a_crash(tmp_path, case):
     path = write_log(tmp_path / "odd.qaraw", OUT_OF_RANGE[case]())
-    # Fails: SchemaError out of ingest at the next flush; the rest of the log is not loaded.
+    # Failed: SchemaError out of ingest at the next flush; the rest of the log was not loaded.
     report = ingest(path, AppendOnlyStore(tmp_path / "store"))
     assert len(report.rejects) == 1
 
@@ -563,13 +566,22 @@ def test_r09_the_same_window_for_book_rows_and_events_still_finds_a_lost_message
     assert len(stream_rows_after_the_loss(widest)) > 10
 
 
-# --- R10: which observation of a trade the store shows depends on how it was loaded ------
+# --- R10: one rule for which observation of a trade is shown (fixed, ADR 0018) ---------
 #
 # ADR 0016: "the store keeps the first observation". docs/data-core.md section
-# 5: a repeat that differs "is stored, so the store shows the later value".
+# 5 said a repeat that differs "is stored, so the store shows the later value".
+# Which observation the store showed depended on how the logs were loaded and
+# on the clocks. The owner decided one rule (ADR 0018): the first observation
+# in replay order, by log_id and then seq, across logs and across loads.
+#
+# The second test could not keep its original form. It required the *later*
+# value, as data-core said, in two cases where the view's tie-break (venue
+# time, then receipt time) happened to pick the first. The decision is the
+# opposite of what it required, so it now requires the first observation, and
+# it has two more cases: the mirror images, where that tie-break picked the
+# later one. Before ADR 0018 those two failed with (4, 1010).
 
 
-@pytest.mark.xfail(strict=True, reason="R10")
 def test_r10_a_trade_resent_as_history_in_a_later_log_keeps_its_live_observation(tmp_path):
     live = kraken(kraken_trade())  # seen as it happened
     resent = [  # the next session, an hour later: the venue's history on subscribe
@@ -585,8 +597,8 @@ def test_r10_a_trade_resent_as_history_in_a_later_log_keeps_its_live_observation
     with PITSession(root, available_at=INT64_MAX) as session:
         (trade,) = session.trades("kraken", INSTRUMENT, *ALL).to_pylist()
         skew = quality.check_clock_skew(session, "kraken", INSTRUMENT, *ALL, QualityConfig())
-    # Fails: the stored row is the resent copy, received an hour later, and the
-    # trade now counts as backfill (0 live rows considered).
+    # Failed: the stored row was the resent copy, received an hour later, and the
+    # trade counted as backfill (0 live rows considered).
     assert (trade["log_id"], trade["recv_ts"]) == (log_id_of(live[0]), live[3].recv_ts)
     assert skew.stats["backfill_trades_skipped"] == 0
 
@@ -608,14 +620,25 @@ def test_r10_a_trade_resent_as_history_in_a_later_log_keeps_its_live_observation
             -NS,
             id="the wall clock stepped back between the two",
         ),
+        pytest.param(
+            "2026-11-11T03:00:00.000000Z",
+            "2026-11-11T03:00:00.500000Z",
+            0,
+            id="the later observation carries a later venue time",
+        ),
+        pytest.param(
+            "2026-11-11T03:00:00.000000Z",
+            "2026-11-11T03:00:00.000000Z",
+            0,
+            id="the same venue time, received in order",
+        ),
     ],  # fmt: skip
 )
-@pytest.mark.xfail(strict=True, reason="R10")
-def test_r10_a_conflicting_repeat_shows_the_later_value(
+def test_r10_a_conflicting_repeat_shows_the_first_observation_whatever_the_clocks_say(
     tmp_path, first_time, later_time, clock_step
 ):
     records = kraken(
-        kraken_trade(price="100.0", timestamp=first_time),  # seq 3
+        kraken_trade(price="100.0", timestamp=first_time),  # seq 3: the first observation
         kraken_trade(price="101.0", timestamp=later_time),  # seq 4: the later observation
     )
     records = [
@@ -625,34 +648,47 @@ def test_r10_a_conflicting_repeat_shows_the_later_value(
     ]  # fmt: skip
     root = tmp_path / "store"
     report = ingest(write_log(tmp_path / "conflict.qaraw", records), AppendOnlyStore(root))
-    assert report.events["TRADE_CONFLICT"] == 1
+    assert report.events["TRADE_CONFLICT"] == 1  # a conflict is still an error
     with PITSession(root, available_at=INT64_MAX) as session:
         (trade,) = session.trades("kraken", INSTRUMENT, *ALL).to_pylist()
-    # Fails with (3, 1000): the two rows share a batch, and the view breaks the
-    # tie on event_ts and then recv_ts, not on the order the records arrived.
-    assert (trade["seq"], trade["price"]) == (4, 1010)
+    # The last two cases failed with (4, 1010): the two rows shared a batch, and
+    # the view broke the tie on event_ts and then recv_ts, not on replay order.
+    assert (trade["seq"], trade["price"]) == (3, 1000)
 
 
-# --- R11: one normalizer fed two logs in arrival order mixes them up ---------------------
+# --- R11: one normalizer fed two logs in arrival order mixed them up (fixed, ADR 0018) ---
 #
 # ``logorder.merge_logs`` yields the records of several logs interleaved, in
 # arrival order. Feeding that to a Normalizer is the obvious way to compare
-# trades across simultaneous logs (ADR 0015), and nothing refuses it.
+# trades across simultaneous logs (ADR 0015), and nothing refused it.
+#
+# The owner decided the normalizer refuses it, with a clear error. This test
+# could not keep its original form. It required every row to keep its own
+# log's id. A raw record does not say which log it is from: once the second
+# log's first record is in, the first log's record 1 cannot be told from the
+# second log's record 1, so no normalizer can do that. The test now requires
+# what the finding was about, that keys never collide silently: fed
+# interleaved, the normalizer raises and nothing comes out of it; fed one log
+# after the other, each row keeps its log's id and no key appears twice.
 
 
-@pytest.mark.xfail(strict=True, reason="R11")
-def test_r11_records_of_two_logs_fed_in_arrival_order_keep_their_own_log_ids():
+def test_r11_records_of_two_logs_fed_in_arrival_order_are_refused_not_mixed_up():
     one = records_of("kraken")[:400]
     two = [RawRecord(r.recv_ts + 1, r.seq, r.venue, r.channel, r.payload, r.recv_mono_ns)
            for r in one]  # fmt: skip
     assert log_id_of(one[0]) != log_id_of(two[0])
     normalizer = Normalizer()
-    for a, b in zip(one, two, strict=True):
-        normalizer.feed(a)
-        normalizer.feed(b)
-    levels = normalizer.take_rows()[("book_events", "kraken", INSTRUMENT)]
+    # Failed with DID NOT RAISE: every row named the second log, so each key
+    # appeared twice and the store would take one log's rows as corrections
+    # of the other's.
+    with pytest.raises(InterleavedLogs, match="interleaved"):
+        for a, b in zip(one, two, strict=True):
+            normalizer.feed(a)
+            normalizer.feed(b)
+    with pytest.raises(InterleavedLogs):
+        normalizer.take_rows()
+
+    levels = normalize(one + two).rows[("book_events", "kraken", INSTRUMENT)]
     keys = [(r["log_id"], r["seq"], r["level_index"]) for r in levels]
-    # Fails: every row names the second log, so each key appears twice and the
-    # store would take one log's rows as corrections of the other's.
     assert {r["log_id"] for r in levels} == {log_id_of(one[0]), log_id_of(two[0])}
     assert len(set(keys)) == len(keys)

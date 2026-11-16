@@ -319,9 +319,10 @@ def test_a_clock_that_does_not_return_int64_nanoseconds_is_an_error(root, bad):
 # --- append-only -------------------------------------------------------------
 
 
-def test_the_only_public_operations_are_append_and_batch():
+def test_the_only_public_operations_are_append_batch_and_load():
     public = {name for name in dir(AppendOnlyStore) if not name.startswith("_")}
-    assert public == {"append", "batch"}  # append is a batch of one table (ADR 0017)
+    # append is a batch of one table (ADR 0017); a load is a raw log's batches (ADR 0018).
+    assert public == {"append", "batch", "load"}
 
 
 def test_appending_never_changes_the_bytes_of_existing_files(root):
@@ -360,7 +361,8 @@ def test_a_correction_is_a_new_row_and_the_original_stays_on_disk(root):
         ("a", 9712310, 1_000),
         ("a", 9712399, 2_000),
     ]
-    assert TRADES.key == ("trade_id",)
+    # Trades are keyed by raw record (ADR 0018); a correction reuses the record.
+    assert TRADES.key == ("log_id", "seq", "trade_id")
     assert correction.knowledge_ts > original.knowledge_ts
 
 
@@ -509,7 +511,8 @@ def test_the_commit_marker_is_written_last_and_names_every_file(root):
     (marker,) = markers(root)
     content = json.loads(marker.read_text(encoding="utf-8"))
     assert content["knowledge_ts"] == 1_000
-    assert content["layout"] == 2
+    assert content["layout"] == 3
+    assert content["load"] is None  # written outside a load (ADR 0018)
     assert sorted(content["files"]) == sorted(
         p.relative_to(root).as_posix() for p in data_files(root)
     )
