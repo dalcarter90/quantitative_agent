@@ -59,6 +59,19 @@ is corrected in data-core, the tie-break X5 describes is replaced by ADR
 0018's rule, and what X6 and X7 quote holds again. R06, R07 and R08, and the
 design, test and documentation findings not named here, are open.
 
+**Update, 2026-11-16 (Phase 3g, ADR 0019).** R06, R07 and R08 are fixed and
+their tests are unmarked; no test in the file is marked any more. Each
+instrument has one fixed price and quantity exponent, the recorder fetches
+metadata before subscribing, and a log's first metadata version is in effect
+from its first row (R06). Findings are limited per severity and a truncated
+report fails (R07). A session's clock is judged on every day it spans, and so
+is a reconnect (R08). The three mutations of T1 and T2 are caught by new tests
+(`test_recorder.py`, `test_read_paths.py`). The X list: X3 and X13 are fixed
+in the code, X9 and X10 in the documents, X8, X11, X12 and X14 already held,
+and the duplicate-column error now says what is wrong. The ADR chain (A) is
+consolidated in `docs/data-core-spec.md`. Still open: D1 to D7, T3, and the
+minor notes other than the duplicate-column one.
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |

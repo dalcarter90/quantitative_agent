@@ -25,9 +25,14 @@ The checks:
   best ask, or that has only one side.
 - ``check_outliers``: trade prices far from recent trades, and prices or
   quantities that cannot be real.
+- ``check_trade_observations``: a trade another log saw with a different
+  price, quantity or side than its first observation (ADR 0019).
 
 A check returns its findings and some counts of what it examined, so that
-"no findings" can be told apart from "nothing was looked at".
+"no findings" can be told apart from "nothing was looked at". Findings are
+limited per severity (``max_findings`` each), so a lesser finding never
+displaces a worse one, and a report with any finding cut fails (ADR 0019).
+docs/data-core-spec.md section 10 lists every finding.
 """
 
 import argparse
@@ -89,7 +94,10 @@ class CheckResult:
     instrument: str
     findings: list[Finding]
     stats: dict[str, int]
-    truncated: bool = False  # more findings existed than max_findings
+    truncated: bool = False  # more findings existed than max_findings allowed
+    # The severities some of whose findings were not kept, least severe first.
+    # The limit is per severity, so a lesser finding never displaces a worse one.
+    cut: tuple[Severity, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,7 +120,7 @@ class QualityConfig:
     max_clock_offset_ns: int = 250_000_000
     # A wall-clock step against the monotonic counter larger than this (ADR 0012).
     max_clock_step_ns: int = 50_000_000
-    max_findings: int = 1000  # per check and instrument
+    max_findings: int = 1000  # per check, instrument and severity
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -172,7 +180,8 @@ class _Scope:
         self.check, self.session, self.config = check, session, config
         self.venue, self.instrument, self.start, self.end = venue, instrument, start, end
         self.findings: list[Finding] = []
-        self.truncated = False
+        self.kept: Counter = Counter()  # findings kept, per severity
+        self.cut: set[Severity] = set()
         self.stats: dict[str, int] = {}
 
     def where(self, alias: str = "") -> str:
@@ -187,18 +196,23 @@ class _Scope:
     def rows(self, sql: str) -> list[dict[str, Any]]:
         return self.session.sql(sql).to_pylist()
 
-    @property
-    def room(self) -> int:
-        """How many more findings fit, plus one so truncation can be noticed."""
-        return max(self.config.max_findings - len(self.findings), 0) + 1
+    def room(self, severity: Severity) -> int:
+        """How many more findings of ``severity`` fit, plus one so that a cut
+        can be noticed: the LIMIT for a query that produces only that severity."""
+        return max(self.config.max_findings - self.kept[severity], 0) + 1
 
     def add(
         self, severity: Severity, what: str, dataset: str, at: dict[str, Any], message: str
     ) -> None:
-        """``at`` is the raw record: a row or event with log_id, seq and recv_ts."""
-        if len(self.findings) >= self.config.max_findings:
-            self.truncated = True
+        """``at`` is the raw record: a row or event with log_id, seq and recv_ts.
+
+        Each severity has its own limit of ``max_findings`` (review, R07): an
+        ERROR is never dropped to make room for, or because of, lesser ones.
+        """
+        if self.kept[severity] >= self.config.max_findings:
+            self.cut.add(severity)
             return
+        self.kept[severity] += 1
         self.findings.append(
             Finding(
                 check=self.check,
@@ -221,7 +235,8 @@ class _Scope:
             instrument=self.instrument,
             findings=self.findings,
             stats=self.stats,
-            truncated=self.truncated,
+            truncated=bool(self.cut),
+            cut=tuple(sorted(self.cut)),
         )
 
 
@@ -256,7 +271,9 @@ def check_stream_integrity(
     kinds = Counter(StreamEventKind(e["kind"]).name for e in events)
     scope.stats = {"events": len(events), "sessions": kinds["SESSION_START"], **kinds}
 
-    stream_connected = False
+    # Whether each log's stream was already connected when the range began, so
+    # that the first connect in a range is a reconnect if it is one (review, R08).
+    stream_connected = _connected_before(scope, sorted({e["log_id"] for e in events}))
     repeats: dict[str, list[dict]] = {}  # TRADE_REPEAT events by session (log_id)
     for event in events:
         kind = StreamEventKind(event["kind"])
@@ -266,15 +283,15 @@ def check_stream_integrity(
             scope.add(severity, what, "stream_events", event, message)
 
         if kind == StreamEventKind.SESSION_START:
-            stream_connected = False
+            stream_connected[event["log_id"]] = False
         elif kind == StreamEventKind.CONNECT and connection == _STREAM:
-            if stream_connected:
+            if stream_connected.get(event["log_id"], False):
                 add(
                     Severity.WARNING,
                     "reconnect",
                     "the stream connection was opened again; data in between was not seen",
                 )
-            stream_connected = True
+            stream_connected[event["log_id"]] = True
         elif kind == StreamEventKind.DISCONNECT:
             if connection == _STREAM and detail != _SESSION_ENDED:
                 add(Severity.WARNING, "disconnect", f"the stream connection dropped: {detail}")
@@ -330,6 +347,26 @@ def check_stream_integrity(
             "each trade's first observation (ADR 0016)",
         )
     return scope.result()
+
+
+def _connected_before(scope: _Scope, logs: Sequence[str]) -> dict[str, bool]:
+    """For each log, whether its stream connection was open when the range
+    began: a stream connect since the log's last session start before it."""
+    if not logs:
+        return {}
+    kinds = f"{int(StreamEventKind.SESSION_START)}, {int(StreamEventKind.CONNECT)}"
+    connected: dict[str, bool] = {}
+    for event in scope.rows(
+        "SELECT log_id, seq, event_index, kind, connection FROM stream_events "
+        f"WHERE venue = '{scope.venue}' AND instrument = '{scope.instrument}' "
+        f"AND recv_ts < {scope.start} AND kind IN ({kinds}) AND log_id IN ({_quoted(logs)}) "
+        "ORDER BY log_id, seq, event_index"
+    ):
+        if event["kind"] == StreamEventKind.SESSION_START:
+            connected[event["log_id"]] = False
+        elif event["connection"] == _STREAM:
+            connected[event["log_id"]] = True
+    return connected
 
 
 def _ms(nanoseconds: int) -> str:
@@ -454,33 +491,28 @@ def check_recording_clock(
     that session is off by about that much. A session whose clock could not be
     measured is a warning; one recorded before clocks were measured at all is
     reported as information. Use of the recorder's override is always reported.
+
+    A session is judged on every range it has data in, not only the one that
+    holds its start (review, R08): the sessions are found by the logs of the
+    rows received in the range, in any dataset, and each one's start, clock
+    and override records are read wherever they are. A clock step is reported
+    in the range where it happened.
     """
     scope = _Scope("recording_clock", session, venue, instrument, start, end, config)
-    kinds = (
-        StreamEventKind.SESSION_START,
-        StreamEventKind.CLOCK_OFFSET,
-        StreamEventKind.CLOCK_OVERRIDE,
-        StreamEventKind.CLOCK_STEP,
-    )
-    events = [
-        event
-        for event in session.stream_events(venue, instrument, start, end).to_pylist()
-        if event["kind"] in kinds
-    ]
-
     sessions: list[dict[str, Any]] = []
-    for event in events:
-        kind = StreamEventKind(event["kind"])
-        if kind == StreamEventKind.SESSION_START:
-            sessions.append({"start": event, "clock": None, "override": None, "steps": []})
-            continue
-        if not sessions:  # the range begins inside a session
-            sessions.append({"start": None, "clock": None, "override": None, "steps": []})
-        if kind == StreamEventKind.CLOCK_STEP:
-            sessions[-1]["steps"].append(event)
-        else:
-            slot = "clock" if kind == StreamEventKind.CLOCK_OFFSET else "override"
-            sessions[-1][slot] = event
+    for found in _sessions_with_data(scope):
+        steps = [
+            e
+            for e in found["events"]
+            if e["kind"] == StreamEventKind.CLOCK_STEP and start <= e["recv_ts"] < end
+        ]
+        clock = next((e for e in found["events"] if e["kind"] == StreamEventKind.CLOCK_OFFSET),
+                     None)  # fmt: skip
+        override = next(
+            (e for e in found["events"] if e["kind"] == StreamEventKind.CLOCK_OVERRIDE), None
+        )
+        sessions.append({"start": found["start"], "clock": clock, "override": override,
+                         "steps": steps})  # fmt: skip
 
     measured_offsets: list[int] = []
     steps: list[int] = []
@@ -568,6 +600,64 @@ def check_recording_clock(
     return scope.result()
 
 
+_SESSION_KINDS = (
+    StreamEventKind.SESSION_START,
+    StreamEventKind.CLOCK_OFFSET,
+    StreamEventKind.CLOCK_OVERRIDE,
+    StreamEventKind.CLOCK_STEP,
+)
+
+
+def _quoted(values: Sequence[str]) -> str:
+    """SQL string literals. Only for log ids, whose form the schema checks."""
+    return ", ".join("'" + value.replace("'", "''") + "'" for value in values)
+
+
+def _sessions_with_data(scope: _Scope) -> list[dict[str, Any]]:
+    """The recording sessions with rows received in the scope's range.
+
+    A session runs from a ``SESSION_START`` to the next one in its log (one
+    per raw log, as the recorder writes them). Each comes with every
+    session-level event of it (start, clock, override, steps) the session can
+    see, whatever its receipt time; ``start`` is None for rows before any
+    start in their log.
+    """
+    union = " UNION ALL ".join(f"SELECT log_id, seq FROM {view} WHERE {scope.where()}"
+                               for view in _DATA_VIEWS)  # fmt: skip
+    spans = scope.rows(
+        f"SELECT log_id, min(seq) AS first, max(seq) AS last FROM ({union}) x "
+        "GROUP BY log_id ORDER BY log_id"
+    )
+    if not spans:
+        return []
+    kinds = ", ".join(str(int(kind)) for kind in _SESSION_KINDS)
+    events = scope.rows(
+        "SELECT log_id, seq, event_index, recv_ts, kind, expected, observed, detail "
+        f"FROM stream_events WHERE venue = '{scope.venue}' AND instrument = '{scope.instrument}' "
+        f"AND kind IN ({kinds}) AND log_id IN ({_quoted([s['log_id'] for s in spans])}) "
+        "ORDER BY log_id, seq, event_index"
+    )
+    found: list[dict[str, Any]] = []
+    for span in spans:
+        of_log = [e for e in events if e["log_id"] == span["log_id"]]
+        starts = [e["seq"] for e in of_log if e["kind"] == StreamEventKind.SESSION_START]
+        # Session boundaries in this log: before its first start, then each start.
+        bounds = [None, *starts] if not starts or starts[0] > 0 else starts
+        for index, begin in enumerate(bounds):
+            until = bounds[index + 1] if index + 1 < len(bounds) else None
+            low = -1 if begin is None else begin
+            high = _INT64_MAX if until is None else until - 1
+            if span["last"] < low or span["first"] > high:
+                continue  # no row of this session in the range
+            members = [e for e in of_log if low <= e["seq"] <= high]
+            start = next((e for e in members if e["kind"] == StreamEventKind.SESSION_START
+                          and e["seq"] == begin), None)  # fmt: skip
+            if begin is None and not members:
+                continue
+            found.append({"start": start, "events": members})
+    return found
+
+
 def _start_detail(event: dict[str, Any]) -> dict[str, Any]:
     try:
         detail = json.loads(event["detail"] or "{}")
@@ -638,7 +728,7 @@ def check_clock_skew(
             f"min({lag}) AS lo, max({lag}) AS hi "
             f"{source} GROUP BY {p}log_id, {p}seq "
             f"HAVING min({lag}) < {low} OR max({lag}) > {high} "
-            f"ORDER BY 1, 2 LIMIT {scope.room}"
+            f"ORDER BY 1, 2 LIMIT {scope.room(Severity.WARNING)}"
         ):
             if row["lo"] < low:
                 note = " (the venue's timestamp is later than receipt)" if row["lo"] < 0 else ""
@@ -674,7 +764,8 @@ def check_clock_skew(
             "ts - lag(ts) OVER (PARTITION BY log_id ORDER BY seq) AS step FROM ("
             f"SELECT {p}log_id AS log_id, {p}seq AS seq, max({p}recv_ts) AS recv_ts, "
             f"max({p}event_ts) AS ts {source} GROUP BY {p}log_id, {p}seq) m) d "
-            f"WHERE step < {-config.max_backwards_ns} ORDER BY 1, 2 LIMIT {scope.room}"
+            f"WHERE step < {-config.max_backwards_ns} ORDER BY 1, 2 "
+            f"LIMIT {scope.room(Severity.WARNING)}"
         ):
             scope.add(
                 Severity.WARNING,
@@ -816,23 +907,82 @@ def check_outliers(
         "trades_with_reference": judged,
         "book_rows_checked": book["n"],
     }
+    # One query per severity, each limited by that severity's room, so that
+    # warnings early in the range cannot keep a later error out (review, R07).
+    levels = "SELECT log_id, seq, recv_ts, level_index, kind, price, qty FROM book_events"
+    order = "ORDER BY log_id, seq, level_index"
     for row in scope.rows(
-        "SELECT log_id, seq, recv_ts, level_index, kind, price, qty FROM book_events "
-        f"WHERE {scope.where()} AND (price <= 0 OR qty < 0 OR (qty = 0 AND {snapshot_kinds})) "
-        f"ORDER BY log_id, seq, level_index LIMIT {scope.room}"
+        f"{levels} WHERE {scope.where()} AND (price <= 0 OR qty < 0) "
+        f"{order} LIMIT {scope.room(Severity.ERROR)}"
     ):
         level = f"level {row['level_index']}"
-        at = ("book_events", row)
         if row["price"] <= 0:
             message = f"{level}: price mantissa {row['price']}"
-            scope.add(Severity.ERROR, "nonpositive_price", *at, message)
+            scope.add(Severity.ERROR, "nonpositive_price", "book_events", row, message)
         if row["qty"] < 0:
             message = f"{level}: quantity mantissa {row['qty']}"
-            scope.add(Severity.ERROR, "negative_quantity", *at, message)
-        elif row["qty"] == 0 and row["kind"] != BookEventKind.DELTA:
-            # Zero means "remove this level", which only makes sense in an update.
-            message = f"{level}: a snapshot lists a level with zero quantity"
-            scope.add(Severity.WARNING, "zero_quantity_in_snapshot", *at, message)
+            scope.add(Severity.ERROR, "negative_quantity", "book_events", row, message)
+    for row in scope.rows(
+        f"{levels} WHERE {scope.where()} AND qty = 0 AND {snapshot_kinds} "
+        f"{order} LIMIT {scope.room(Severity.WARNING)}"
+    ):
+        # Zero means "remove this level", which only makes sense in an update.
+        message = f"level {row['level_index']}: a snapshot lists a level with zero quantity"
+        scope.add(Severity.WARNING, "zero_quantity_in_snapshot", "book_events", row, message)
+    return scope.result()
+
+
+# --- trades seen in several logs ------------------------------------------------------
+
+_TRADE_FIELDS = ("price", "qty", "side")
+
+
+def check_trade_observations(
+    session: PITSession, venue: str, instrument: str, start: int, end: int, config: QualityConfig
+) -> CheckResult:
+    """Observations of a trade in another log that disagree with its first (ADR 0019).
+
+    Every observation of a trade is stored, and a session shows the first in
+    ``(log_id, seq)`` order (ADR 0018). Within one log the normalizer
+    compares them and writes ``TRADE_CONFLICT``, which ``stream_integrity``
+    reports; but each log is loaded in its own run, so nothing compares two
+    logs. This does: for every observation received in the range from a log
+    other than its trade's first observation's, a different price, quantity
+    or side is an ERROR (``trade_conflict_across_logs``), reported at the
+    later observation wherever the first was received. An identical one is
+    counted (``repeated_across_logs``): venues resend their recent trades on
+    every subscribe, so it is expected and not reported.
+    """
+    scope = _Scope("trade_observations", session, venue, instrument, start, end, config)
+    observations = session.trade_observations(venue, instrument, start, end).to_pylist()
+    several: set[str] = set()
+    repeated = conflicts = 0
+    for seen in observations:
+        if seen["log_id"] == seen["first_log_id"]:
+            continue  # the first observation, or a repeat within its log (TRADE_CONFLICT)
+        several.add(seen["trade_id"])
+        differs = [name for name in _TRADE_FIELDS if seen[name] != seen[f"first_{name}"]]
+        if not differs:
+            repeated += 1
+            continue
+        conflicts += 1
+        changes = ", ".join(f"{name} {seen[f'first_{name}']} then {seen[name]}" for name in differs)
+        scope.add(
+            Severity.ERROR,
+            "trade_conflict_across_logs",
+            "trades",
+            seen,
+            f"trade {seen['trade_id']} was seen in this log with a different "
+            f"{' and '.join(differs)} ({changes}) from its first observation (log "
+            f"{seen['first_log_id']}, seq {seen['first_seq']}); the session shows the first "
+            "(ADR 0018)",
+        )
+    scope.stats = {
+        "observations": len(observations),
+        "trades_seen_in_several_logs": len(several),
+        "repeated_across_logs": repeated,
+        "conflicts_across_logs": conflicts,
+    }
     return scope.result()
 
 
@@ -843,6 +993,7 @@ CHECKS: tuple[Check, ...] = (
     check_clock_skew,
     check_crossed_books,
     check_outliers,
+    check_trade_observations,
 )
 
 
@@ -910,7 +1061,10 @@ def _report(results: Sequence[CheckResult], max_print: int, out: Callable[[str],
             out(f"\n{result.venue}/{result.instrument}")
         counts = Counter(f.severity for f in result.findings)
         graded = ", ".join(f"{counts[s]} {s.name}" for s in sorted(counts, reverse=True))
-        more = " (more exist; raise max_findings)" if result.truncated else ""
+        more = ""
+        if result.cut:
+            names = " and ".join(s.name for s in result.cut)
+            more = f" (more {names} findings were cut off by max_findings; raise it)"
         total = len(result.findings)
         summary = f"{total} finding{'s' if total != 1 else ''}" + (f": {graded}" if graded else "")
         out(f"  {result.check}: {summary}{more}")
@@ -997,6 +1151,10 @@ def main(argv: list[str] | None = None) -> int:
         severities.append(Severity.WARNING)
     _report(results, args.max_print, print)
 
+    # A report that could not hold every finding is incomplete, whatever it
+    # holds: it fails, so that no limit can turn a failing range into a
+    # passing one (review, R07).
+    cut = sorted({severity for result in results for severity in result.cut})
     if not severities:
         print("\nResult: no findings")
         return 0
@@ -1006,6 +1164,11 @@ def main(argv: list[str] | None = None) -> int:
         f"\nResult: {count} finding{'s' if count != 1 else ''} (worst: {worst.name}); "
         f"failing at {fail_on.name}"
     )
+    if cut:
+        names = " and ".join(severity.name for severity in cut)
+        print(f"TRUNCATED: {names} findings were cut off by max_findings, so this report is "
+              "incomplete and fails; raise max_findings to see them all")  # fmt: skip
+        return 1
     return 1 if worst >= fail_on else 0
 
 

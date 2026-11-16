@@ -6,6 +6,7 @@ print(report.summary())
 """
 
 from quantagent.data.adapters.base import (
+    FIXED_EXPONENTS,
     InterleavedLogs,
     Normalized,
     Normalizer,
@@ -27,6 +28,7 @@ ADAPTERS: dict[str, type[VenueAdapter]] = {
 
 __all__ = [
     "ADAPTERS",
+    "FIXED_EXPONENTS",
     "CoinbaseAdapter",
     "InterleavedLogs",
     "KrakenAdapter",

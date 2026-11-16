@@ -11,13 +11,14 @@ passes, the suite fails on the unexpected pass, and the marker has to be
 removed in the same change. From then on the test is the finding's regression
 test.
 
-Fixed so far, and unmarked: R01, R02, R03 and R09 (the time model, ADR 0017),
-and R04, R05, R10 and R11 (loads and the normalizer's input, ADR 0018). The
-tests of R01 to R03 and R09 use the session's two cutoffs. Four tests could
-not keep their original shape: R03's and R09's because the fix makes the
-situation they set up impossible, R10's conflict test and R11's because the
-owner decided a behavior other than the one they required. Each says so
-where it stands.
+Every finding with a test here is fixed, and no test is marked: R01, R02, R03
+and R09 (the time model, ADR 0017), R04, R05, R10 and R11 (loads and the
+normalizer's input, ADR 0018), and R06, R07 and R08 (ADR 0019). The tests of
+R01 to R03 and R09 use the session's two cutoffs. Four tests could not keep
+their original shape: R03's and R09's because the fix makes the situation
+they set up impossible, R10's conflict test and R11's because the owner
+decided a behavior other than the one they required. Each says so where it
+stands. R10's also states its price at the fixed exponent of ADR 0019.
 
 If the owner decides a behavior is intended, the test is replaced by one that
 pins the decision, in the same change as the ADR that records it. Do not
@@ -395,15 +396,16 @@ def test_r05_a_value_that_does_not_fit_the_schema_is_a_reject_not_a_crash(tmp_pa
     assert len(report.rejects) == 1
 
 
-# --- R06: instrument metadata cannot be relied on to interpret a row --------------------
+# --- R06: instrument metadata can be relied on to interpret a row (fixed, ADR 0019) ------
 #
 # ADR 0005: "readers rescale using the metadata in force at each row's time",
 # and "exp is the finest decimal precision the venue supports for the
-# instrument, not the current tick size".
+# instrument, not the current tick size". The owner decided (ADR 0019) that
+# each instrument has one fixed exponent, independent of its tick size, and
+# that a log's metadata version is in effect from the session's first row.
 
 
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
-@pytest.mark.xfail(strict=True, reason="R06")
 def test_r06_a_metadata_version_is_in_effect_for_every_row_of_its_session(loaded, venue):
     with PITSession(loaded, available_at=INT64_MAX) as session:
         levels = session.book_events(venue, INSTRUMENT, *ALL).to_pylist()
@@ -417,7 +419,6 @@ def test_r06_a_metadata_version_is_in_effect_for_every_row_of_its_session(loaded
     assert meta is not None
 
 
-@pytest.mark.xfail(strict=True, reason="R06")
 def test_r06_a_coinbase_tick_size_change_does_not_rescale_prices():
     def price_exp(price_increment):
         rows = normalize(coinbase(price_increment=price_increment)).rows
@@ -429,13 +430,12 @@ def test_r06_a_coinbase_tick_size_change_does_not_rescale_prices():
     assert price_exp("0.01") == price_exp("0.1")
 
 
-# --- R07: the finding limit can hide an ERROR behind INFO findings -----------------------
+# --- R07: the finding limit never hides an ERROR (fixed, ADR 0019) --------------------------
 #
 # ADR 0016 fixed this for repeated trades only ("would fill the limit with
 # INFO findings and hide any later ERROR in the same check").
 
 
-@pytest.mark.xfail(strict=True, reason="R07")
 def test_r07_information_findings_never_crowd_out_an_error(tmp_path):
     rows = [stream_event(0, StreamEventKind.SESSION_START, T0)]
     rows += [comparison(seq, T0 + seq, "explained", unverified=1) for seq in (1, 2, 3)]
@@ -450,7 +450,6 @@ def test_r07_information_findings_never_crowd_out_an_error(tmp_path):
     assert Severity.ERROR in {f.severity for f in result.findings}
 
 
-@pytest.mark.xfail(strict=True, reason="R07")
 def test_r07_the_report_fails_when_an_error_was_cut_off_by_the_limit(tmp_path, capsys):
     rows = [stream_event(0, StreamEventKind.SESSION_START, T0)]
     rows += [comparison(seq, T0 + seq, "explained", unverified=1) for seq in (1, 2, 3)]
@@ -465,10 +464,9 @@ def test_r07_the_report_fails_when_an_error_was_cut_off_by_the_limit(tmp_path, c
     assert status == 1
 
 
-# --- R08: a session's clock error is reported only where the session started -------------
+# --- R08: a session's clock error is reported on every day it spans (fixed, ADR 0019) ----
 
 
-@pytest.mark.xfail(strict=True, reason="R08")
 def test_r08_a_bad_recording_clock_is_reported_for_every_day_the_session_covers(tmp_path):
     midnight = (T0 // DAY + 1) * DAY
     start = midnight - 60 * NS  # the session begins at 23:59 and records into the next day
@@ -653,7 +651,9 @@ def test_r10_a_conflicting_repeat_shows_the_first_observation_whatever_the_clock
         (trade,) = session.trades("kraken", INSTRUMENT, *ALL).to_pylist()
     # The last two cases failed with (4, 1010): the two rows shared a batch, and
     # the view broke the tie on event_ts and then recv_ts, not on replay order.
-    assert (trade["seq"], trade["price"]) == (3, 1000)
+    # (Prices were then at Kraken's one decimal; since ADR 0019 every BTC-USD
+    # price is at eight, so 100.0 is 10_000_000_000.)
+    assert (trade["seq"], trade["price"]) == (3, 10_000_000_000)
 
 
 # --- R11: one normalizer fed two logs in arrival order mixed them up (fixed, ADR 0018) ---

@@ -1,6 +1,6 @@
 # 0017: The time model: two cutoffs, committed batches, receipt-time windows
 
-Status: Accepted (owner decision, 2026-11-15; implementation choices confirmed by the owner 2026-11-15, see "Review"), amended by 0018
+Status: Accepted (owner decision, 2026-11-15; implementation choices confirmed by the owner 2026-11-15, see "Review"), amended by 0018; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-15
 Amends: 0006, 0008, 0011, 0015
 

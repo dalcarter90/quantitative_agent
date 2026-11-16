@@ -1,6 +1,6 @@
 # 0005: int64 mantissa with per-instrument exponent; int64 nanosecond timestamps
 
-Status: Accepted (by the owner, as proposed), amended by 0008, 0011 and 0012
+Status: Accepted (by the owner, as proposed), amended by 0008, 0011, 0012 and 0019; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-10
 
 ## Context

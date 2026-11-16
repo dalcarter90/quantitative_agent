@@ -37,6 +37,7 @@ before making it.
 | 3d | Keep the first observation of a repeated trade (ADR 0016) | Done |
 | 3e | The time model: two cutoffs, committed batches, receipt-time windows (ADR 0017) | Done |
 | 3f | Loads, one observation per trade, refused input (ADR 0018) | Done |
+| 3g | Fixed exponents, per-severity limits, the data core spec (ADR 0019) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -1384,8 +1385,8 @@ findings R04, R05, R10 and R11 (ADR 0018).
       private (`_batch`, `_append`) and test-only, and a test asserts the
       store's public surface is the load API only.
 - [x] ADR 0018's Review items marked decided by the owner.
-- [ ] **Next PR:** trade conflicts between logs loaded in separate runs (ADR
-      0018, Review item 7, deferred by the owner).
+- [x] **Next PR:** trade conflicts between logs loaded in separate runs (ADR
+      0018, Review item 7, deferred by the owner). *(Done in Phase 3g, ADR 0019.)*
 
 **What was built:**
 
@@ -1504,9 +1505,138 @@ findings R04, R05, R10 and R11 (ADR 0018).
   from merged logs, not one normalizer; nothing in the repository feeds a
   normalizer merged records.
 - **The store grows with every reload.** There is no compaction.
-- **Still open from the review:** R06, R07, R08, the design findings D1 to D7
-  and the test findings T1 to T3. D1 to D3 should be settled before code is
+- **Still open from the review:** ~~R06, R07, R08,~~ the design findings D1 to D7
+  and the test findings ~~T1, T2,~~ T3. *(R06 to R08, T1 and T2 settled in Phase
+  3g, ADR 0019.)* D1 to D3 should be settled before code is
   written against `MarketEvent` in Phase 4.
+
+### Phase 3g: Fixed exponents, per-severity limits, the data core spec (done)
+
+Added by the owner after Phase 3f, before Phase 4. It fixes the review's
+findings R06, R07 and R08, the deferred ADR 0018 Review item 7, the three
+surviving mutations (T1, T2) and the open document disagreements (X), and
+consolidates the data core's ADRs into one specification (ADR 0019).
+
+- [x] R06: each instrument has one fixed price exponent, independent of tick
+      size and generous enough for any tick it may have; a tick-size change
+      never changes the representation. The recorder fetches instrument
+      metadata before subscribing, so a version is in effect from a session's
+      first row.
+- [x] Owner decisions while building (2026-11-16): the venue's precision is
+      stored (`instruments` schema version 4); BTC-USD is exponent 8 for price
+      and quantity on both venues, the quantity exponent fixed the same way;
+      the exponents are an explicit table, and an unlisted instrument's
+      metadata is refused.
+- [x] R07: findings are limited per severity, an ERROR is never dropped behind
+      INFO or WARNING findings, and a truncated report exits nonzero.
+- [x] R08: a session's clock error is reported on every day the session spans.
+- [x] A quality check for trade conflicts between logs loaded in separate runs.
+- [x] The three surviving mutations from the review get tests that catch them.
+- [x] Every open document/code disagreement the review lists is fixed.
+- [x] `docs/data-core-spec.md` written; ADRs 0005 and 0008 to 0018 marked
+      superseded by it, 0006 in part.
+- [x] The R06, R07 and R08 review tests pass with their `xfail` markers
+      removed; no test is marked any more.
+- [x] `data/normalized` rebuilt and compared with the previous store.
+
+**What was built:**
+
+- `adapters/base.py`: `FIXED_EXPONENTS`; `VenueAdapter.metadata` (every
+  `instruments` row, at the fixed exponents, refusing `no_fixed_exponent` and
+  `precision_exceeds_exponent`); `price` and `qty`, which convert at the
+  venue's precision and scale to the exponent, so a price finer than the venue
+  quotes is still malformed. Kraken's checksum divides by
+  `10 ** (exponent - precision)`.
+- `schema.py`: `instruments` version 4 with `price_precision` and
+  `qty_precision`; `Dataset.at_most` (a precision is never above its exponent),
+  checked by `check_row` and `table_from_rows` alike.
+- `recorder.py` (version 4): `VenueSpec.metadata_requests` and `is_metadata`;
+  Kraken's book and trade subscriptions wait for the instrument snapshot, 20 s
+  without it is a reconnect.
+- `session.py`: `instrument` takes a log's first version as in effect from the
+  log's first row; `instrument_for` (the version a row was written with);
+  `trade_observations` (every observation with its trade's first; no SQL
+  view); `InstrumentMeta` names its record and precisions; `sql` refuses two
+  result columns of one name with a clear message.
+- `quality.py`: limits per severity (`CheckResult.cut`), the outlier book
+  query split by severity, a truncated report exits 1; `recording_clock`
+  finds sessions by the logs of the rows in the range; `stream_integrity`
+  knows whether a log was connected before the range; `check_trade_observations`.
+- `book.py`: `BookMessage` carries the metadata in force
+  (`messages_from_table(table, instruments)`); Kraken verification uses it
+  and refuses to run without it.
+- C++: `InstrumentId` constructible only from unsigned integers of at most 32
+  bits (X13).
+- `docs/data-core-spec.md` (new), `docs/data-core.md` (now the guide), ADR 0019,
+  ADR statuses, architecture sections 3.2 and 6.1, CLAUDE.md, `README.md`, the
+  package docstring.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,526 Python tests, no
+  expected failures left (1,421 and 6 before this phase).
+- Tests written before the code, each seen failing first for its reason:
+  `test_instruments.py` (fixed exponents and precisions, a Kraken precision
+  change mid-session with its checksum, refused metadata, the schema, both
+  lookups on the fixtures and on two sessions where the second resends history,
+  the reference book given and denied the metadata); `test_trade_observations.py`
+  (conflicts between logs in each field, identical repeats, load order, the
+  range and `available_at`, conflicts within a log, a reload, the typed method,
+  the report); `test_read_paths.py` (T2); in `test_recorder.py`, the stamp
+  timing (T1), Kraken's metadata first and the reconnect without it; in
+  `test_quality.py`, limits per severity, the outlier queries, a truncated
+  report, a session spanning midnight, a day with only market data, two
+  sessions in one log, and reconnects across days; in `test_session_sql.py`,
+  two columns of one name. The R06, R07 and R08 review tests pass unmarked,
+  unchanged apart from their markers.
+- **The three review mutations** applied to the real source: a recorder that
+  stamps before the wait, a new `quantagent/data/leak.py` reading the store with
+  `pq.ParquetDataset`, and `book.py` doing the same. Each now fails a test.
+- **Breakage pass:** 30 deliberate breakages of the new code (ten in the
+  quality checks, eight in the session, six in the adapters, two in the
+  reference book, two in the schema, two in the recorder). The first run caught
+  28. The survivors (the outlier check's ERROR query limited by the WARNING
+  room; a session of a log with no rows in the range) got tests, and then both
+  were caught.
+- **Golden files regenerated** from the fixtures with the command line: the
+  same 13,782 and 2,702 rows, every `log_id`, `seq`, `recv_ts` and quantity
+  unchanged, and every price exactly the old one times 10^7 (Kraken) or 10^6
+  (Coinbase), compared column by column. `book verify` passed on both.
+- `data/normalized` rebuilt from the two one-hour logs (the old store is kept
+  as `data/normalized-before-adr0019`; it is refused with the rebuild message
+  and `quality` exits 2 on it). Compared with the old store read by main's
+  code (`data/store-facts-before-adr0019/`): the same row counts in all four
+  datasets on both venues (319,421 / 4,569 / 2 / 35 and 871,546 / 18,372 / 1 /
+  35), the same receipt-time ranges, logs and stream event kinds, the same
+  quantity sums, every price sum exactly the old one times 10^7 or 10^6, the
+  same 6 of 6 check snapshots exact on each venue, never crossed, 23 files.
+  The instruments rows are at exponent 8 with Kraken's precision 1 and
+  Coinbase's 2. The quality report is the same apart from the version it names
+  and the new `trade_observations` check, which finds nothing (each hour is one
+  log). No reject on either load.
+- R06 on the hour: 182 Kraken and 38,814 Coinbase market rows carry venue times
+  before their session's metadata was received; `instrument(at=)` at the
+  earliest returns the session's version (128 ms and 192 ms on this store, as
+  it reads all four views); `instrument_for` takes 6 ms.
+- Loading took 15.8 s and 28.6 s (14.9 s and 28.3 s in Phase 3f).
+- Not verified: the recorder against the venues (the `network` tests were not
+  run), so Kraken's live instrument snapshot arriving before the book and
+  trade subscriptions is tested only with scripted sockets.
+
+**Notes for the next phases:**
+
+- **Phase 4:** the golden files' prices are at exponent 8. The C++
+  `InstrumentMeta` has no precisions, and the C++ book needs them to verify
+  Kraken's checksum (digits are the mantissa divided by
+  `10 ** (price_exp - price_precision)`); the Python converter Phase 4 writes
+  must carry them.
+- **A new instrument** needs an entry in `adapters.FIXED_EXPONENTS` before its
+  logs load; recording it first is fine.
+- **ADR 0019's "Review" section** lists twelve choices made while building
+  this, for the owner.
+- **Still open from the review:** D1 to D7 (D1 to D3 before Phase 4's code
+  against `MarketEvent`), T3, and the minor notes other than the
+  duplicate-column one.
 
 ### Phase 4: C++ order book, verified
 

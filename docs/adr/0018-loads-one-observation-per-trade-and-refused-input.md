@@ -1,6 +1,6 @@
 # 0018: Loads, one observation per trade, and what the normalizer refuses
 
-Status: Accepted (owner decision, 2026-11-15; implementation choices decided by the owner 2026-11-16, see "Review")
+Status: Accepted (owner decision, 2026-11-15; implementation choices decided by the owner 2026-11-16, see "Review"), amended by 0019 (its Review item 7); superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-15
 Amends: 0006, 0009, 0010, 0013, 0015, 0016, 0017
 

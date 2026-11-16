@@ -1,6 +1,6 @@
 # 0015: Schema versions are checked, conflicting trades are errors, uncompared sessions are warnings
 
-Status: Accepted (owner decision, 2026-11-13), amended by 0016, 0017 and 0018
+Status: Accepted (owner decision, 2026-11-13), amended by 0016, 0017, 0018 and 0019; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-13
 Amends: 0006, 0010, 0013, 0014
 

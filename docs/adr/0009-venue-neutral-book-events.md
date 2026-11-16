@@ -1,6 +1,6 @@
 # 0009: Venue-neutral book events, with Kraken as the second venue
 
-Status: Accepted (confirmed by the owner as written, 2026-11-11), amended by 0010, 0013, 0014 and 0018
+Status: Accepted (confirmed by the owner as written, 2026-11-11), amended by 0010, 0013, 0014 and 0018; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-11
 Amends: 0006
 

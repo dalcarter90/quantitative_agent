@@ -96,6 +96,8 @@ def _row(dataset_name: str, key: int, recv_ts: int, event_ts: int, value: int) -
         "event_ts": EVENT_TIMES[key % len(EVENT_TIMES)],
         "price_exp": 2,
         "qty_exp": 2,
+        "price_precision": 2,
+        "qty_precision": 2,
         "tick_size": value,
         "lot_size": 1,
     }
@@ -247,20 +249,48 @@ def _check_session(session, expected, available_at, version, committed, window):
             assert allowed(got)
             assert _canonical(got) == _canonical(_plain(versions))
 
+            # By time (ADR 0019): a log's first version is in effect from the
+            # log's first row the session shows, in any view; a later version
+            # of a log from its own event_ts. The latest to take effect wins,
+            # then the later in (log_id, seq) order.
+            first_row: dict[str, int] = {}
+            for (_, v, i, _), row in expected.items():
+                if (v, i) == (venue, instrument):
+                    first_row[row["log_id"]] = min(first_row.get(row["log_id"], row["event_ts"]),
+                                                   row["event_ts"])  # fmt: skip
+            first_seq: dict[str, int] = {}
+            for r in versions:
+                first_seq[r["log_id"]] = min(first_seq.get(r["log_id"], r["seq"]), r["seq"])
+
+            def takes_effect(r, first_seq=first_seq, first_row=first_row):
+                if r["seq"] != first_seq[r["log_id"]]:
+                    return r["event_ts"]
+                return min(r["event_ts"], first_row[r["log_id"]])
+
             for at in (*EVENT_TIMES, EVENT_TIMES[0] - 1, None):
                 meta = session.instrument(venue, instrument, at=at)
                 effective = available_at if at is None else at
-                in_effect = [r for r in versions if r["event_ts"] <= effective]
+                in_effect = [r for r in versions if takes_effect(r) <= effective]
                 if not in_effect:
                     assert meta is None
                     continue
-                best = max(in_effect, key=lambda r: r["event_ts"])
+                best = max(in_effect, key=lambda r: (takes_effect(r), r["log_id"], r["seq"]))
                 assert meta.knowledge_ts <= version and meta.recv_ts <= available_at
-                assert (meta.event_ts, meta.tick_size, meta.knowledge_ts) == (
-                    best["event_ts"],
-                    best["tick_size"],
-                    best["knowledge_ts"],
-                )
+                assert (meta.event_ts, meta.tick_size, meta.knowledge_ts, meta.log_id,
+                        meta.seq) == (best["event_ts"], best["tick_size"], best["knowledge_ts"],
+                                      best["log_id"], best["seq"])  # fmt: skip
+
+            # By record: the latest version of the same log at or before a record.
+            for r in versions:
+                for seq in {r["seq"], max(r["seq"] - 1, 0), r["seq"] + 1}:
+                    meta = session.instrument_for(venue, instrument, log_id=r["log_id"], seq=seq)
+                    of_log = [v for v in versions if v["log_id"] == r["log_id"] and v["seq"] <= seq]
+                    if not of_log:
+                        assert meta is None
+                        continue
+                    best = max(of_log, key=lambda v: v["seq"])
+                    assert (meta.seq, meta.tick_size, meta.knowledge_ts) == (
+                        best["seq"], best["tick_size"], best["knowledge_ts"])  # fmt: skip
 
     # SQL over every view.
     for name in DATASETS:

@@ -174,6 +174,16 @@ def test_an_invalid_but_allowed_query_is_a_query_error(session):
         session.sql("SELECT CAST(trade_id AS BIGINT) FROM trades")
 
 
+def test_two_result_columns_of_one_name_are_refused_with_a_clear_message(session):
+    """The review's minor note (X): this failed with a binder error naming
+    json_execute_serialized_sql, the session's internal call."""
+    with pytest.raises(QueryError, match=r'two columns named "venue".*AS') as raised:
+        session.sql("SELECT * FROM trades a, trades b")
+    assert "json_execute_serialized_sql" not in str(raised.value)
+    renamed = session.sql("SELECT a.price, b.price AS other_price FROM trades a, trades b")
+    assert renamed.schema.names == ["price", "other_price"]
+
+
 # --- what is rejected ----------------------------------------------------------
 
 DDL_AND_DML = [

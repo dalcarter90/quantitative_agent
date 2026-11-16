@@ -5,8 +5,10 @@ signal and risk layers, and an LLM research/monitoring agent.
 
 Paper trading is the default everywhere. Live trading requires explicit opt-in.
 
-**Status:** skeleton and design only (roadmap Phase 0). No trading components
-are implemented yet.
+**Status:** the data core (capture, the append-only store, the point-in-time
+session, quality checks), the reference order book and the C++ core types are
+built (roadmap Part A and Phase 3, with Phases 3a to 3g). No trading components
+are implemented yet. The roadmap's status table is the current list.
 
 ## Documentation
 

@@ -64,6 +64,20 @@ static_assert(std::is_trivially_copyable_v<Qty> && sizeof(Qty) == 8);
 static_assert(std::is_trivially_copyable_v<Timestamp> && sizeof(Timestamp) == 8);
 static_assert(std::is_trivially_copyable_v<MonoTimestamp> && sizeof(MonoTimestamp) == 8);
 static_assert(std::is_trivially_copyable_v<InstrumentId> && sizeof(InstrumentId) == 4);
+
+// An instrument id is built only from an integer that fits without loss
+// (roadmap Phase 3; review, D7): before this, InstrumentId(int64_t{1} << 32)
+// silently became id 0.
+static_assert(std::is_constructible_v<InstrumentId, std::uint32_t>);
+static_assert(std::is_constructible_v<InstrumentId, std::uint16_t>);
+static_assert(std::is_constructible_v<InstrumentId, std::uint8_t>);
+static_assert(!std::is_constructible_v<InstrumentId, std::uint64_t>);
+static_assert(!std::is_constructible_v<InstrumentId, std::int64_t>);
+static_assert(!std::is_constructible_v<InstrumentId, std::int32_t>);
+static_assert(!std::is_constructible_v<InstrumentId, int>);
+static_assert(!std::is_constructible_v<InstrumentId, bool>);
+static_assert(!std::is_constructible_v<InstrumentId, double>);
+static_assert(!std::is_convertible_v<std::uint32_t, InstrumentId>);
 static_assert(std::is_trivially_copyable_v<InstrumentMeta>);
 
 // Side uses the same numbers as the Python schema.
@@ -93,8 +107,8 @@ TEST(Types, ComparisonsOrderByMantissa) {
 }
 
 TEST(Types, InstrumentIdAndMetadata) {
-  constexpr InstrumentMeta kraken{InstrumentId(7), 1, 8, Price(1), Qty(1)};
-  EXPECT_EQ(kraken.id, InstrumentId(7));
+  constexpr InstrumentMeta kraken{InstrumentId(7u), 1, 8, Price(1), Qty(1)};
+  EXPECT_EQ(kraken.id, InstrumentId(7u));
   EXPECT_EQ(kraken.id.value(), 7u);
   EXPECT_EQ(kraken.price_exp, 1);
   EXPECT_EQ(kraken.qty_exp, 8);

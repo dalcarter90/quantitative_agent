@@ -1,6 +1,6 @@
 # 0008: `event_ts` for messages without a venue timestamp
 
-Status: Accepted (owner decision), amended by 0012 and 0017
+Status: Accepted (owner decision), amended by 0012, 0013, 0017 and 0019; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-11
 Amends: 0005
 

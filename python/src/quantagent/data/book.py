@@ -18,7 +18,10 @@ Venue rules, as the venues document them:
   update carries a CRC32 of the ten best asks (ascending) then the ten best
   bids (descending), each level as its price digits then quantity digits with
   the decimal point and leading zeros removed. Kraken prints prices and
-  quantities at full precision, so those digits are the stored mantissas.
+  quantities at the pair's precision; the store holds them at the
+  instrument's fixed exponents (ADR 0019), so the digits are the stored
+  mantissas divided by ``10 ** (exponent - precision)``, with the metadata in
+  force for each message (``messages_from_table(table, instruments)``).
   There are no sequence numbers.
 - **Coinbase** (https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels):
   every message on a connection carries ``sequence_num``, one higher than the
@@ -194,11 +197,17 @@ class ReferenceBook:
         return bid is not None and ask is not None and bid[0] >= ask[0]
 
 
-def kraken_checksum(book: ReferenceBook) -> int:
-    """Kraken's book checksum; see the module docstring for the recipe."""
+def kraken_checksum(book: ReferenceBook, divisors: tuple[int, int] = (1, 1)) -> int:
+    """Kraken's book checksum; see the module docstring for the recipe.
+
+    ``divisors`` turn the book's mantissas into the digits Kraken prints:
+    ``10 ** (price_exp - price_precision)`` and the same for quantities.
+    """
+    price_divisor, qty_divisor = divisors
     asks = book.top(Side.SELL, KRAKEN_CHECKSUM_LEVELS)
     bids = book.top(Side.BUY, KRAKEN_CHECKSUM_LEVELS)
-    return zlib.crc32("".join(f"{price}{qty}" for price, qty in (*asks, *bids)).encode())
+    digits = "".join(f"{p // price_divisor}{q // qty_divisor}" for p, q in (*asks, *bids))
+    return zlib.crc32(digits.encode())
 
 
 # --- messages ---------------------------------------------------------------------------------
@@ -217,6 +226,12 @@ class BookMessage:
     checksum: int | None
     depth: int | None
     levels: tuple[Level, ...]
+    # The instrument metadata in force for this record (ADR 0019), if given to
+    # messages_from_table: the latest version of the same log at or before it.
+    price_exp: int | None = None
+    qty_exp: int | None = None
+    price_precision: int | None = None
+    qty_precision: int | None = None
 
     @property
     def key(self) -> tuple[str, int]:
@@ -229,19 +244,48 @@ class BookMessage:
 
 
 _HEADER = ("kind", "venue_seq_last", "checksum", "depth")
+_METADATA = ("price_exp", "qty_exp", "price_precision", "qty_precision")
 
 
-def messages_from_table(table: pa.Table) -> Iterator[BookMessage]:
+def _versions_by_log(instruments: pa.Table | None) -> dict[str, tuple[list[int], list[tuple]]]:
+    """Each log's metadata versions: their seqs in order, and the four numbers of each."""
+    found: dict[str, list[tuple[int, tuple]]] = {}
+    if instruments is not None:
+        columns = [instruments.column(n).to_pylist() for n in ("log_id", "seq", *_METADATA)]
+        for log_id, seq, *numbers in zip(*columns, strict=True):
+            found.setdefault(log_id, []).append((seq, tuple(numbers)))
+    by_log = {}
+    for log_id, versions in found.items():
+        versions.sort()
+        by_log[log_id] = ([seq for seq, _ in versions], [numbers for _, numbers in versions])
+    return by_log
+
+
+def messages_from_table(
+    table: pa.Table, instruments: pa.Table | None = None
+) -> Iterator[BookMessage]:
     """Group ``book_events`` rows (from ``PITSession.book_events``) into
-    messages, ordered by (log_id, seq), each with its levels in order."""
+    messages, ordered by (log_id, seq), each with its levels in order.
+
+    ``instruments`` is the instrument's metadata versions (from
+    ``PITSession.instruments``). Each message then carries the version in
+    force for its record: the latest of its own log at or before it. Replaying
+    Kraken with verification needs it, because Kraken's checksum is over the
+    digits Kraken prints, at its precision, not at the stored exponent.
+    """
     names = ("log_id", "seq", "recv_ts", "event_ts", *_HEADER, "level_index", "side", "price",
              "qty")  # fmt: skip
     columns = [table.column(name).to_pylist() for name in names]
     grouped: dict[tuple[str, int], list[tuple]] = {}
     for values in zip(*columns, strict=True):
         grouped.setdefault((values[0], values[1]), []).append(values)
+    versions = _versions_by_log(instruments)
+    none = (None,) * len(_METADATA)
 
     for (log_id, seq), rows in sorted(grouped.items()):
+        seqs, numbers = versions.get(log_id, ([], []))
+        found = bisect_right(seqs, seq) - 1
+        metadata = numbers[found] if found >= 0 else none
         rows.sort(key=lambda r: r[8])
         where = f"message (log {log_id}, seq {seq})"
         if [r[8] for r in rows] != list(range(len(rows))):
@@ -260,6 +304,7 @@ def messages_from_table(table: pa.Table) -> Iterator[BookMessage]:
             checksum=checksum,
             depth=depth,
             levels=tuple((Side(r[9]), r[10], r[11]) for r in rows),
+            **dict(zip(_METADATA, metadata, strict=True)),
         )
 
 
@@ -337,7 +382,16 @@ class _Replayer:
         if self.venue == "kraken":
             if message.checksum is None:
                 raise ValueError(f"Kraken message seq {message.seq} has no checksum to verify")
-            computed = kraken_checksum(self.book)
+            if message.price_precision is None or message.qty_precision is None:
+                raise ValueError(
+                    f"Kraken message (log {message.log_id}, seq {message.seq}) carries no "
+                    "instrument metadata: Kraken's checksum is over the digits it prints, at "
+                    "its price and quantity precision, so verifying it needs the version in "
+                    "force. Pass the session's instruments to messages_from_table (ADR 0019)."
+                )
+            divisors = (10 ** (message.price_exp - message.price_precision),
+                        10 ** (message.qty_exp - message.qty_precision))  # fmt: skip
+            computed = kraken_checksum(self.book, divisors)
             if computed != message.checksum:
                 raise ChecksumMismatch(message.at, message.checksum, computed, "computed")
         else:
@@ -603,7 +657,8 @@ def _load(args: argparse.Namespace) -> tuple[list[BookMessage], list[dict[str, A
     available_at = _INT64_MAX if args.available_at is None else args.available_at
     with PITSession(args.store, available_at=available_at, version=args.version) as session:
         table = session.book_events(args.venue, args.instrument, 0, _INT64_MAX)
-        messages = list(messages_from_table(table))
+        instruments = session.instruments(args.venue, args.instrument)
+        messages = list(messages_from_table(table, instruments))
         events = session.stream_events(args.venue, args.instrument, 0, _INT64_MAX).to_pylist()
     return messages, events
 

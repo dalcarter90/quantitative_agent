@@ -1,6 +1,6 @@
 # 0006: Raw binary log + Parquet/DuckDB normalized store
 
-Status: Accepted (by the owner, as proposed), amended by 0009, 0010, 0012, 0013, 0015, 0017 and 0018
+Status: Accepted (by the owner, as proposed), amended by 0009, 0010, 0012, 0013, 0015, 0017 and 0018; its raw-log and normalized-store tiers superseded by `docs/data-core-spec.md` (ADR 0019); its journal, experiment registry and audit log tiers stand
 Date: 2026-11-10
 
 ## Context

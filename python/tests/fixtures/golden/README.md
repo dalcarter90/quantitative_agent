@@ -28,8 +28,9 @@ the stream and have no row.
 Columns run rank by rank: `bid_price_00, bid_qty_00, ask_price_00,
 ask_qty_00, bid_price_01, ...`, 83 columns in all. A rank the book does not
 have is null on both price and quantity. Prices and quantities are int64
-mantissas at the instrument's `price_exp` and `qty_exp` (ADR 0005): Kraken
-BTC-USD is 1 and 8, Coinbase BTC-USD is 2 and 8. Rank 00 is the top of book.
+mantissas at the instrument's fixed `price_exp` and `qty_exp`
+(`docs/data-core-spec.md`, section 2): 8 and 8 for BTC-USD on both venues.
+Rank 00 is the top of book.
 
 Kraken books are the subscribed 25 levels, cut to depth after every message;
 Coinbase books are the full book. The file holds the top 20 of each.
@@ -39,6 +40,11 @@ Coinbase books are the full book. The file holds the top 20 of each.
 - ADR 0013 added the `log_id` column and moved `recv_ts` after `seq`. Every
   row, `seq`, `recv_ts` and level value is unchanged from the files it
   replaced, checked column by column when they were regenerated.
+- ADR 0019 fixed each instrument's exponents. Prices were at Kraken's 1 and
+  Coinbase's 2 decimals, and are now at 8: every price is the old one times
+  10^7 (Kraken) or 10^6 (Coinbase). Every row, `log_id`, `seq`, `recv_ts` and
+  quantity is unchanged, and every price is exactly the old one scaled,
+  checked column by column when they were regenerated.
 
 ## Regenerating
 

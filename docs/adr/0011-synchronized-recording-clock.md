@@ -1,6 +1,6 @@
 # 0011: The recording clock must be synchronized, and is measured
 
-Status: Accepted (owner decision), amended by 0017
+Status: Accepted (owner decision), amended by 0017 and 0019; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-12
 Amends: 0005, 0010
 

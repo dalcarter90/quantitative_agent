@@ -42,7 +42,10 @@ from quantagent.data.rawlog import RawLogWriter
 
 # 2: the clock offset is measured and recorded (ADR 0011).
 # 3: every record has a monotonic stamp; the start names the counter (ADR 0012).
-RECORDER_VERSION = 3
+# 4: instrument metadata is in the log before any market data is asked for:
+#    Kraken's instrument snapshot is received before the book and trade
+#    subscriptions are sent (ADR 0019).
+RECORDER_VERSION = 4
 # How early the event loop's timer can fire before the session deadline.
 _TIMER_SLACK = 0.1
 CONTROL = "recorder"
@@ -84,6 +87,14 @@ class VenueSpec:
     probe_subscriptions: Callable[[str, int], list[dict]]
     rest: Callable[[str], list[tuple[str, str]]]  # (channel, url) fetched before connecting
     is_book_snapshot: Callable[[str], bool]
+    # Instrument metadata comes before any market data (ADR 0019). A venue
+    # whose metadata comes over the stream lists those requests first in
+    # ``subscriptions``: the first ``metadata_requests`` are sent on connecting,
+    # the rest only once a message ``is_metadata`` has been received and
+    # written. A venue whose metadata comes over REST, before connecting, has
+    # none.
+    metadata_requests: int = 0
+    is_metadata: Callable[[str], bool] | None = None
 
 
 def _kraken_book(symbol: str, depth: int) -> dict:
@@ -114,6 +125,12 @@ VENUES: dict[str, VenueSpec] = {
         probe_subscriptions=lambda symbol, depth: [_kraken_book(symbol, depth)],
         rest=lambda symbol: [],
         is_book_snapshot=lambda text: '"channel":"book"' in text and '"type":"snapshot"' in text,
+        # https://docs.kraken.com/api/docs/websocket-v2/instrument: the snapshot
+        # lists every pair, with its precisions and increments.
+        metadata_requests=1,
+        is_metadata=lambda text: (
+            '"channel":"instrument"' in text[:100] and '"type":"snapshot"' in text[:100]
+        ),
     ),
     # https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels
     # level2, market_trades and heartbeats are public; no JWT is required.
@@ -162,12 +179,19 @@ async def record(
     reconnect_delay: float = 2.0,
     measure_clock: Callable[[], ClockMeasurement] | None = None,
     allow_clock_offset: bool = False,
+    metadata_timeout: float = 20.0,
 ) -> Path:
     """Record for ``duration`` seconds and return the path of the sealed log.
 
     The clock is measured first. If it is more than ``MAX_OFFSET_NS`` off, or
     cannot be measured, nothing is contacted or written and ClockOffsetError
     is raised, unless ``allow_clock_offset`` is set.
+
+    Instrument metadata is in the log before any market data (ADR 0019):
+    fetched over REST before connecting, or, on a venue that sends it over the
+    stream, received before the market data subscriptions are sent. A stream
+    connection whose metadata has not arrived within ``metadata_timeout``
+    seconds is a failure, and is opened again.
     """
     measured = await asyncio.to_thread(measure_clock or measure_offset)
     within_limit = measured.within(MAX_OFFSET_NS)
@@ -187,11 +211,14 @@ async def record(
     def remaining() -> float:
         return deadline - time.monotonic()
 
-    async def open_and_subscribe(socket: Any, connection: str, requests: list[dict]) -> None:
-        control(event="connect", connection=connection, url=spec.url)
+    async def subscribe(socket: Any, connection: str, requests: list[dict]) -> None:
         for request in requests:
             await socket.send(json.dumps(request))
             control(event="subscribe", connection=connection, request=request)
+
+    async def open_and_subscribe(socket: Any, connection: str, requests: list[dict]) -> None:
+        control(event="connect", connection=connection, url=spec.url)
+        await subscribe(socket, connection, requests)
 
     async def stream() -> None:
         while remaining() > 0:
@@ -202,11 +229,23 @@ async def record(
             session_over = False
             try:
                 async with connect(spec.url, max_size=None) as socket:
-                    await open_and_subscribe(socket, STREAM, spec.subscriptions(symbol, depth))
+                    requests = spec.subscriptions(symbol, depth)
+                    split = spec.metadata_requests or len(requests)
+                    await open_and_subscribe(socket, STREAM, requests[:split])
+                    # Market data is asked for once the metadata is in (ADR 0019).
+                    pending = requests[split:]
+                    metadata_deadline = time.monotonic() + metadata_timeout
                     while remaining() > 0:
+                        wait = remaining()
+                        if pending:
+                            wait = min(wait, metadata_deadline - time.monotonic())
                         try:
-                            message = await asyncio.wait_for(socket.recv(), timeout=remaining())
+                            message = await asyncio.wait_for(socket.recv(), timeout=max(wait, 0))
                         except TimeoutError:
+                            if pending and time.monotonic() >= metadata_deadline - _TIMER_SLACK:
+                                raise TimeoutError(
+                                    f"no instrument metadata within {metadata_timeout} s"
+                                ) from None
                             if remaining() > _TIMER_SLACK:
                                 raise  # not our deadline: a failure, so reconnect
                             session_over = True
@@ -216,6 +255,9 @@ async def record(
                         writer.write(
                             spec.name, STREAM, payload, recv_ts=received, recv_mono_ns=mono
                         )
+                        if pending and spec.is_metadata(payload.decode("utf-8", "replace")):
+                            await subscribe(socket, STREAM, pending)
+                            pending = []
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - any failure means reconnect
@@ -273,7 +315,8 @@ async def record(
             override=allow_clock_offset,
             servers=measured.to_json()["servers"],
         )
-        # Instrument metadata first, so it is known before any market data.
+        # Instrument metadata first, so it is known before any market data: a
+        # version is then in effect from the session's first row (ADR 0019).
         for channel, url in spec.rest(symbol):
             control(event="rest", channel=channel, url=url)
             body = await asyncio.to_thread(fetch, url)

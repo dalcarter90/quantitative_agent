@@ -176,9 +176,11 @@ def test_kraken_instrument_metadata_has_no_venue_timestamp_so_it_is_a_receipt_ro
             "event_ts_source": "receipt",
             "recv_ts": BASE + 1000,
             "seq": 1,
-            "price_exp": 1,
+            "price_exp": 8,  # fixed for BTC-USD, whatever the tick (ADR 0019)
             "qty_exp": 8,
-            "tick_size": 1,  # 0.1 at one decimal place
+            "price_precision": 1,  # Kraken prints BTC/USD prices with one decimal
+            "qty_precision": 8,
+            "tick_size": 10_000_000,  # 0.1 at eight decimal places
             "lot_size": 1,  # 0.00000001 at eight decimal places
         }
     ]
@@ -204,10 +206,22 @@ def test_kraken_book_snapshot_rows_are_exact():
         "depth": 10,
     }
     assert rows_of(normalized, BOOK_EVENTS, "kraken") == [
-        {**common, "level_index": 0, "side": Side.BUY, "price": 734685, "qty": 20416909},
-        {**common, "level_index": 1, "side": Side.BUY, "price": 734669, "qty": 340289101},
-        {**common, "level_index": 2, "side": Side.SELL, "price": 734686, "qty": 89472056},
-        {**common, "level_index": 3, "side": Side.SELL, "price": 734700, "qty": 208204},
+        {**common, "level_index": 0, "side": Side.BUY, "price": 7_346_850_000_000, "qty": 20416909},
+        {
+            **common,
+            "level_index": 1,
+            "side": Side.BUY,
+            "price": 7_346_690_000_000,
+            "qty": 340289101,
+        },
+        {
+            **common,
+            "level_index": 2,
+            "side": Side.SELL,
+            "price": 7_346_860_000_000,
+            "qty": 89472056,
+        },
+        {**common, "level_index": 3, "side": Side.SELL, "price": 7_347_000_000_000, "qty": 208204},
     ]
 
 
@@ -215,9 +229,9 @@ def test_kraken_book_update_keeps_message_order_removals_and_repeated_prices():
     normalized = kraken_session(KRAKEN_SNAPSHOT, KRAKEN_UPDATE)
     update = [r for r in rows_of(normalized, BOOK_EVENTS, "kraken") if r["seq"] == 4]
     assert [(r["level_index"], r["side"], r["price"], r["qty"]) for r in update] == [
-        (0, Side.BUY, 734669, 0),  # qty 0 removes the level
-        (1, Side.BUY, 734685, 20467952),
-        (2, Side.BUY, 734685, 6120),  # the same price again, later in the message
+        (0, Side.BUY, 7_346_690_000_000, 0),  # qty 0 removes the level
+        (1, Side.BUY, 7_346_850_000_000, 20467952),
+        (2, Side.BUY, 7_346_850_000_000, 6120),  # the same price again, later in the message
     ]
     assert {r["kind"] for r in update} == {BookEventKind.DELTA}
     assert {r["checksum"] for r in update} == {1401313711}
@@ -235,7 +249,7 @@ def test_kraken_trades_use_the_taker_side_as_given():
             "recv_ts": BASE + 3000,
             "seq": 3,
             "trade_id": "115202912",
-            "price": 734697,
+            "price": 7_346_970_000_000,
             "qty": 51042,
             "side": Side.SELL,
         },
@@ -245,7 +259,7 @@ def test_kraken_trades_use_the_taker_side_as_given():
             "recv_ts": BASE + 3000,
             "seq": 3,
             "trade_id": "115202913",
-            "price": 734700,
+            "price": 7_347_000_000_000,
             "qty": 100000000,
             "side": Side.BUY,
         },
@@ -348,21 +362,26 @@ def test_coinbase_product_metadata_has_no_venue_timestamp_so_it_is_a_receipt_row
             "event_ts_source": "receipt",
             "recv_ts": BASE + 1000,
             "seq": 1,
-            "price_exp": 2,  # price_increment 0.01
-            "qty_exp": 8,  # base_increment 0.00000001
-            "tick_size": 1,
+            "price_exp": 8,  # fixed for BTC-USD, whatever the tick (ADR 0019)
+            "qty_exp": 8,
+            "price_precision": 2,  # price_increment 0.01
+            "qty_precision": 8,  # base_increment 0.00000001
+            "tick_size": 1_000_000,  # 0.01 at eight decimal places
             "lot_size": 1,
         }
     ]
 
 
-def test_coinbase_exponents_come_from_the_increments():
+def test_coinbase_increments_set_the_tick_and_the_precision_not_the_exponent():
+    # Until ADR 0019 the exponents were read off the increments: 0.050 gave
+    # price_exp 2. Now the exponents are fixed and the increments are what
+    # they are, validation rules (review, R06).
     product = COINBASE_PRODUCT[1].replace('"price_increment":"0.01"', '"price_increment":"0.050"')
     product = product.replace('"base_increment":"0.00000001"', '"base_increment":"1"')
     normalized = normalize(log("coinbase", COINBASE_START, ("rest:product", product)))
     (row,) = rows_of(normalized, INSTRUMENTS, "coinbase")
-    assert (row["price_exp"], row["tick_size"]) == (2, 5)
-    assert (row["qty_exp"], row["lot_size"]) == (0, 1)
+    assert (row["price_exp"], row["price_precision"], row["tick_size"]) == (8, 2, 5_000_000)
+    assert (row["qty_exp"], row["qty_precision"], row["lot_size"]) == (8, 0, 100_000_000)
 
 
 def test_coinbase_book_snapshot_and_update_rows_are_exact():
@@ -380,10 +399,22 @@ def test_coinbase_book_snapshot_and_update_rows_are_exact():
     update = {**base, "event_ts": update_time, "recv_ts": BASE + 6000, "seq": 6,
               "kind": BookEventKind.DELTA, "venue_seq_last": 3}  # fmt: skip
     assert rows_of(normalized, BOOK_EVENTS, "coinbase") == [
-        {**snapshot, "level_index": 0, "side": Side.BUY, "price": 7346965, "qty": 2208558},
-        {**snapshot, "level_index": 1, "side": Side.SELL, "price": 7346966, "qty": 75654522},
-        {**update, "level_index": 0, "side": Side.BUY, "price": 7346478, "qty": 0},
-        {**update, "level_index": 1, "side": Side.SELL, "price": 7347000, "qty": 70000},
+        {
+            **snapshot,
+            "level_index": 0,
+            "side": Side.BUY,
+            "price": 7_346_965_000_000,
+            "qty": 2208558,
+        },
+        {
+            **snapshot,
+            "level_index": 1,
+            "side": Side.SELL,
+            "price": 7_346_966_000_000,
+            "qty": 75654522,
+        },
+        {**update, "level_index": 0, "side": Side.BUY, "price": 7_346_478_000_000, "qty": 0},
+        {**update, "level_index": 1, "side": Side.SELL, "price": 7_347_000_000_000, "qty": 70000},
     ]
 
 
@@ -397,7 +428,7 @@ def test_coinbase_trade_side_is_the_makers_so_the_aggressor_is_the_opposite():
             "recv_ts": BASE + 5000,
             "seq": 5,
             "trade_id": "1118502354",
-            "price": 7346965,
+            "price": 7_346_965_000_000,
             "qty": 2129674,
             "side": Side.SELL,  # maker BUY
         },
@@ -407,7 +438,7 @@ def test_coinbase_trade_side_is_the_makers_so_the_aggressor_is_the_opposite():
             "recv_ts": BASE + 5000,
             "seq": 5,
             "trade_id": "1118502355",
-            "price": 7346684,
+            "price": 7_346_684_000_000,
             "qty": 7,
             "side": Side.BUY,  # maker SELL
         },
@@ -539,6 +570,8 @@ KRAKEN_BAD = {
         b'"qty":NaN,"trade_id":1,"timestamp":"2026-11-11T03:06:47Z"}]}',
         b'{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":1.0,'
         b'"qty":99999999999999.0,"trade_id":1,"timestamp":"2026-11-11T03:06:47Z"}]}',
+    ],
+    "precision_exceeds_exponent": [
         b'{"channel":"instrument","type":"snapshot","data":{"pairs":[{"symbol":"BTC/USD",'
         b'"price_precision":40,"qty_precision":8,"price_increment":0.1,"qty_increment":0.1}]}}',
     ],

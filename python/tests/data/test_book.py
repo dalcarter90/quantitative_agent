@@ -40,7 +40,7 @@ from quantagent.data.book import (
     verify_check_snapshots,
 )
 from quantagent.data.rawlog import read_raw_log
-from quantagent.data.schema import BOOK_EVENTS, BookEventKind, Side, StreamEventKind
+from quantagent.data.schema import BOOK_EVENTS, INSTRUMENTS, BookEventKind, Side, StreamEventKind
 from quantagent.data.schema import table_from_rows as build
 from quantagent.data.session import PITSession
 from quantagent.data.store import AppendOnlyStore
@@ -54,7 +54,12 @@ FOLLOW = object()  # default venue sequence number: increasing with seq
 
 
 def msg(seq, kind, *levels, venue_seq=FOLLOW, checksum=None, depth=None, event_ts=None):
-    """A book message. Coinbase-style sequence numbers follow ``seq`` unless given."""
+    """A book message. Coinbase-style sequence numbers follow ``seq`` unless given.
+
+    Its mantissas are the digits the venue prints: exponents and precisions are
+    0, as the metadata in force says (ADR 0019), so Kraken's checksum is over
+    the mantissas themselves.
+    """
     return BookMessage(
         log_id=LOG,
         recv_ts=1_000 + seq,
@@ -65,6 +70,10 @@ def msg(seq, kind, *levels, venue_seq=FOLLOW, checksum=None, depth=None, event_t
         checksum=checksum,
         depth=depth,
         levels=tuple(levels),
+        price_exp=0,
+        qty_exp=0,
+        price_precision=0,
+        qty_precision=0,
     )
 
 
@@ -396,7 +405,8 @@ def from_records(records, venue):
     normalized = normalize(records)
     rows = normalized.rows[("book_events", venue, INSTRUMENT)]
     events = normalized.rows.get(("stream_events", venue, INSTRUMENT), [])
-    return list(messages_from_table(build(BOOK_EVENTS, rows))), events
+    instruments = build(INSTRUMENTS, normalized.rows[("instruments", venue, INSTRUMENT)])
+    return list(messages_from_table(build(BOOK_EVENTS, rows), instruments)), events
 
 
 @pytest.fixture(scope="module", params=["kraken", "coinbase"])
@@ -723,7 +733,8 @@ def test_the_store_read_gives_the_same_messages_as_normalizing_directly(tmp_path
     ingest(fixture_path("kraken"), AppendOnlyStore(tmp_path / "store"))
     direct, _ = from_records(kraken_records(), "kraken")
     with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
-        stored = list(messages_from_table(session.book_events("kraken", INSTRUMENT, 0, INT64_MAX)))
+        table = session.book_events("kraken", INSTRUMENT, 0, INT64_MAX)
+        stored = list(messages_from_table(table, session.instruments("kraken", INSTRUMENT)))
     assert stored == direct
 
 
@@ -747,7 +758,8 @@ def test_the_one_hour_recordings_match_every_check_snapshot(venue, tmp_path):
     (path,) = sorted((RECORDINGS / venue / INSTRUMENT).glob("*.qaraw.zst"))
     ingest(path, AppendOnlyStore(tmp_path / "store"))
     with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
-        messages = list(messages_from_table(session.book_events(venue, INSTRUMENT, 0, INT64_MAX)))
+        table = session.book_events(venue, INSTRUMENT, 0, INT64_MAX)
+        messages = list(messages_from_table(table, session.instruments(venue, INSTRUMENT)))
         events = session.stream_events(venue, INSTRUMENT, 0, INT64_MAX).to_pylist()
     results = verify_check_snapshots(venue, messages, events)
     assert len(results) == 6

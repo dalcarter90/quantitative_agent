@@ -465,7 +465,8 @@ def test_instrument_in_effect_is_the_latest_known_version_at_or_before_the_time(
 def announced(effective, tick_size, seq):
     """A metadata version received at time 500, before it takes effect."""
     row = {"event_ts": effective, "event_ts_source": "venue", "recv_ts": 500, "log_id": LOG,
-           "seq": seq, "price_exp": 2, "qty_exp": 5, "tick_size": tick_size,
+           "seq": seq, "price_exp": 2, "qty_exp": 5, "price_precision": 2, "qty_precision": 5,
+           "tick_size": tick_size,
            "lot_size": 1}  # fmt: skip
     return table_from_rows(INSTRUMENTS, [row])
 
@@ -591,6 +592,8 @@ def test_public_surface_is_exactly_the_query_methods(history):
         "stream_events",
         "instruments",
         "instrument",
+        "instrument_for",  # ADR 0019
+        "trade_observations",  # ADR 0019
         "sql",
         "close",
     }

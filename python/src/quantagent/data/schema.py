@@ -133,6 +133,8 @@ class Dataset:
     allowed: Mapping[str, frozenset[int] | frozenset[str]] = field(default_factory=dict)
     bounds: Mapping[str, tuple[int | None, int | None]] = field(default_factory=dict)
     one_row_per: tuple[str, ...] = ()
+    # Column -> the column of the same row it may not exceed.
+    at_most: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def stored_schema(self) -> pa.Schema:
@@ -234,17 +236,24 @@ BOOK_EVENTS = Dataset(
 )
 
 # One row per version of an instrument's metadata, observed in one raw record.
-# ``event_ts`` is when the version takes effect. The key is the observation, not
-# event_ts: for metadata without a venue timestamp event_ts is the receipt
-# time, and no key depends on recv_ts (ADR 0013).
+# The key is the observation, not event_ts: for metadata without a venue
+# timestamp event_ts is the receipt time, and no key depends on recv_ts (ADR
+# 0013). A version is in effect for the rows of its log that follow it.
+#
+# price_exp and qty_exp are the instrument's representation: fixed per
+# instrument, whatever its tick and lot sizes (ADR 0019). price_precision and
+# qty_precision are the decimals the venue itself uses, which can change; they
+# are never finer than the exponents (Kraken's checksum is over those digits).
 INSTRUMENTS = Dataset(
     name="instruments",
-    version=3,
+    version=4,
     schema=pa.schema(
         [
             *_HEADER,
             _required("price_exp", pa.int8()),
             _required("qty_exp", pa.int8()),
+            _required("price_precision", pa.int8()),
+            _required("qty_precision", pa.int8()),
             _required("tick_size", pa.int64()),  # mantissa at price_exp
             _required("lot_size", pa.int64()),  # mantissa at qty_exp
         ]
@@ -255,9 +264,12 @@ INSTRUMENTS = Dataset(
         **_TIMESTAMP_BOUNDS,
         "price_exp": (0, MAX_EXP),
         "qty_exp": (0, MAX_EXP),
+        "price_precision": (0, MAX_EXP),
+        "qty_precision": (0, MAX_EXP),
         "tick_size": (1, None),
         "lot_size": (1, None),
     },
+    at_most={"price_precision": "price_exp", "qty_precision": "qty_exp"},
 )
 
 # Integrity events for every venue, one row per event. Each refers to the raw
@@ -386,6 +398,11 @@ def check_row(dataset: Dataset, row: Mapping[str, Any]) -> None:
             raise SchemaError(f"{where}: expected str, got {type(value).__name__} {value!r}")
         if rule.allowed is not None and value not in rule.allowed:
             raise SchemaError(f"{where}: value not in {sorted(rule.allowed)}")
+    for name, limit in dataset.at_most.items():
+        if row[name] > row[limit]:
+            raise SchemaError(
+                f"{dataset.name}.{name}: {row[name]} is above its {limit}, {row[limit]}"
+            )
     if not _LOG_ID.fullmatch(row["log_id"]):
         raise SchemaError(f"{dataset.name}.log_id: {row['log_id']!r} is not a log id")
     if row["event_ts_source"] == EVENT_TS_RECEIPT and row["event_ts"] != row["recv_ts"]:
@@ -467,6 +484,15 @@ def validate_table(dataset: Dataset, table: pa.Table) -> None:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['min']} is below {low}")
         if high is not None and extremes["max"] > high:
             raise SchemaError(f"{dataset.name}.{name}: {extremes['max']} is above {high}")
+
+    for name, limit in dataset.at_most.items():
+        above = pc.greater(table.column(name), table.column(limit))
+        if pc.any(above).as_py():
+            index = above.to_pylist().index(True)
+            raise SchemaError(
+                f"{dataset.name}.{name}: {table.column(name)[index].as_py()} is above its "
+                f"{limit}, {table.column(limit)[index].as_py()}"
+            )
 
     # ADR 0013: every row names a well-formed raw log.
     log_ids = table.column("log_id")
