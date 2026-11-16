@@ -589,7 +589,7 @@ def test_stream_events_go_through_the_store_and_come_back_through_pitsession(ven
     assert report.rows["stream_events"] == len(expected)
     assert (tmp_path / "store" / "stream_events" / f"venue={venue}").is_dir()
 
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         table = session.stream_events(venue, INSTRUMENT, 0, INT64_MAX)
         assert table.schema.equals(STREAM_EVENTS.stored_schema)
         got = [{k: v for k, v in r.items() if k != "knowledge_ts"} for r in table.to_pylist()]
@@ -603,7 +603,8 @@ def test_stream_events_go_through_the_store_and_come_back_through_pitsession(ven
         assert {K(r["kind"]).name: r["n"] for r in counted} == report.events
 
     knowledge_times = {int(p.name[5:25]) for p in (tmp_path / "store").rglob("*.parquet")}
-    with PITSession(tmp_path / "store", as_of=min(knowledge_times) - 1) as before:
+    earlier = min(knowledge_times) - 1
+    with PITSession(tmp_path / "store", available_at=INT64_MAX, version=earlier) as before:
         assert before.stream_events(venue, INSTRUMENT, 0, INT64_MAX).num_rows == 0
 
 

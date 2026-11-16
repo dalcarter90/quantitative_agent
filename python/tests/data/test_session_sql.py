@@ -1,35 +1,37 @@
-"""PITSession.sql: one SELECT over the as-of views, and nothing else.
+"""PITSession.sql: one SELECT over the session's filtered views, and nothing else.
 
 Every rejection below must come from the statement validator (QueryRejected),
 not from the query happening to fail later. A second group of tests then
 shows that the database engine itself refuses the same things, so a validator
 bug alone could not expose future data.
 
-See conftest.py for the timeline of the ``history`` store. Sessions here are
-opened at as_of=4000, so the files written at 5000 and later are "the future".
+See conftest.py for the timeline of the ``history`` store. Sessions here read
+everything received (available_at is the end of time) at version 4000, so the
+batches committed at 5000 and later are "the future". The second cutoff has
+its own engine tests at the end of this file.
 """
 
 import duckdb
 import pyarrow as pa
 import pytest
-from _builders import T0
+from _builders import INT64_MAX, LAG, NS_PER_SECOND, T0
 
 from quantagent.data.session import PITSession, QueryError, QueryRejected
 
-AS_OF = 4000
+VERSION = 4000
 
 
 @pytest.fixture
 def session(history):
-    with PITSession(history.root, as_of=AS_OF) as s:
+    with PITSession(history.root, available_at=INT64_MAX, version=VERSION) as s:
         yield s
 
 
 @pytest.fixture
 def paths(history):
     return {
-        "future": history.file(9000),  # knowledge_ts after AS_OF
-        "past": history.file(2000),  # knowledge_ts before AS_OF
+        "future": history.file(9000),  # knowledge_ts after VERSION
+        "past": history.file(2000),  # knowledge_ts before VERSION
         "root": history.root.as_posix(),
     }
 
@@ -69,25 +71,26 @@ def test_views_have_partition_columns_and_stored_columns(session):
 
 
 def test_views_show_the_latest_known_version_only(history):
-    with PITSession(history.root, as_of=3999) as before:
+    with PITSession(history.root, available_at=INT64_MAX, version=3999) as before:
         assert rows(before.sql("SELECT price FROM trades WHERE trade_id = 'a' ORDER BY 1")) == [
             (100,),
             (200,),
         ]
-    with PITSession(history.root, as_of=4000) as after:
+    with PITSession(history.root, available_at=INT64_MAX, version=4000) as after:
         assert rows(after.sql("SELECT price FROM trades WHERE trade_id = 'a' ORDER BY 1")) == [
             (150,),
             (200,),
         ]
 
 
-def test_all_three_views_exist_and_future_rows_are_absent(session):
+def test_all_four_views_exist_and_future_rows_are_absent(session):
     assert rows(session.sql("SELECT count(*) FROM trades")) == [(3,)]
     assert rows(session.sql("SELECT count(*) FROM book_events")) == [(0,)]  # written at 5000
     assert rows(session.sql("SELECT tick_size FROM instruments")) == [(1,)]
-    for view in ("trades", "book_events", "instruments"):
+    assert rows(session.sql("SELECT count(*) FROM stream_events")) == [(0,)]
+    for view in ("trades", "book_events", "instruments", "stream_events"):
         (latest,) = rows(session.sql(f"SELECT max(knowledge_ts) FROM {view}"))[0]
-        assert latest is None or latest <= AS_OF
+        assert latest is None or latest <= VERSION
 
 
 @pytest.mark.parametrize(
@@ -565,8 +568,9 @@ def test_rejection_messages_name_the_reason(session, paths):
 #
 # These tests deliberately reach into the session's private connection, which
 # no caller is allowed to do, to show what would happen if the validator had a
-# hole: the connection can read only files whose knowledge time is at or before
-# as_of, and its configuration cannot be changed.
+# hole: the connection can read only the files of committed batches at or before
+# the session's version, received on or before the day of available_at, and its
+# configuration cannot be changed.
 
 
 def _connection(session) -> duckdb.DuckDBPyConnection:
@@ -633,19 +637,21 @@ def test_engine_does_not_resolve_python_variables(session):
         con.sql("SELECT * FROM leak").fetchall()
 
 
-def test_engine_holds_no_row_after_as_of_even_in_the_files_it_may_read(session, history):
+def test_engine_holds_no_row_after_the_version_even_in_the_files_it_may_read(session, history):
     con = _connection(session)
     allowed = con.sql("SELECT current_setting('allowed_paths')").fetchall()[0][0]
     assert allowed, "expected an explicit list of readable files"
     assert history.file(9000) not in allowed
     for path in allowed:
         (latest,) = con.sql(f"SELECT max(knowledge_ts) FROM read_parquet('{path}')").fetchall()[0]
-        assert latest <= AS_OF
+        assert latest <= VERSION
 
 
-def test_a_file_whose_name_understates_its_knowledge_time_is_still_filtered(root):
-    # Defence against a mislabelled file: the views filter on the knowledge_ts
-    # stored in each row, not only on the file name.
+def test_a_batch_whose_name_understates_its_knowledge_time_is_still_filtered(root):
+    # Defence against a mislabelled batch: the views filter on the knowledge_ts
+    # stored in each row, not only on the names of the file and its marker.
+    import json
+
     from _builders import FakeClock, trade_table
 
     from quantagent.data.schema import TRADES
@@ -653,11 +659,72 @@ def test_a_file_whose_name_understates_its_knowledge_time_is_still_filtered(root
 
     store = AppendOnlyStore(root, clock=FakeClock(9000))
     result = store.append(TRADES, "kraken", "ETH-USD", trade_table(("late", T0, 1)))
-    disguised = result.files[0].with_name(f"part-{1000:020d}.parquet")
-    result.files[0].rename(disguised)  # test-only tampering
+    store.append(TRADES, "kraken", "ETH-USD", trade_table(("later", T0, 2), seq=1))  # 9001
+    # Test-only tampering: the batch written at 9000 now claims to be from 1000,
+    # consistently in its file name, its marker's name and the marker's content.
+    disguised = result.files[0].with_name(f"part-{1000:020d}-000000.parquet")
+    result.files[0].rename(disguised)
+    marker = root / "_batches" / f"batch-{9000:020d}.json"
+    content = json.loads(marker.read_text(encoding="utf-8"))
+    content["knowledge_ts"] = 1000
+    content["files"] = [disguised.relative_to(root).as_posix()]
+    marker.unlink()
+    (root / "_batches" / f"batch-{1000:020d}.json").write_text(json.dumps(content))
 
-    with PITSession(root, as_of=5000) as s:
+    with PITSession(root, available_at=INT64_MAX, version=5000) as s:
         assert rows(s.sql("SELECT count(*) FROM trades")) == [(0,)]
         assert s.trades("kraken", "ETH-USD", 0, 2**63 - 1).num_rows == 0
-    with PITSession(root, as_of=9000) as s:
+    with PITSession(root, available_at=INT64_MAX, version=9000) as s:
         assert rows(s.sql("SELECT trade_id FROM trades")) == [("late",)]
+
+
+# --- the second cutoff and uncommitted batches, at the engine (ADR 0017) -----------------
+
+
+def test_engine_cannot_read_a_file_of_a_later_receipt_day(history):
+    """Files are partitioned by the day their rows were received. A session
+    cannot open one from a day after available_at, even through its private
+    connection, and the views filter the rest to the nanosecond."""
+    received_a = T0 + LAG
+    next_day = history.file(8000)  # trade c, received the following day
+    same_day = history.file(2000)  # trades a and b; b arrived a second after a
+    with PITSession(history.root, available_at=received_a) as s:
+        con = _connection(s)
+        for query in (
+            f"SELECT * FROM read_parquet('{next_day}')",
+            f"SELECT * FROM '{next_day}'",
+            f"SELECT * FROM parquet_metadata('{next_day}')",
+        ):
+            with pytest.raises(duckdb.PermissionException):
+                con.sql(query).fetchall()
+        allowed = con.sql("SELECT current_setting('allowed_paths')").fetchall()[0][0]
+        assert same_day in allowed and next_day not in allowed
+        assert all("date=2023-11-15" not in path for path in allowed)
+        # The file of the same day holds b, which had not been received yet.
+        assert rows(s.sql("SELECT trade_id FROM trades WHERE venue = 'kraken'")) == [("a",)]
+        (latest,) = rows(s.sql("SELECT max(recv_ts) FROM trades"))[0]
+        assert latest == received_a < received_a + NS_PER_SECOND
+
+
+def test_engine_cannot_read_the_files_of_an_uncommitted_batch(history):
+    from _builders import trade_table
+
+    from quantagent.data.schema import TRADES
+
+    history.store.batch().append(TRADES, "kraken", "ETH-USD", trade_table(("u", T0, 1), seq=9))
+    (uncommitted,) = [p.as_posix() for p in history.root.rglob("*.parquet") if "9001" in p.name]
+    with PITSession(history.root, available_at=INT64_MAX) as s:
+        con = _connection(s)
+        with pytest.raises(duckdb.PermissionException):
+            con.sql(f"SELECT * FROM read_parquet('{uncommitted}')").fetchall()
+        allowed = con.sql("SELECT current_setting('allowed_paths')").fetchall()[0][0]
+        assert uncommitted not in allowed
+        assert rows(s.sql("SELECT count(*) FROM trades WHERE trade_id = 'u'")) == [(0,)]
+
+
+def test_views_carry_no_row_received_after_available_at(history):
+    with PITSession(history.root, available_at=T0 + LAG) as s:
+        for view in ("trades", "book_events", "instruments", "stream_events"):
+            (latest,) = rows(s.sql(f"SELECT max(recv_ts) FROM {view}"))[0]
+            assert latest is None or latest <= T0 + LAG
+        assert rows(s.sql("SELECT count(*) FROM trades")) == [(2,)]  # a on both venues

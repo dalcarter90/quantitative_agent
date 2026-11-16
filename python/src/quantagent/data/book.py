@@ -600,8 +600,8 @@ def golden_table(
 
 
 def _load(args: argparse.Namespace) -> tuple[list[BookMessage], list[dict[str, Any]]]:
-    as_of = _INT64_MAX if args.as_of is None else args.as_of
-    with PITSession(args.store, as_of=as_of) as session:
+    available_at = _INT64_MAX if args.available_at is None else args.available_at
+    with PITSession(args.store, available_at=available_at, version=args.version) as session:
         table = session.book_events(args.venue, args.instrument, 0, _INT64_MAX)
         messages = list(messages_from_table(table))
         events = session.stream_events(args.venue, args.instrument, 0, _INT64_MAX).to_pylist()
@@ -660,10 +660,25 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--store", required=True)
         command.add_argument("--venue", required=True, choices=_VENUES)
         command.add_argument("--instrument", required=True)
-        command.add_argument("--as-of", type=int, help="knowledge time, ns (default: everything)")
+        command.add_argument(
+            "--available-at",
+            type=int,
+            help="simulated time, ns: only what had been received by then (default: everything)",
+        )
+        command.add_argument(
+            "--version",
+            type=int,
+            help="knowledge time, ns: the store as of that committed batch (default: the latest)",
+        )
+        command.add_argument("--as-of", help=argparse.SUPPRESS)  # retired; refused below
         if name == "golden":
             command.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if args.as_of is not None:
+        parser.error(
+            "--as-of was retired (ADR 0017): use --version for a knowledge cutoff and "
+            "--available-at for a receipt-time cutoff"
+        )
     try:
         if args.command == "verify":
             return _verify_command(args)

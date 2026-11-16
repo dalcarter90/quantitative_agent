@@ -8,8 +8,9 @@ Decisions referenced here are recorded in `docs/adr/`.
 1. **Paper by default.** Every entry point starts in paper mode. Live trading
    needs an explicit, multi-part opt-in (section 9).
 2. **Point-in-time correctness is structural.** Research code cannot read data
-   that was not known at the simulated time, because the only query interface
-   requires an as-of time and filters on knowledge time.
+   that had not been received at the simulated time, because the only query
+   interface requires that time and returns only rows received by it
+   (ADR 0017).
 3. **One code path for backtest, paper and live.** The same C++ order book, risk
    checks and order state machine run in all three. Only the event source and
    the venue endpoint change.
@@ -41,7 +42,7 @@ HFT, and nothing in the design assumes it is.
  │      │ targets                                │   │   features → pre-trade risk →       │
  │ 3 Signals    OFI, technicals, regime, model   │◀──│   execution gateway                 │
  │      ▲                                        │   │   replay / backtest engine          │
- │      │ PITSession(as_of)                      │   │                                     │
+ │      │ PITSession(available_at)               │   │                                     │
  │ 2 Data core  bitemporal store, adapters, QC   │◀──│   journal + raw capture             │
  └──────────────────────────────────────────────┘   └─────────────────────────────────────┘
 ```
@@ -49,7 +50,7 @@ HFT, and nothing in the design assumes it is.
 | # | Layer | Language | Owns | Must never |
 |---|-------|----------|------|-----------|
 | 1 | Hot path | C++20 | Feed handlers, order book, incremental features, pre-trade risk, order state, execution gateway, replay engine | Allocate, lock, throw, or read the wall clock on the core thread |
-| 2 | Data core | Python | Raw capture ingestion, append-only bitemporal store, `PITSession`, exchange adapters, quality checks, reference order book reconstructor | Return a row whose knowledge time is after the session's as-of time |
+| 2 | Data core | Python | Raw capture ingestion, append-only bitemporal store, `PITSession`, exchange adapters, quality checks, reference order book reconstructor | Return a row received after the session's `available_at`, from a later version than its `version`, or from a batch that was not committed |
 | 3 | Signals | Python (features mirrored in C++) | Feature definitions, regime detection, the blended model, validation harness, cost model | Read data except through `PITSession`; report a result without costs |
 | 4 | Risk/portfolio | Python control plane + C++ enforcement | Position sizing, exposure limits, drawdown guard, pause/recall, the only route to the order path | Be bypassed; have limits changed at runtime by software |
 | 5 | Agent | Python | Research loop, monitoring, reports, pause requests, flags | Place orders, change limits, resume trading, touch exchange credentials |
@@ -82,28 +83,47 @@ thread.
 ### 3.2 Data core → everything above it
 
 ```python
-with PITSession(store_root, as_of=t) as s:   # as_of is a required keyword, no default
-    s.trades(venue, instrument, start, end)  # only rows with knowledge_ts <= t
+# available_at is a required keyword, no default. version is optional.
+with PITSession(store_root, available_at=t, version=None) as s:
+    s.trades(venue, instrument, start, end)  # only rows with recv_ts <= t
     s.book_events(venue, instrument, start, end)
     s.stream_events(venue, instrument, start, end)  # gaps, reconnects, checksum mismatches
-    s.instruments(venue, instrument)         # every metadata version known at t
-    s.instrument(venue, instrument, at=u)    # the version in effect at u, as known at t
+    s.instruments(venue, instrument)         # every metadata version received by t
+    s.instrument(venue, instrument, at=u)    # the version in effect at u (default t)
     s.sql("SELECT ... FROM trades ...")      # one SELECT over the same views
 ```
 
-`start` and `end` are a half-open range on `event_ts`. Each method returns the
-latest version of each record known at `as_of`. A `bars` method is planned but
-not built; it belongs with the bar features in the signal layer.
+A session has two cutoffs, because it answers two questions (ADR 0017):
+
+| Cutoff | Question | Rule |
+|--------|----------|------|
+| `available_at`, required | What had we received? | Only rows with `recv_ts <= available_at` are visible. A backtest sets it to simulated time |
+| `version`, optional | Which version of the store? | Among the rows available, each record's latest version with `knowledge_ts <= version`. Defaults to the latest committed batch, and cannot be later than it |
+
+`as_of`, the single knowledge-time cutoff sessions had before, is retired:
+passing it is an error that names these two.
+
+`start` and `end` are a half-open range on `recv_ts`, for every dataset: a
+window selects market data and the integrity events about it by the same
+clock. Venue time (`event_ts`) is a column to filter on through `sql`, never a
+cutoff. A `bars` method is planned but not built; it belongs with the bar
+features in the signal layer.
 
 `PITSession` is the only read path for layers 3 and 5, and it blocks
 look-ahead structurally rather than by convention:
 
-- `as_of` is required and fixed for the life of the session.
-- Every query runs against views already filtered to `knowledge_ts <= as_of`.
-  The unfiltered tables are not reachable through the session.
+- `available_at` is required and fixed for the life of the session. So is the
+  version, once the session is open.
+- Every query runs against views already filtered to
+  `recv_ts <= available_at` and `knowledge_ts <= version`. The unfiltered
+  tables are not reachable through the session.
+- Only committed batches exist for a session. A load is one batch; its files
+  are readable only once its commit marker is written, so a session never
+  sees part of a load, or market data without the integrity events loaded
+  with it.
 - The store is append-only. A correction or backfill is a new row with a later
-  `knowledge_ts`, so a session at an earlier `as_of` still sees what was known
-  then.
+  `knowledge_ts`, so a session at an earlier `version` still sees what the
+  store held then. A version that can be asked for never changes afterwards.
 - `sql` accepts exactly one `SELECT` statement over those views. DDL, DML,
   multi-statement input, and anything that reads a file path or URL
   (`read_parquet` and similar) are rejected. The check is an allow-list applied
@@ -111,16 +131,24 @@ look-ahead structurally rather than by convention:
   is no second parser to disagree with the engine. Tables, functions, types and
   expression kinds not on the list are refused, as are `WITH` clauses.
 - Independently of that check, each session's database is locked so it can
-  open only the data files written at or before `as_of`, cannot write, attach
-  or load anything, and cannot be reconfigured. A hole in the statement check
-  would still not reach later data.
+  open only the files of committed batches at or before its version, received
+  on or before the day of `available_at`. It cannot write, attach or load
+  anything, and cannot be reconfigured. A hole in the statement check would
+  still not reach a later version, an uncommitted batch or a later day.
 - The session does not hand out its database connection or the store's file
   paths, and error messages have store paths removed.
 
 An import-lint test (added with the signal layer) additionally fails if layer
-3 or 5 code imports storage internals. Inside a backtest, the harness creates a
-session per decision time with `as_of` equal to simulated time; strategy code
-never constructs one.
+3 or 5 code imports storage internals.
+
+**Backtests use a replay cursor.** The harness opens one
+`ReplayCursor(store_root, start=..., end=...)` for the whole replay, hands its
+`session` to the strategy, and calls `cursor.advance(now)` as simulated time
+passes. The session then reads exactly what a new session with
+`available_at=now` would read, without reopening the store. Time moves forward
+only. The session has no method that moves time and no reference to the
+cursor, so strategy code that holds the session cannot look ahead; it never
+constructs a session or a cursor itself.
 
 ### 3.3 Signals → Risk/portfolio
 
@@ -190,8 +218,9 @@ models latency, fees and queue position. Time comes from the events.
 ### 4.3 The decision clock
 
 Strategy logic in Python runs on a decision clock, not per tick. In replay the
-engine calls the Python strategy synchronously at each decision time, with a
-`PITSession` whose `as_of` equals simulated time. Live, the same function runs
+engine calls the Python strategy synchronously at each decision time, with the
+session of a `ReplayCursor` it has advanced to simulated time (section 3.2), so
+the session's `available_at` equals simulated time. Live, the same function runs
 in the Python process on a timer. If inference later needs to be faster, the
 fitted model is exported to a C++ evaluator on the core thread; the interface
 (`TargetSet`) does not change.
@@ -274,17 +303,24 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 | Field | Meaning | Set by |
 |-------|---------|--------|
 | `event_ts` | When the venue says it happened | The venue (its precision varies; stored as given, scaled to ns). If the message has no venue timestamp, it holds `recv_ts` (ADR 0008) |
-| `event_ts_source` | Where `event_ts` came from: `"venue"` or `"receipt"` | The adapter, from the message type (ADR 0008; arrives with Phase 1c) |
-| `recv_ts` | When our process received the bytes | Feed thread, wall clock |
-| `knowledge_ts` | When the record became available to queries in the store | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
+| `event_ts_source` | Where `event_ts` came from: `"venue"` or `"receipt"` | The adapter, from the message type (ADR 0008) |
+| `recv_ts` | When our process received the bytes. **The availability time**: what a session at simulated time T may see, every time window and the store's date partition are on it (ADR 0017) | Feed thread, wall clock |
+| `knowledge_ts` | Which load of the store a row belongs to: its **version**. One per batch, read when the load begins; the batch is readable from its commit | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
 | `recv_mono_ns` | The system's monotonic high-resolution counter, read with `recv_ts` | Feed thread (recorder). Comparable only between logs from the same machine, boot and counter (ADR 0012) |
 | `seq` | Local sequence number at receipt | Feed thread. **Within one raw log, replay order is `seq` alone**; logs are merged by `recv_mono_ns`. `recv_ts` is a measurement, never an ordering key (ADR 0012) |
 | `log_id` | The raw log a stored row came from, derived from that log's first record (not a time field; listed because it orders stored data with `seq`) | Normalizer. Stored rows are keyed and ordered by `(log_id, seq)`, never by `recv_ts` (ADR 0013) |
 
-**Wall-clock times assume a synchronized clock** (ADR 0011). `recv_ts` and
-`knowledge_ts` are only as accurate as the clock of the machine that stamped
-them, so every component that stamps wall-clock time must run on a clock kept
-synchronized to NTP. The recorder enforces this: at the start of every
+**Three times, each with one job** (ADR 0017). Venue time (`event_ts`) is what
+the venue says and is never a cutoff. Receipt time (`recv_ts`) decides what a
+session may see. Knowledge time (`knowledge_ts`) decides which version of the
+store it reads. A raw log is loaded after it was recorded, so a row's
+knowledge time is hours or days after its receipt time, and the two are never
+used for each other.
+
+**Wall-clock times assume a synchronized clock** (ADR 0011). `recv_ts` is only
+as accurate as the clock of the machine that recorded it, and `knowledge_ts`
+as the clock of the machine that loaded it, so every component that stamps
+wall-clock time must run on a clock kept synchronized to NTP. The recorder enforces this: at the start of every
 session it measures its offset against several NTP servers, refuses to record
 if the offset is above 250 ms unless explicitly overridden, and stores the
 measurement (and any override) as stream events, which a quality check
@@ -294,7 +330,8 @@ stamping time.
 Latency measurements inside the process use a monotonic clock and are stored
 as durations, never as wall times. Simulated "now" in a backtest is the
 `recv_ts` of the event being processed plus modelled latency, so a strategy
-sees data when we would have had it, not when the venue produced it.
+sees data when we would have had it, not when the venue produced it. It is the
+`available_at` of the session the strategy is given.
 
 ### 6.3 C++ core types and messages
 
@@ -370,7 +407,7 @@ Details and alternatives are in ADR 0006.
 | Tier | Content | Format | Used by |
 |------|---------|--------|---------|
 | Raw log | Exact bytes received, with `recv_ts` and `seq` | Append-only length-prefixed binary, zstd per segment | Replay engine, normalizer. Never rewritten |
-| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps, and the raw record each row came from (`log_id`, `seq`; ADR 0013); bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/date, integer mantissas | `PITSession`, via DuckDB |
+| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps, and the raw record each row came from (`log_id`, `seq`; ADR 0013); bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/receipt date, integer mantissas. Written in batches, one per load, each readable once its commit marker exists (ADR 0017) | `PITSession`, via DuckDB |
 | Journal | Every hot-path decision, order, risk result and fill | Append-only fixed-record binary | Reconciliation, audit, monitoring |
 | Experiment registry | Hypotheses, configs, results, trial counts | DuckDB/SQLite file | Validation harness, agent |
 | Audit log | Every agent tool call with its reasoning | Append-only JSON lines | Humans |
@@ -387,7 +424,7 @@ and result before the call's effect is applied.
 
 | Tool | Effect | Class |
 |------|--------|-------|
-| `query_data(as_of, ...)` | Read market data through `PITSession`. `as_of` cannot exceed now and cannot reach into the locked holdout period | Read |
+| `query_data(available_at, ...)` | Read market data through `PITSession`. `available_at` cannot exceed now and cannot reach into the locked holdout period: the holdout is a ceiling on receipt time, which is what `available_at` bounds (ADR 0017) | Read |
 | `get_performance(scope, window)` | Paper/live PnL, fills, slippage, turnover | Read |
 | `get_risk_state()` | Current limits, exposures, drawdown, pause state | Read |
 | `get_system_health()` | Feed gaps, queue depths, latency, journal lag | Read |

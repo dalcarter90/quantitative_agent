@@ -2,13 +2,19 @@
 
 Each test proves a finding of the review and is named after it (R01, R02,
 ...). The tests state what the documents promise, or what the review argues
-the code should do, and the code does not do it yet.
+the code should do.
 
-EVERY TEST HERE IS MARKED ``xfail(strict=True)`` WITH ITS FINDING NUMBER AS THE
-REASON. The marker keeps ``scripts/check.ps1`` green while the finding is
-open, and it is strict: once a finding is fixed its test passes, the suite
-fails on the unexpected pass, and the marker has to be removed in the same
-change. From then on the test is the finding's regression test.
+A TEST WHOSE FINDING IS STILL OPEN IS MARKED ``xfail(strict=True)`` WITH ITS
+FINDING NUMBER AS THE REASON. The marker keeps ``scripts/check.ps1`` green
+while the finding is open, and it is strict: once a finding is fixed its test
+passes, the suite fails on the unexpected pass, and the marker has to be
+removed in the same change. From then on the test is the finding's regression
+test.
+
+Fixed so far, and unmarked: R01, R02, R03 and R09 (the time model, ADR 0017).
+Their tests now use the session's two cutoffs. Two of them could not keep
+their original shape, because the fix makes the situation they set up
+impossible; each says so where it stands.
 
 If the owner decides a behavior is intended, the test is replaced by one that
 pins the decision, in the same change as the ADR that records it. Do not
@@ -181,20 +187,20 @@ def events_store(root, rows):
     return root
 
 
-# --- R01: as_of bounds when a row was stored, not when it was received ------------------
+# --- R01: a session is bounded by when a row was received (fixed, ADR 0017) --------------
 #
-# Architecture 3.2 and 4.3: "Inside a backtest, the harness creates a session
-# per decision time with as_of equal to simulated time." Section 6.2: simulated
-# now "is the recv_ts of the event being processed plus modelled latency, so a
-# strategy sees data when we would have had it".
+# Architecture 4.3: a backtest's session shows what had been received by
+# simulated time. Section 6.2: simulated now "is the recv_ts of the event being
+# processed plus modelled latency, so a strategy sees data when we would have
+# had it".
 #
-# knowledge_ts is the wall clock when ``ingest`` ran. A raw log is loaded after
-# it was recorded, so every row's knowledge_ts is later than every simulated
-# time inside the recording.
+# Before ADR 0017 the session's one cutoff, as_of, bounded knowledge_ts: the
+# wall clock when ``ingest`` ran, days after the recording. A session at a time
+# inside the recording was empty. The cutoff is now ``available_at``, on
+# recv_ts, and ranges are receipt time too.
 
 
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
-@pytest.mark.xfail(strict=True, reason="R01")
 def test_r01_a_session_at_a_time_inside_the_recording_sees_what_had_arrived_by_then(loaded, venue):
     records = records_of(venue)
     now = (records[0].recv_ts + records[-1].recv_ts) // 2  # simulated time, mid recording
@@ -204,35 +210,36 @@ def test_r01_a_session_at_a_time_inside_the_recording_sees_what_had_arrived_by_t
         if row["recv_ts"] <= now
     ]
     assert len(arrived) > 50  # the recorder had received these by then
-    with PITSession(loaded, as_of=now) as session:
+    with PITSession(loaded, available_at=now) as session:
         visible = session.trades(venue, INSTRUMENT, *ALL)
-    # Fails with 0 rows: the store learned of all of them days later, at load time.
+    # Failed with 0 rows: the store learned of all of them days later, at load time.
     assert visible.num_rows == len(arrived)
 
 
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
-@pytest.mark.xfail(strict=True, reason="R01")
 def test_r01_reading_up_to_simulated_time_returns_nothing_that_arrived_later(loaded, venue):
-    """The call a harness would make once R01 forces it to open the session
-    "as of now" instead: the range bounds venue time, so rows the recorder had
-    not received yet come back (in flight, or history resent at session start)."""
+    """The other call a harness could make: read everything and bound the range
+    at simulated time. The range used to bound venue time, so rows the recorder
+    had not received yet came back (in flight, or history resent at session
+    start). It bounds receipt time now."""
     records = records_of(venue)
     now = (records[0].recv_ts + records[-1].recv_ts) // 2
-    with PITSession(loaded, as_of=INT64_MAX) as session:
+    with PITSession(loaded, available_at=INT64_MAX) as session:
         trades = session.trades(venue, INSTRUMENT, 0, now).to_pylist()
         levels = session.book_events(venue, INSTRUMENT, 0, now).to_pylist()
+    assert len(trades) > 50 and len(levels) > 1000
     not_yet_received = [r for r in (*trades, *levels) if r["recv_ts"] > now]
     assert not_yet_received == []
 
 
-# --- R02: integrity events become known after the data they qualify ----------------------
+# --- R02: integrity events are known with the data they qualify (fixed, ADR 0017) -------
 #
-# ``ingest`` appends each flush as instruments, trades, book_events, then
-# stream_events, each with its own knowledge time. Between the last two, a
-# point-in-time reader sees a stream with a lost message and no sign of it.
+# ``ingest`` used to append each flush as instruments, trades, book_events,
+# then stream_events, each with its own knowledge time. Between the last two, a
+# point-in-time reader saw a stream with a lost message and no sign of it. A
+# load is one batch now: one knowledge time, readable only when all of it is.
 
 
-@pytest.mark.xfail(strict=True, reason="R02")
 def test_r02_book_rows_are_never_visible_before_the_events_that_qualify_them(tmp_path):
     records = records_of("coinbase")
     updates = stream_book_updates(records)
@@ -241,9 +248,9 @@ def test_r02_book_rows_are_never_visible_before_the_events_that_qualify_them(tmp
     root = tmp_path / "store"
     ingest(damaged, AppendOnlyStore(root, clock=SteppingClock()))
 
-    unqualified = []
-    for as_of in knowledge_times(root):
-        with PITSession(root, as_of=as_of) as session:
+    unqualified, told = [], []
+    for version in knowledge_times(root):
+        with PITSession(root, available_at=INT64_MAX, version=version) as session:
             table = session.book_events("coinbase", INSTRUMENT, *ALL)
             events = session.stream_events("coinbase", INSTRUMENT, *ALL).to_pylist()
         if table.num_rows == 0:
@@ -252,28 +259,42 @@ def test_r02_book_rows_are_never_visible_before_the_events_that_qualify_them(tmp
             for _ in book.replay("coinbase", book.messages_from_table(table), events):
                 pass
         except book.SequenceBreak:
-            continue  # the reader was told
-        unqualified.append(as_of)
-    # Fails: at the book batch's knowledge time the stream replays as if intact.
+            told.append(version)  # the reader was told
+            continue
+        unqualified.append(version)
+    # Failed: at the book batch's knowledge time the stream replayed as if intact.
     assert unqualified == []
+    assert told == [1000]  # the whole load is one version, and it holds the gap
 
 
-# --- R03: knowledge_ts is stamped before the batch can be read ---------------------------
+# --- R03: a version that can be read never changes afterwards (fixed, ADR 0017) ---------
 #
-# "Every method returns ... the rows with knowledge_ts <= as_of" is only
-# repeatable if a batch is readable from its knowledge time on. The store reads
-# the clock first and publishes the files afterwards.
+# The store reads the clock when a batch is opened and publishes it later. A
+# session opened in between, with a cutoff later than the batch's knowledge
+# time, used to miss the batch; the same cutoff afterwards included it.
+#
+# This test could not keep its original form. It opened both sessions at
+# knowledge cutoff 2000 and required the same rows from both. No store can
+# promise that for a cutoff ahead of a batch that is still being published
+# without refusing the request, and refusing it is the fix: a session's
+# version cannot be later than the latest committed batch. So the test now
+# checks the two things that make versions repeatable: the cutoff of 2000 is
+# refused while the batch is unpublished, and the version a session *was*
+# given returns the same rows afterwards.
 
 
-@pytest.mark.xfail(strict=True, reason="R03")
 def test_r03_a_session_opened_after_a_batchs_knowledge_time_always_sees_it(root, monkeypatch):
     root.mkdir()
     seen = {}
     real_link = os.link
 
     def look_then_publish(source, target):
-        # Another process opening a session while the writer is between the two steps.
-        with PITSession(root, as_of=2_000) as session:
+        # Another process opening a session while the writer is between the two
+        # steps: the batch's knowledge time (1000) is issued, its marker is not out.
+        with pytest.raises(ValueError, match="latest committed"):
+            PITSession(root, available_at=INT64_MAX, version=2_000)
+        with PITSession(root, available_at=INT64_MAX) as session:
+            seen["version"] = session.version
             seen["while_writing"] = session.trades("kraken", "ETH-USD", *ALL).num_rows
         real_link(source, target)
 
@@ -283,10 +304,15 @@ def test_r03_a_session_opened_after_a_batchs_knowledge_time_always_sees_it(root,
     )
     monkeypatch.undo()
     assert result.knowledge_ts == 1_000
-    with PITSession(root, as_of=2_000) as session:
+    assert seen["version"] < 1_000  # the unpublished batch was not part of any version
+    with PITSession(root, available_at=INT64_MAX, version=seen["version"]) as session:
         seen["afterwards"] = session.trades("kraken", "ETH-USD", *ALL).num_rows
-    # Fails: the same as_of, later than the batch's knowledge time, gave 0 rows then 1.
+    # Failed: the same cutoff, later than the batch's knowledge time, gave 0 rows then 1.
     assert seen["while_writing"] == seen["afterwards"]
+    # From its knowledge time on, the batch is in every version that can be asked for.
+    for version in (1_000, None):
+        with PITSession(root, available_at=INT64_MAX, version=version) as session:
+            assert session.trades("kraken", "ETH-USD", *ALL).num_rows == 1
 
 
 # --- R04: a correction cannot take a row away -------------------------------------------
@@ -316,7 +342,7 @@ def test_r04_loading_a_log_again_after_a_fix_clears_what_the_fix_resolved(tmp_pa
     second = ingest(fixture_path("kraken"), store)  # the fix: every message parses
     assert second.rejects == [] and second.events["CHECKSUM_MISMATCH"] == 0
 
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         result = quality.check_stream_integrity(session, "kraken", INSTRUMENT, *ALL,
                                                 QualityConfig())  # fmt: skip
     # Fails: message_rejected is still reported, at the record that now parses.
@@ -376,7 +402,7 @@ def test_r05_a_value_that_does_not_fit_the_schema_is_a_reject_not_a_crash(tmp_pa
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
 @pytest.mark.xfail(strict=True, reason="R06")
 def test_r06_a_metadata_version_is_in_effect_for_every_row_of_its_session(loaded, venue):
-    with PITSession(loaded, as_of=INT64_MAX) as session:
+    with PITSession(loaded, available_at=INT64_MAX) as session:
         levels = session.book_events(venue, INSTRUMENT, *ALL).to_pylist()
         stream = [r for r in levels if r["kind"] != BookEventKind.CHECK_SNAPSHOT]
         trades = session.trades(venue, INSTRUMENT, *ALL).to_pylist()
@@ -412,7 +438,7 @@ def test_r07_information_findings_never_crowd_out_an_error(tmp_path):
     rows += [comparison(seq, T0 + seq, "explained", unverified=1) for seq in (1, 2, 3)]
     rows.append(comparison(4, T0 + 4, "mismatch", violations=7))
     root = events_store(tmp_path / "store", rows)
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         result = quality.check_independent_snapshots(
             session, "coinbase", INSTRUMENT, *ALL, QualityConfig(max_findings=3)
         )
@@ -455,7 +481,7 @@ def test_r08_a_bad_recording_clock_is_reported_for_every_day_the_session_covers(
     root = events_store(tmp_path / "store", rows)
 
     def clock_errors(day_start):
-        with PITSession(root, as_of=INT64_MAX) as session:
+        with PITSession(root, available_at=INT64_MAX) as session:
             result = quality.check_recording_clock(
                 session, "coinbase", INSTRUMENT, day_start, day_start + DAY, QualityConfig()
             )
@@ -466,13 +492,22 @@ def test_r08_a_bad_recording_clock_is_reported_for_every_day_the_session_covers(
     assert clock_errors(midnight) == ["clock_offset_exceeded"]
 
 
-# --- R09: one time window selects book rows and their events on different clocks --------
+# --- R09: one window selects book rows and their events by one clock (fixed, ADR 0017) ---
 #
-# Every range method filters event_ts. For book rows that is venue time; for
-# stream events it is the receipt time, which is later by the lag.
+# Every range method used to filter event_ts: venue time for book rows, receipt
+# time for stream events, later by the lag. A window could hold book messages
+# from after a lost message and not the event that reports the loss. Ranges
+# are receipt time for every dataset now.
+#
+# This test could not keep its original form either. It took the one window
+# that ends just before the gap was noticed and required more than ten book
+# messages from after the loss inside it. With one clock that window holds
+# none, which is the fix. So the test now sweeps window ends across the loss,
+# by the venue's clock and by ours, and requires of every one of them what the
+# original required of one: if the window holds a book message from after the
+# loss, replaying it raises.
 
 
-@pytest.mark.xfail(strict=True, reason="R09")
 def test_r09_the_same_window_for_book_rows_and_events_still_finds_a_lost_message(tmp_path):
     records = records_of("coinbase")
     updates = stream_book_updates(records)
@@ -481,18 +516,51 @@ def test_r09_the_same_window_for_book_rows_and_events_still_finds_a_lost_message
     root = tmp_path / "store"
     ingest(damaged, AppendOnlyStore(root))
 
-    with PITSession(root, as_of=INT64_MAX) as session:
+    def stream_rows_after_the_loss(table):
+        return {
+            r["seq"]
+            for r in table.to_pylist()
+            if r["seq"] >= gap["seq"] and r["kind"] != BookEventKind.CHECK_SNAPSHOT
+        }
+
+    with PITSession(root, available_at=INT64_MAX) as session:
         everything = session.stream_events("coinbase", INSTRUMENT, *ALL).to_pylist()
         (gap,) = [e for e in everything if e["kind"] == StreamEventKind.SEQUENCE_GAP]
-        end = gap["event_ts"]  # a window that ends just before the gap was noticed
-        table = session.book_events("coinbase", INSTRUMENT, 0, end)
-        events = session.stream_events("coinbase", INSTRUMENT, 0, end).to_pylist()
-    after_the_loss = {r["seq"] for r in table.to_pylist() if r["seq"] >= gap["seq"]}
-    assert len(after_the_loss) > 10  # the window holds book messages from after the loss
-    # Fails: no error; those messages are applied to a book that is missing an update.
-    with pytest.raises(book.SequenceBreak):
-        for _ in book.replay("coinbase", book.messages_from_table(table), events):
-            pass
+        noticed = gap["recv_ts"]  # when the record that revealed the loss arrived
+        levels = session.book_events("coinbase", INSTRUMENT, *ALL)
+        venue_times = sorted(
+            {
+                r["event_ts"]
+                for r in levels.to_pylist()
+                if r["seq"] >= gap["seq"] and r["kind"] != BookEventKind.CHECK_SNAPSHOT
+            }
+        )[:3]
+        assert venue_times[-1] < noticed  # the venue stamped them before we saw the gap
+        ends = [t + 1 for t in venue_times] + [noticed - 1, noticed, noticed + 1, noticed + NS]
+
+        held, raised = [], []
+        for end in ends:
+            table = session.book_events("coinbase", INSTRUMENT, 0, end)
+            events = session.stream_events("coinbase", INSTRUMENT, 0, end).to_pylist()
+            after_the_loss = stream_rows_after_the_loss(table)
+            try:
+                for _ in book.replay("coinbase", book.messages_from_table(table), events):
+                    pass
+            except book.SequenceBreak:
+                raised.append(end)
+            else:
+                # Failed for the windows that end at the venue times: no error, and
+                # those messages were applied to a book that is missing an update.
+                assert not after_the_loss, end
+            if after_the_loss:
+                held.append(end)
+    # The sweep really did cross the loss: windows before it, and windows holding
+    # book messages from after it (more than ten in the widest).
+    assert held == [noticed + 1, noticed + NS] or held == [noticed + NS]
+    assert set(held) <= set(raised) and ends[0] not in raised
+    with PITSession(root, available_at=INT64_MAX) as session:
+        widest = session.book_events("coinbase", INSTRUMENT, 0, noticed + NS)
+    assert len(stream_rows_after_the_loss(widest)) > 10
 
 
 # --- R10: which observation of a trade the store shows depends on how it was loaded ------
@@ -514,7 +582,7 @@ def test_r10_a_trade_resent_as_history_in_a_later_log_keeps_its_live_observation
     ingest(write_log(tmp_path / "first.qaraw", live), store)
     ingest(write_log(tmp_path / "second.qaraw", resent), store)
 
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         (trade,) = session.trades("kraken", INSTRUMENT, *ALL).to_pylist()
         skew = quality.check_clock_skew(session, "kraken", INSTRUMENT, *ALL, QualityConfig())
     # Fails: the stored row is the resent copy, received an hour later, and the
@@ -558,7 +626,7 @@ def test_r10_a_conflicting_repeat_shows_the_later_value(
     root = tmp_path / "store"
     report = ingest(write_log(tmp_path / "conflict.qaraw", records), AppendOnlyStore(root))
     assert report.events["TRADE_CONFLICT"] == 1
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         (trade,) = session.trades("kraken", INSTRUMENT, *ALL).to_pylist()
     # Fails with (3, 1000): the two rows share a batch, and the view breaks the
     # tie on event_ts and then recv_ts, not on the order the records arrived.

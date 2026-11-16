@@ -1,6 +1,16 @@
 """PITSession: the only read path into the store (architecture section 3.2).
 
-See conftest.py for the timeline of the ``history`` store.
+A session has two cutoffs (ADR 0017):
+
+- ``available_at``, required: simulated time. Only rows with
+  ``recv_ts <= available_at`` are visible.
+- ``version``, optional: a knowledge cutoff. Among the rows available, each
+  record's latest version with ``knowledge_ts <= version`` is returned. It
+  defaults to the latest committed batch and cannot be later than it.
+
+See conftest.py for the timeline of the ``history`` store. Its rows are
+received ``LAG`` after their venue time. Most tests below read "everything
+received" (``available_at=INT64_MAX``) and vary ``version``, or the reverse.
 """
 
 import copy
@@ -13,6 +23,7 @@ import pyarrow as pa
 import pytest
 from _builders import (
     INT64_MAX,
+    LAG,
     LOG,
     NS_PER_DAY,
     NS_PER_SECOND,
@@ -20,17 +31,27 @@ from _builders import (
     V1_EFFECTIVE,
     V2_EFFECTIVE,
     FakeClock,
-    instrument_table,
     trade_table,
 )
 
 import quantagent.data as data_package
-from quantagent.data.schema import BOOK_EVENTS, INSTRUMENTS, TRADES, Side
+from quantagent.data.schema import (
+    BOOK_EVENTS,
+    INSTRUMENTS,
+    STREAM_EVENTS,
+    TRADES,
+    Side,
+    table_from_rows,
+)
 from quantagent.data.session import InstrumentMeta, PITSession, QueryError, QueryRejected
 from quantagent.data.store import AppendOnlyStore
 
 ALL_TIME = (0, INT64_MAX)
 KRK = ("kraken", "ETH-USD")
+# When the history's Kraken trades a, b and c were received.
+RECV_A = T0 + LAG
+RECV_B = T0 + NS_PER_SECOND + LAG
+RECV_C = T0 + NS_PER_DAY + 2 * NS_PER_SECOND + LAG
 
 
 def trade_view(session, venue="kraken", instrument="ETH-USD", start=0, end=INT64_MAX):
@@ -41,45 +62,75 @@ def trade_view(session, venue="kraken", instrument="ETH-USD", start=0, end=INT64
 # --- construction ------------------------------------------------------------
 
 
-def test_as_of_is_required(history):
-    with pytest.raises(TypeError, match="as_of"):
+def test_available_at_is_required(history):
+    with pytest.raises(TypeError, match="available_at"):
         PITSession(history.root)
+    with pytest.raises(TypeError, match="available_at"):
+        PITSession(history.root, version=5000)
 
 
-def test_as_of_is_keyword_only(history):
+def test_available_at_is_keyword_only(history):
     with pytest.raises(TypeError):
         PITSession(history.root, 5000)
 
 
-def test_as_of_has_no_default():
-    parameter = inspect.signature(PITSession).parameters["as_of"]
-    assert parameter.default is inspect.Parameter.empty
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+def test_available_at_has_no_default_and_version_defaults_to_the_latest():
+    parameters = inspect.signature(PITSession).parameters
+    assert list(parameters) == ["root", "available_at", "version"]
+    available_at = parameters["available_at"]
+    assert available_at.default is inspect.Parameter.empty
+    assert available_at.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["version"].default is None
+    assert parameters["version"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 @pytest.mark.parametrize("bad", [None, 5000.0, "5000", True, [5000]])
-def test_as_of_must_be_an_int(history, bad):
-    with pytest.raises(TypeError, match="as_of"):
-        PITSession(history.root, as_of=bad)
+def test_available_at_must_be_an_int(history, bad):
+    with pytest.raises(TypeError, match="available_at"):
+        PITSession(history.root, available_at=bad)
 
 
 @pytest.mark.parametrize("bad", [-1, 2**63])
-def test_as_of_must_be_an_int64_nanosecond_time(history, bad):
-    with pytest.raises(ValueError, match="as_of"):
-        PITSession(history.root, as_of=bad)
+def test_available_at_must_be_an_int64_nanosecond_time(history, bad):
+    with pytest.raises(ValueError, match="available_at"):
+        PITSession(history.root, available_at=bad)
+
+
+@pytest.mark.parametrize("extra", [{}, {"available_at": INT64_MAX}, {"version": 4000}])
+def test_as_of_is_retired_and_the_error_names_its_replacements(history, extra):
+    """ADR 0017: as_of meant a knowledge cutoff. It was retired rather than
+    given a new meaning, so an old call fails instead of reading other data."""
+    with pytest.raises(TypeError) as raised:
+        PITSession(history.root, as_of=4000, **extra)
+    message = str(raised.value)
+    assert "as_of" in message and "available_at" in message and "version" in message
+    assert "ADR 0017" in message
+
+
+@pytest.mark.parametrize("bad", [5000.0, "5000", True, [5000]])
+def test_version_must_be_an_int_or_none(history, bad):
+    with pytest.raises(TypeError, match="version"):
+        PITSession(history.root, available_at=INT64_MAX, version=bad)
+
+
+def test_version_must_not_be_negative(history):
+    with pytest.raises(ValueError, match="version"):
+        PITSession(history.root, available_at=INT64_MAX, version=-1)
 
 
 def test_missing_store_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
-        PITSession(tmp_path / "nowhere", as_of=1)
+        PITSession(tmp_path / "nowhere", available_at=1)
 
 
 def test_empty_store_gives_empty_typed_results(tmp_path):
-    with PITSession(tmp_path, as_of=5000) as session:
+    with PITSession(tmp_path, available_at=5000) as session:
+        assert session.version == 0  # no batch has been committed
         trades = session.trades(*KRK, *ALL_TIME)
         assert trades.num_rows == 0
         assert trades.schema.equals(TRADES.stored_schema)
         assert session.book_events(*KRK, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
+        assert session.stream_events(*KRK, *ALL_TIME).schema.equals(STREAM_EVENTS.stored_schema)
         assert session.instruments(*KRK).schema.equals(INSTRUMENTS.stored_schema)
         assert session.instrument(*KRK) is None
         assert session.sql("SELECT count(*) AS n FROM trades").to_pylist() == [{"n": 0}]
@@ -89,7 +140,7 @@ def test_a_stray_parquet_file_in_the_store_is_an_error(history):
     stray = history.root / "trades" / "venue=kraken" / "instrument=ETH-USD" / "extra.parquet"
     stray.write_bytes(b"x")
     with pytest.raises(ValueError, match="unexpected file"):
-        PITSession(history.root, as_of=5000)
+        PITSession(history.root, available_at=INT64_MAX)
 
 
 def test_a_store_path_containing_an_equals_sign_is_refused(tmp_path):
@@ -97,15 +148,16 @@ def test_a_store_path_containing_an_equals_sign_is_refused(tmp_path):
     odd = tmp_path / "a=b"
     odd.mkdir()
     with pytest.raises(ValueError, match="="):
-        PITSession(odd, as_of=1)
+        PITSession(odd, available_at=1)
 
 
 def test_session_is_a_context_manager_and_unusable_after_close(history):
-    with PITSession(history.root, as_of=5000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=5000) as session:
         assert session.trades(*KRK, *ALL_TIME).num_rows == 2
     for call in (
         lambda: session.trades(*KRK, *ALL_TIME),
         lambda: session.book_events(*KRK, *ALL_TIME),
+        lambda: session.stream_events(*KRK, *ALL_TIME),
         lambda: session.instruments(*KRK),
         lambda: session.instrument(*KRK),
         lambda: session.sql("SELECT 1 AS x FROM trades"),
@@ -115,41 +167,61 @@ def test_session_is_a_context_manager_and_unusable_after_close(history):
     session.close()  # closing twice is harmless
 
 
-# --- typed methods: point-in-time visibility ----------------------------------
+# --- version: the knowledge cutoff --------------------------------------------
 
 
 def test_nothing_is_visible_before_the_first_batch(history):
-    with PITSession(history.root, as_of=999) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=999) as session:
         assert trade_view(session) == []
         assert session.instrument(*KRK) is None
         assert session.instruments(*KRK).num_rows == 0
         assert session.book_events(*KRK, *ALL_TIME).num_rows == 0
 
 
-def test_as_of_is_inclusive(history):
-    with PITSession(history.root, as_of=1999) as session:
+def test_version_is_inclusive(history):
+    with PITSession(history.root, available_at=INT64_MAX, version=1999) as session:
         assert trade_view(session) == []
-    with PITSession(history.root, as_of=2000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=2000) as session:
         assert trade_view(session) == [("a", 100, 2000), ("b", 101, 2000)]
 
 
-def test_trades_grow_with_as_of(history):
-    with PITSession(history.root, as_of=8000) as session:
+def test_trades_grow_with_version_and_the_default_is_the_latest(history):
+    with PITSession(history.root, available_at=INT64_MAX, version=8000) as session:
+        assert session.version == 8000
         assert trade_view(session) == [("a", 150, 4000), ("b", 101, 2000), ("c", 103, 8000)]
-    with PITSession(history.root, as_of=INT64_MAX) as session:
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        assert session.version == 9000  # the latest committed batch
         assert trade_view(session) == [("a", 150, 4000), ("b", 101, 2000), ("c", 103, 8000)]
+
+
+@pytest.mark.parametrize("beyond", [9001, INT64_MAX])
+def test_a_version_later_than_the_latest_committed_batch_is_refused(history, beyond):
+    """Such a version is not repeatable: a batch committed later could fall
+    at or before it, and the same call would then return more."""
+    with pytest.raises(ValueError, match="latest committed") as raised:
+        PITSession(history.root, available_at=INT64_MAX, version=beyond)
+    assert "9000" in str(raised.value)  # names the latest version that can be asked for
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
+        assert session.version == 9000
+
+
+def test_an_empty_store_has_only_version_zero(tmp_path):
+    with PITSession(tmp_path, available_at=INT64_MAX, version=0) as session:
+        assert session.version == 0
+    with pytest.raises(ValueError, match="latest committed"):
+        PITSession(tmp_path, available_at=INT64_MAX, version=1)
 
 
 def test_a_correction_is_visible_only_from_its_knowledge_time(history):
-    with PITSession(history.root, as_of=3999) as before:
+    with PITSession(history.root, available_at=INT64_MAX, version=3999) as before:
         assert trade_view(before) == [("a", 100, 2000), ("b", 101, 2000)]
-    with PITSession(history.root, as_of=4000) as after:
+    with PITSession(history.root, available_at=INT64_MAX, version=4000) as after:
         assert trade_view(after) == [("a", 150, 4000), ("b", 101, 2000)]
 
 
 def test_book_event_correction_is_visible_only_from_its_knowledge_time(history):
-    def levels(as_of):
-        with PITSession(history.root, as_of=as_of) as session:
+    def levels(version):
+        with PITSession(history.root, available_at=INT64_MAX, version=version) as session:
             rows = session.book_events(*KRK, *ALL_TIME).to_pylist()
         return sorted((r["side"], r["price"], r["qty"], r["knowledge_ts"]) for r in rows)
 
@@ -160,51 +232,153 @@ def test_book_event_correction_is_visible_only_from_its_knowledge_time(history):
 
 
 def test_venues_and_instruments_are_separate(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         assert trade_view(session, "coinbase", "BTC-USD") == [("a", 200, 3000)]
         assert trade_view(session, "coinbase", "ETH-USD") == []
         assert trade_view(session, "kraken", "BTC-USD") == []
 
 
-def test_time_range_is_half_open_on_event_ts(history):
-    with PITSession(history.root, as_of=9000) as session:
-        second = T0 + NS_PER_SECOND
-        assert [t[0] for t in trade_view(session, start=T0, end=second)] == ["a"]
-        assert [t[0] for t in trade_view(session, start=T0, end=second + 1)] == ["a", "b"]
-        assert [t[0] for t in trade_view(session, start=T0 + 1, end=INT64_MAX)] == ["b", "c"]
-        assert trade_view(session, start=second, end=second) == []
+# --- available_at: what had been received --------------------------------------
+
+
+def test_only_rows_received_by_available_at_are_visible(history):
+    def received_by(available_at):
+        with PITSession(history.root, available_at=available_at) as session:
+            assert session.available_at == available_at
+            return [t[0] for t in trade_view(session)]
+
+    assert received_by(RECV_A - 1) == []
+    assert received_by(RECV_A) == ["a"]  # inclusive
+    assert received_by(RECV_B - 1) == ["a"]
+    assert received_by(RECV_B) == ["a", "b"]
+    assert received_by(RECV_C - 1) == ["a", "b"]
+    assert received_by(RECV_C) == ["a", "b", "c"]
+    assert received_by(INT64_MAX) == ["a", "b", "c"]
+
+
+def test_venue_time_does_not_make_a_row_visible(history):
+    """Trade a happened at T0 and was received LAG later. At any time in
+    between, the venue's timestamp is in the past and the row is not here yet."""
+    with PITSession(history.root, available_at=T0 + LAG // 2) as session:
+        assert trade_view(session) == []
+        assert session.sql("SELECT count(*) AS n FROM trades").to_pylist() == [{"n": 0}]
+
+
+def test_available_at_applies_to_every_dataset(history):
+    with PITSession(history.root, available_at=V1_EFFECTIVE + LAG - 1) as session:
+        assert session.instruments(*KRK).num_rows == 0
+        assert session.instrument(*KRK) is None
+    with PITSession(history.root, available_at=RECV_A - 1) as session:
+        # The first metadata version was received a day earlier; nothing else was.
+        assert [r["tick_size"] for r in session.instruments(*KRK).to_pylist()] == [5]
+        assert session.book_events(*KRK, *ALL_TIME).num_rows == 0
+        assert trade_view(session) == []
+    with PITSession(history.root, available_at=RECV_A) as session:
+        assert session.book_events(*KRK, *ALL_TIME).num_rows == 2
+        for view in ("trades", "book_events", "instruments", "stream_events"):
+            (row,) = session.sql(f"SELECT max(recv_ts) AS latest FROM {view}").to_pylist()
+            assert row["latest"] is None or row["latest"] <= RECV_A
+
+
+def test_both_cutoffs_apply_together(history):
+    with PITSession(history.root, available_at=RECV_B, version=3999) as session:
+        assert trade_view(session) == [("a", 100, 2000), ("b", 101, 2000)]
+    with PITSession(history.root, available_at=RECV_A, version=3999) as session:
+        assert trade_view(session) == [("a", 100, 2000)]
+    with PITSession(history.root, available_at=RECV_A, version=4000) as session:
+        assert trade_view(session) == [("a", 150, 4000)]
+    with PITSession(history.root, available_at=RECV_C, version=7999) as session:
+        assert trade_view(session) == [("a", 150, 4000), ("b", 101, 2000)]  # c known at 8000
+
+
+def test_the_version_is_chosen_among_the_rows_available(root):
+    """A trade seen twice: live, and resent an hour later by a later batch.
+    Before the resend arrives, the session shows the live observation, not
+    nothing and not the later row."""
+    hour = 3600 * NS_PER_SECOND
+    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
+    store.append(TRADES, *KRK, trade_table(("t", T0, 100)))
+    store.append(TRADES, *KRK, trade_table(("t", T0 + hour, 100), seq=7))  # same trade_id
+
+    def seen(available_at, version=None):
+        with PITSession(root, available_at=available_at, version=version) as session:
+            rows = session.trades(*KRK, *ALL_TIME).to_pylist()
+        return [(r["seq"], r["recv_ts"], r["knowledge_ts"]) for r in rows]
+
+    assert seen(RECV_A - 1) == []
+    assert seen(RECV_A) == [(0, RECV_A, 1_000)]
+    assert seen(RECV_A + hour - 1) == [(0, RECV_A, 1_000)]
+    assert seen(RECV_A + hour) == [(7, RECV_A + hour, 2_000)]  # the latest version available
+    assert seen(INT64_MAX, version=1_000) == [(0, RECV_A, 1_000)]
+
+
+# --- time ranges: receipt time (ADR 0017) ---------------------------------------
+
+
+def test_time_range_is_half_open_on_recv_ts(history):
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
+        assert [t[0] for t in trade_view(session, start=RECV_A, end=RECV_B)] == ["a"]
+        assert [t[0] for t in trade_view(session, start=RECV_A, end=RECV_B + 1)] == ["a", "b"]
+        assert [t[0] for t in trade_view(session, start=RECV_A + 1, end=INT64_MAX)] == ["b", "c"]
+        assert trade_view(session, start=RECV_B, end=RECV_B) == []
         # Spans date partitions.
-        assert [t[0] for t in trade_view(session, start=second, end=T0 + 2 * NS_PER_DAY)] == [
+        assert [t[0] for t in trade_view(session, start=RECV_B, end=T0 + 2 * NS_PER_DAY)] == [
             "b",
             "c",
         ]
+        # The range is receipt time, not venue time: a happened at T0.
+        assert trade_view(session, start=T0, end=RECV_A) == []
 
 
-def test_a_correction_that_moves_event_ts_leaves_the_old_time_range(root):
+def test_a_window_selects_every_dataset_by_the_same_clock(root):
+    """One window means one thing (review R09): a book row and the integrity
+    event noticed at the same raw record are in the same windows, whatever
+    the venue's timestamp on the book row says."""
+    received = T0 + 2 * NS_PER_SECOND
+    level = {"event_ts": T0, "event_ts_source": "venue", "recv_ts": received, "log_id": LOG,
+             "seq": 4, "kind": 1, "venue_seq_first": None, "venue_seq_last": 9, "checksum": None,
+             "depth": None, "level_index": 0, "side": Side.BUY, "price": 99, "qty": 5}  # fmt: skip
+    event = {"event_ts": received, "event_ts_source": "receipt", "recv_ts": received,
+             "log_id": LOG, "seq": 4, "event_index": 0, "kind": 10, "connection": "ws",
+             "expected": 8, "observed": 9, "detail": None}  # fmt: skip
+    with AppendOnlyStore(root, clock=FakeClock(1_000)).batch() as batch:
+        batch.append(BOOK_EVENTS, *KRK, table_from_rows(BOOK_EVENTS, [level]))
+        batch.append(STREAM_EVENTS, *KRK, table_from_rows(STREAM_EVENTS, [event]))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        for window in ((0, received), (T0, T0 + 1), (received, received + 1), (0, INT64_MAX)):
+            levels = session.book_events(*KRK, *window).num_rows
+            events = session.stream_events(*KRK, *window).num_rows
+            assert levels == events, window
+        assert session.book_events(*KRK, received, received + 1).num_rows == 1
+        assert session.book_events(*KRK, T0, T0 + 1).num_rows == 0  # venue time is not the key
+
+
+def test_a_correction_that_moves_a_row_in_time_leaves_the_old_time_range(root):
     store = AppendOnlyStore(root, clock=FakeClock(1000, 2000))
     store.append(TRADES, *KRK, trade_table(("a", T0, 100)))
     store.append(TRADES, *KRK, trade_table(("a", T0 + NS_PER_DAY, 100)))  # other partition
 
-    with PITSession(root, as_of=1000) as before:
-        assert [t[0] for t in trade_view(before, start=T0, end=T0 + 1)] == ["a"]
-    with PITSession(root, as_of=2000) as after:
-        assert trade_view(after, start=T0, end=T0 + 1) == []
-        assert trade_view(after, start=T0 + NS_PER_DAY, end=INT64_MAX) == [("a", 100, 2000)]
+    with PITSession(root, available_at=INT64_MAX, version=1000) as before:
+        assert [t[0] for t in trade_view(before, start=RECV_A, end=RECV_A + 1)] == ["a"]
+    with PITSession(root, available_at=INT64_MAX, version=2000) as after:
+        assert trade_view(after, start=RECV_A, end=RECV_A + 1) == []
+        assert trade_view(after, start=RECV_A + NS_PER_DAY, end=INT64_MAX) == [("a", 100, 2000)]
         assert trade_view(after) == [("a", 100, 2000)]
 
 
 def test_typed_results_use_the_stored_schema_and_replay_order(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         trades = session.trades(*KRK, *ALL_TIME)
         assert isinstance(trades, pa.Table)
         assert trades.schema.equals(TRADES.stored_schema)
         order = [(r["log_id"], r["seq"]) for r in trades.to_pylist()]
         assert order == [(LOG, 0), (LOG, 1), (LOG, 2)]  # replay order (ADR 0013)
         assert session.book_events(*KRK, *ALL_TIME).schema.equals(BOOK_EVENTS.stored_schema)
+        assert session.stream_events(*KRK, *ALL_TIME).schema.equals(STREAM_EVENTS.stored_schema)
         assert session.instruments(*KRK).schema.equals(INSTRUMENTS.stored_schema)
 
 
-@pytest.mark.parametrize("method", ["trades", "book_events"])
+@pytest.mark.parametrize("method", ["trades", "book_events", "stream_events"])
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -220,7 +394,7 @@ def test_typed_results_use_the_stored_schema_and_replay_order(history):
     ],
 )
 def test_typed_methods_validate_their_arguments(history, method, arguments):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         with pytest.raises((TypeError, ValueError)):
             getattr(session, method)(*arguments)
 
@@ -229,8 +403,8 @@ def test_typed_methods_validate_their_arguments(history, method, arguments):
 
 
 def test_instrument_versions_as_known(history):
-    def versions(as_of):
-        with PITSession(history.root, as_of=as_of) as session:
+    def versions(version):
+        with PITSession(history.root, available_at=INT64_MAX, version=version) as session:
             rows = session.instruments(*KRK).to_pylist()
         return [(r["event_ts"], r["tick_size"], r["knowledge_ts"]) for r in rows]
 
@@ -241,7 +415,7 @@ def test_instrument_versions_as_known(history):
 
 
 def test_instrument_in_effect_is_the_latest_known_version_at_or_before_the_time(history):
-    with PITSession(history.root, as_of=5999) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=5999) as session:
         meta = session.instrument(*KRK, at=T0)
         assert isinstance(meta, InstrumentMeta)
         assert (meta.venue, meta.instrument) == KRK
@@ -253,29 +427,39 @@ def test_instrument_in_effect_is_the_latest_known_version_at_or_before_the_time(
         assert session.instrument(*KRK, at=V1_EFFECTIVE - 1) is None
         assert session.instrument(*KRK, at=V1_EFFECTIVE).tick_size == 1
 
-    with PITSession(history.root, as_of=6000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=6000) as session:
         # Known now, but it only takes effect in the future.
         assert session.instrument(*KRK, at=T0).tick_size == 1
         assert session.instrument(*KRK, at=V2_EFFECTIVE - 1).tick_size == 1
         assert session.instrument(*KRK, at=V2_EFFECTIVE).tick_size == 10
 
-    with PITSession(history.root, as_of=7000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=7000) as session:
         assert session.instrument(*KRK, at=T0).tick_size == 5
         assert session.instrument("coinbase", "BTC-USD") is None
 
 
-def test_instrument_defaults_to_the_version_in_effect_at_as_of(root):
+def announced(effective, tick_size, seq):
+    """A metadata version received at time 500, before it takes effect."""
+    row = {"event_ts": effective, "event_ts_source": "venue", "recv_ts": 500, "log_id": LOG,
+           "seq": seq, "price_exp": 2, "qty_exp": 5, "tick_size": tick_size,
+           "lot_size": 1}  # fmt: skip
+    return table_from_rows(INSTRUMENTS, [row])
+
+
+def test_instrument_defaults_to_the_version_in_effect_at_available_at(root):
     store = AppendOnlyStore(root, clock=FakeClock(100, 200))
-    store.append(INSTRUMENTS, *KRK, instrument_table(1_000, tick_size=1))
-    store.append(INSTRUMENTS, *KRK, instrument_table(5_000, tick_size=2, seq=1))
-    with PITSession(root, as_of=4_999) as session:
+    store.append(INSTRUMENTS, *KRK, announced(1_000, tick_size=1, seq=0))
+    store.append(INSTRUMENTS, *KRK, announced(5_000, tick_size=2, seq=1))
+    with PITSession(root, available_at=4_999) as session:
         assert session.instrument(*KRK).tick_size == 1
-    with PITSession(root, as_of=5_000) as session:
+    with PITSession(root, available_at=5_000) as session:
         assert session.instrument(*KRK).tick_size == 2
+    with PITSession(root, available_at=499) as session:
+        assert session.instrument(*KRK) is None  # not received yet
 
 
 def test_instrument_meta_is_immutable(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         meta = session.instrument(*KRK, at=T0)
     assert meta is not None
     with pytest.raises(AttributeError):
@@ -286,20 +470,32 @@ def test_instrument_meta_is_immutable(history):
 
 
 def test_later_appends_are_invisible_to_an_open_session(history):
-    with PITSession(history.root, as_of=8000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=8000) as session:
         before = trade_view(session)
         history.store.append(TRADES, *KRK, trade_table(("a", T0, 999), ("z", T0, 1)))
         assert trade_view(session) == before
         assert session.sql("SELECT max(knowledge_ts) AS k FROM trades").to_pylist() == [{"k": 8000}]
 
 
-def test_as_of_cannot_be_changed(history):
-    with PITSession(history.root, as_of=3999) as session:
-        assert session.as_of == 3999
-        with pytest.raises(AttributeError):
-            session.as_of = 9000
-        with pytest.raises(AttributeError):
-            del session.as_of
+def test_a_session_at_the_default_version_does_not_follow_later_batches(history):
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        before = trade_view(session)
+        later = history.store.append(TRADES, *KRK, trade_table(("z", T0, 1), seq=9))
+        assert session.version == 9000  # fixed when the session was opened
+        assert trade_view(session) == before
+    with PITSession(history.root, available_at=INT64_MAX) as reopened:
+        assert reopened.version == later.knowledge_ts
+        assert "z" in [t[0] for t in trade_view(reopened)]
+
+
+def test_the_cutoffs_cannot_be_changed(history):
+    with PITSession(history.root, available_at=RECV_B, version=3999) as session:
+        assert (session.available_at, session.version) == (RECV_B, 3999)
+        for name in ("available_at", "version"):
+            with pytest.raises(AttributeError):
+                setattr(session, name, 9000)
+            with pytest.raises(AttributeError):
+                delattr(session, name)
         with pytest.raises(AttributeError):
             session.anything_else = 1
         # Ordinary assignment to the private fields is refused as well.
@@ -308,12 +504,12 @@ def test_as_of_cannot_be_changed(history):
                 setattr(session, name, 9000)
             with pytest.raises(AttributeError):
                 delattr(session, name)
-        assert session.as_of == 3999
+        assert (session.available_at, session.version) == (RECV_B, 3999)
         assert trade_view(session) == [("a", 100, 2000), ("b", 101, 2000)]
 
 
 def test_an_engine_error_that_quotes_a_file_path_is_redacted(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         # Test-only tampering, to make the engine fail on a file it may read.
         victim = history.files_by_kts[2000][0]
         victim.write_bytes(b"this is not a parquet file")
@@ -326,23 +522,26 @@ def test_an_engine_error_that_quotes_a_file_path_is_redacted(history):
         assert link is None
 
 
-def test_forcing_the_private_as_of_does_not_change_what_is_visible(history):
+def test_forcing_the_private_cutoffs_does_not_change_what_is_visible(history):
     # Deliberately breaking encapsulation: the views were fixed at construction,
     # so even this cannot widen what the session reads.
-    with PITSession(history.root, as_of=3999) as session:
+    with PITSession(history.root, available_at=RECV_A, version=3999) as session:
+        assert trade_view(session) == [("a", 100, 2000)]
         for name in list(getattr(type(session), "__slots__", ())) + list(
             getattr(session, "__dict__", {})
         ):
             if isinstance(getattr(session, name, None), int):
-                object.__setattr__(session, name, 9000)
-        assert trade_view(session) == [("a", 100, 2000), ("b", 101, 2000)]
-        assert session.sql("SELECT max(knowledge_ts) AS k FROM trades").to_pylist() == [
-            {"k": 3000}  # the coinbase trade; still nothing after 3999
+                object.__setattr__(session, name, INT64_MAX)
+        assert trade_view(session) == [("a", 100, 2000)]
+        assert session.sql(
+            "SELECT max(knowledge_ts) AS k, max(recv_ts) AS r FROM trades"
+        ).to_pylist() == [
+            {"k": 3000, "r": RECV_A}  # the coinbase trade; nothing after either cutoff
         ]
 
 
 def test_sessions_cannot_be_copied_pickled_or_subclassed(history):
-    with PITSession(history.root, as_of=3999) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=3999) as session:
         with pytest.raises(TypeError):
             pickle.dumps(session)
         with pytest.raises(TypeError):
@@ -361,7 +560,8 @@ def test_sessions_cannot_be_copied_pickled_or_subclassed(history):
 def test_public_surface_is_exactly_the_query_methods(history):
     public = {name for name in dir(PITSession) if not name.startswith("_")}
     assert public == {
-        "as_of",
+        "available_at",
+        "version",
         "trades",
         "book_events",
         "stream_events",
@@ -388,13 +588,15 @@ def _holds_connection_or_path(value, root: Path, depth=0) -> bool:
 
 
 def test_public_attributes_and_results_hold_no_connection_and_no_path(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         values = {
-            "as_of": session.as_of,
+            "available_at": session.available_at,
+            "version": session.version,
             "repr": repr(session),
             "str": str(session),
             "trades": session.trades(*KRK, *ALL_TIME),
             "book_events": session.book_events(*KRK, *ALL_TIME),
+            "stream_events": session.stream_events(*KRK, *ALL_TIME),
             "instruments": session.instruments(*KRK),
             "instrument": session.instrument(*KRK, at=T0),
             "sql": session.sql("SELECT * FROM trades"),
@@ -418,7 +620,7 @@ def test_public_attributes_and_results_hold_no_connection_and_no_path(history):
 
 
 def test_error_messages_do_not_reveal_store_paths(history):
-    with PITSession(history.root, as_of=9000) as session:
+    with PITSession(history.root, available_at=INT64_MAX, version=9000) as session:
         failures = []
         for query in (
             "SELECT no_such_column FROM trades",
@@ -441,7 +643,7 @@ def test_error_messages_do_not_reveal_store_paths(history):
 def test_the_data_package_exports_no_other_read_path():
     # The store is write-only and nothing else in the package reads files back.
     public_store = {n for n in dir(AppendOnlyStore) if not n.startswith("_")}
-    assert public_store == {"append"}
+    assert public_store == {"append", "batch"}
     modules = {
         name for name in dir(data_package) if not name.startswith("_") and name != "annotations"
     }
@@ -469,8 +671,6 @@ def test_the_data_package_exports_no_other_read_path():
 
 
 def test_rows_come_back_in_log_and_seq_order_even_if_recv_ts_goes_backwards(root):
-    from quantagent.data.schema import table_from_rows
-
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     later_log = "20231114T130000.000000000Z-000000000001"
     rows = []
@@ -481,8 +681,65 @@ def test_rows_come_back_in_log_and_seq_order_even_if_recv_ts_goes_backwards(root
                      "log_id": log_id, "seq": seq, "trade_id": f"{log_id[-1]}{seq}",
                      "price": 1, "qty": 1, "side": 1})  # fmt: skip
     store.append(TRADES, *KRK, table_from_rows(TRADES, rows))
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         got = session.trades(*KRK, 0, INT64_MAX).to_pylist()
     assert [(r["log_id"], r["seq"]) for r in got] == [
         (LOG, 0), (LOG, 1), (LOG, 2), (later_log, 0), (later_log, 1)
     ]  # fmt: skip
+
+
+# --- committed batches only (ADR 0017) ---------------------------------------------------
+
+
+def test_a_batch_is_invisible_until_it_is_committed(history):
+    batch = history.store.batch()
+    batch.append(TRADES, *KRK, trade_table(("u", T0, 77), seq=9))
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        assert session.version == 9000  # the open batch is not a version yet
+        assert "u" not in [t[0] for t in trade_view(session)]
+        assert session.sql("SELECT count(*) AS n FROM trades WHERE trade_id = 'u'").to_pylist() == [
+            {"n": 0}
+        ]
+    with pytest.raises(ValueError, match="latest committed"):
+        PITSession(history.root, available_at=INT64_MAX, version=batch.knowledge_ts)
+
+    committed = batch.commit()
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        assert session.version == committed.knowledge_ts
+        assert ("u", 77, committed.knowledge_ts) in trade_view(session)
+
+
+def test_the_files_of_a_load_that_died_are_never_visible(history):
+    crashed = AppendOnlyStore(history.root, clock=FakeClock(20_000))
+    crashed.batch().append(TRADES, *KRK, trade_table(("dead", T0, 1), seq=9))  # no commit, ever
+    leftover = [p for p in history.root.rglob("*.parquet") if "20000" in p.name]
+    assert len(leftover) == 1
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        assert session.version == 9000
+        assert "dead" not in [t[0] for t in trade_view(session)]
+    # A later batch commits normally, and the dead one stays invisible.
+    later = AppendOnlyStore(history.root, clock=FakeClock(1)).append(
+        TRADES, *KRK, trade_table(("alive", T0, 2), seq=10)
+    )
+    with PITSession(history.root, available_at=INT64_MAX) as session:
+        assert session.version == later.knowledge_ts > 20_000
+        ids = [t[0] for t in trade_view(session)]
+        assert "alive" in ids and "dead" not in ids
+
+
+def test_a_committed_file_that_is_missing_is_an_error(history):
+    history.files_by_kts[2000][0].unlink()  # test-only damage
+    with pytest.raises(ValueError, match="missing") as raised:
+        PITSession(history.root, available_at=INT64_MAX)
+    assert str(history.root) not in str(raised.value)
+
+
+def test_a_store_whose_first_load_never_committed_reads_as_empty(root):
+    """Found by the property test: not a store from before commit markers, just
+    one with nothing committed yet."""
+    AppendOnlyStore(root, clock=FakeClock(1_000)).batch().append(
+        TRADES, *KRK, trade_table(("a", T0, 100))
+    )
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert session.version == 0
+        assert trade_view(session) == []

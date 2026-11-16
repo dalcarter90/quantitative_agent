@@ -1,22 +1,39 @@
 """PITSession: the point-in-time read path into the normalized store.
 
-A session is opened at a fixed ``as_of`` knowledge time and can only ever
-return rows that were in the store at that time. That is enforced in three
-independent ways (architecture section 3.2):
+A session answers two different questions with two cutoffs (ADR 0017):
 
-1. **Views.** Every query runs against views that keep rows with
-   ``knowledge_ts <= as_of`` and then the latest known version of each record.
-   The typed methods and ``sql`` both read these views and nothing else.
+- **What had we received?** ``available_at``, required: a simulated time. Only
+  rows with ``recv_ts <= available_at`` are visible. This is the cutoff a
+  backtest sets to simulated time.
+- **Which version of the store?** ``version``, optional: a knowledge cutoff.
+  Among the rows available, each record's latest version with
+  ``knowledge_ts <= version`` is returned. It defaults to the latest committed
+  batch and cannot be later than it, so a version that was read once reads
+  the same forever.
+
+Only committed batches exist for a session: the files of a load that is still
+running, failed or died have no commit marker and are never opened.
+
+That is enforced in three independent ways (architecture section 3.2):
+
+1. **Views.** Every query runs against views that keep the rows inside both
+   cutoffs and then the latest version of each record. The typed methods and
+   ``sql`` both read these views and nothing else.
 2. **Statement validation.** ``sql`` accepts exactly one SELECT over those
    views, checked on DuckDB's own syntax tree (see ``sqlguard``).
 3. **Engine lockdown.** The session's private DuckDB instance is configured
-   so it can open only the data files whose knowledge time is at or before
-   ``as_of``, cannot write, attach or load anything, and cannot have that
-   configuration changed. Even a statement that slipped past the validator
-   could not reach later data.
+   so it can open only the files of committed batches at or before the
+   session's version, received on or before the day of ``available_at``. It
+   cannot write, attach or load anything, and that configuration cannot be
+   changed. Even a statement that slipped past the validator could not reach
+   a later version, an uncommitted batch or a later day.
 
-A session is a snapshot: files appended after it was opened are not visible
-to it. It is not safe to share between threads.
+A session is a snapshot: batches committed after it was opened are not
+visible to it. It is not safe to share between threads.
+
+``ReplayCursor`` is for backtests: it opens the store once and hands out one
+session whose ``available_at`` the cursor's owner moves forward. The session
+itself has no way to move it.
 
 Before anything else, a session checks every file it will open: the dataset,
 schema version and columns its Parquet metadata records must be what this code
@@ -24,9 +41,11 @@ reads. A store written by another version of the code is refused with a
 ``StoreVersionError`` saying to rebuild it from the raw logs (ADR 0015).
 """
 
+import inspect
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -44,64 +63,179 @@ from quantagent.data.schema import (
     Dataset,
 )
 from quantagent.data.sqlguard import MAX_QUERY_LENGTH, QueryRejected, validate
-from quantagent.data.store import _PART, _check_name
+from quantagent.data.store import (
+    _LEGACY_PART,
+    _MARKER,
+    _PART,
+    BATCH_DIRECTORY,
+    REBUILD,
+    STORE_LAYOUT,
+    StoreVersionError,
+    _check_name,
+    _legacy,
+)
 
-__all__ = ["InstrumentMeta", "PITSession", "QueryError", "QueryRejected", "StoreVersionError"]
+__all__ = [
+    "InstrumentMeta",
+    "PITSession",
+    "QueryError",
+    "QueryRejected",
+    "ReplayCursor",
+    "StoreVersionError",
+]
 
+_NS_PER_DAY = 86_400 * 1_000_000_000
+_EPOCH = date(1970, 1, 1)
 _PARTITION_COLUMNS = {"venue": "VARCHAR", "instrument": "VARCHAR", "date": "DATE"}
 _VIEW_NAMES = frozenset(DATASETS)
 _DUCKDB_TYPES = {pa.int8(): "TINYINT", pa.int32(): "INTEGER", pa.int64(): "BIGINT",
                  pa.uint64(): "UBIGINT", pa.string(): "VARCHAR"}  # fmt: skip
 _PARTITION_DIRECTORY = re.compile(r"(venue|instrument|date)=[^=]+")
+_DATE_DIRECTORY = re.compile(r"date=([0-9]{4}-[0-9]{2}-[0-9]{2})")
+
+_AS_OF_RETIRED = (
+    "as_of was retired (ADR 0017): it was a knowledge cutoff, and a session now has two "
+    "cutoffs. Pass available_at=<simulated time, ns> to see the rows received at or before "
+    "it; to pin a store version as well, pass version=<knowledge time, ns> (as_of's old "
+    "meaning). version defaults to the latest committed batch."
+)
 
 
 class QueryError(RuntimeError):
     """An allowed statement failed while running (for example, an unknown column)."""
 
 
-class StoreVersionError(ValueError):
-    """A store file was not written with the schema this code reads (ADR 0015)."""
+_REBUILD = f"the store was written by another version of the code; {REBUILD}"
 
 
-_REBUILD = (
-    "the store was written by another version of the code; rebuild it from the raw logs "
-    "into a new directory (python -m quantagent.data.adapters <raw log> --store <new store>; "
-    "docs/data-core.md, section 3)"
-)
+@dataclass(frozen=True, slots=True)
+class _DataFile:
+    """One file of a committed batch."""
+
+    dataset: str
+    day: int  # its date partition, in days since the epoch: the UTC day its rows were received
+    knowledge_ts: int
+    path: str  # absolute, with forward slashes
 
 
-def _check_versions(root: Path, files: dict[str, list[str]]) -> None:
+def _well_placed(parts: tuple[str, ...]) -> bool:
+    return (
+        len(parts) == 5
+        and parts[0] in DATASETS
+        and [p.split("=")[0] for p in parts[1:4]] == list(_PARTITION_COLUMNS)
+        and all(_PARTITION_DIRECTORY.fullmatch(p) for p in parts[1:4])
+        and _DATE_DIRECTORY.fullmatch(parts[3]) is not None
+    )
+
+
+def _data_file(root: Path, parts: tuple[str, ...]) -> _DataFile | None:
+    """The data file at ``parts`` under ``root``, or None if the path is not one."""
+    match = _PART.fullmatch(parts[-1]) if parts else None
+    if match is None or not _well_placed(parts):
+        return None
+    try:
+        day = (date.fromisoformat(parts[3][len("date=") :]) - _EPOCH).days
+    except ValueError:
+        return None
+    return _DataFile(parts[0], day, int(match.group(1)), root.joinpath(*parts).as_posix())
+
+
+def _committed_files(root: Path) -> tuple[list[_DataFile], int]:
+    """The files of every committed batch, and the latest committed knowledge
+    time (0 if no batch was ever committed).
+
+    A data file that no commit marker names belongs to a batch that was not
+    committed, and is left out. Anything that is not the layout this code
+    writes is refused.
+    """
+    on_disk: dict[str, _DataFile] = {}
+    for path in sorted(root.rglob("*.parquet")):
+        parts = path.relative_to(root).parts
+        found = _data_file(root, parts)
+        if found is None:
+            if _LEGACY_PART.fullmatch(parts[-1]):
+                raise _legacy(path)
+            raise ValueError(f"unexpected file in store: {'/'.join(parts)}")
+        on_disk["/".join(parts)] = found
+
+    directory = root / BATCH_DIRECTORY
+    if not directory.is_dir():
+        if on_disk:
+            raise StoreVersionError(
+                "the store has data files but no commit markers (ADR 0017), so it was not "
+                f"written by this version of the code; {REBUILD}"
+            )
+        return [], 0
+
+    committed: list[_DataFile] = []
+    latest = 0
+    for marker in sorted(directory.iterdir()):
+        if marker.name.startswith("."):
+            continue  # a marker still being written
+        match = _MARKER.fullmatch(marker.name)
+        if match is None:
+            raise ValueError(f"unexpected file in store: {BATCH_DIRECTORY}/{marker.name}")
+        knowledge_ts = int(match.group(1))
+        where = f"commit marker {marker.name}"
+        try:
+            content = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise ValueError(f"{where} cannot be read as JSON") from None
+        if not isinstance(content, dict):
+            raise ValueError(f"{where} is not a JSON object")
+        if content.get("layout") != STORE_LAYOUT:
+            raise StoreVersionError(
+                f"{where} is for store layout {content.get('layout')!r}, but this code reads "
+                f"layout {STORE_LAYOUT}; {REBUILD}"
+            )
+        if content.get("knowledge_ts") != knowledge_ts:
+            raise ValueError(f"{where} does not hold the knowledge time its name gives")
+        names = content.get("files")
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ValueError(f"{where} has no list of files")
+        for name in names:
+            listed = _data_file(root, tuple(name.split("/")))
+            if listed is None or listed.knowledge_ts != knowledge_ts:
+                raise ValueError(f"{where} names a file that is not one of its batch's data files")
+            if name not in on_disk:
+                raise ValueError(f"committed store file {name} is missing; the store is damaged")
+            committed.append(on_disk[name])
+        latest = max(latest, knowledge_ts)
+    return committed, latest
+
+
+def _check_versions(root: Path, files: list[_DataFile]) -> None:
     """Refuse any file whose recorded dataset, schema version or columns are not
     what this code reads. Only the footer of each file is read."""
-    for name, paths in files.items():
+    for file in files:
+        name, path = file.dataset, file.path
         dataset = DATASETS[name]
         expected = dataset.stored_schema.remove_metadata()
-        for path in paths:
-            where = f"store file {Path(path).relative_to(root).as_posix()}"
-            try:
-                schema = pq.read_schema(path)
-            except (OSError, pa.ArrowException) as error:
-                problem = f"cannot be read as Parquet ({type(error).__name__})"
-                raise StoreVersionError(f"{where} {problem}; {_REBUILD}") from None
-            metadata = schema.metadata or {}
-            found = metadata.get(b"qa.dataset", b"").decode("utf-8", "replace")
-            version = metadata.get(b"qa.schema_version", b"").decode("utf-8", "replace")
-            if not found or not version:
-                raise StoreVersionError(f"{where} has no schema version; {_REBUILD}")
-            if found != name:
-                raise StoreVersionError(
-                    f"{where} is in the {name} directory but holds {found} rows; {_REBUILD}"
-                )
-            if version != str(dataset.version):
-                raise StoreVersionError(
-                    f"{where} holds {name} schema version {version}, but this code reads "
-                    f"version {dataset.version}: {_REBUILD}"
-                )
-            if not schema.remove_metadata().equals(expected):
-                raise StoreVersionError(
-                    f"{where} says {name} schema version {version}, but its columns are not "
-                    f"that version's; {_REBUILD}"
-                )
+        where = f"store file {Path(path).relative_to(root).as_posix()}"
+        try:
+            schema = pq.read_schema(path)
+        except (OSError, pa.ArrowException) as error:
+            problem = f"cannot be read as Parquet ({type(error).__name__})"
+            raise StoreVersionError(f"{where} {problem}; {_REBUILD}") from None
+        metadata = schema.metadata or {}
+        found = metadata.get(b"qa.dataset", b"").decode("utf-8", "replace")
+        version = metadata.get(b"qa.schema_version", b"").decode("utf-8", "replace")
+        if not found or not version:
+            raise StoreVersionError(f"{where} has no schema version; {_REBUILD}")
+        if found != name:
+            raise StoreVersionError(
+                f"{where} is in the {name} directory but holds {found} rows; {_REBUILD}"
+            )
+        if version != str(dataset.version):
+            raise StoreVersionError(
+                f"{where} holds {name} schema version {version}, but this code reads "
+                f"version {dataset.version}: {_REBUILD}"
+            )
+        if not schema.remove_metadata().equals(expected):
+            raise StoreVersionError(
+                f"{where} says {name} schema version {version}, but its columns are not "
+                f"that version's; {_REBUILD}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,40 +264,23 @@ def _quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _visible_files(root: Path, as_of: int) -> dict[str, list[str]]:
-    """Data files whose knowledge time is at or before ``as_of``, per dataset."""
-    files: dict[str, list[str]] = {name: [] for name in DATASETS}
-    for path in sorted(root.rglob("*.parquet")):
-        parts = path.relative_to(root).parts
-        match = _PART.fullmatch(parts[-1])
-        well_placed = (
-            len(parts) == 5
-            and parts[0] in DATASETS
-            and [p.split("=")[0] for p in parts[1:4]] == list(_PARTITION_COLUMNS)
-            and all(_PARTITION_DIRECTORY.fullmatch(p) for p in parts[1:4])
-        )
-        if match is None or not well_placed:
-            raise ValueError(f"unexpected file in store: {'/'.join(parts)}")
-        if int(match.group(1)) <= as_of:
-            files[parts[0]].append(path.as_posix())
-    return files
-
-
-def _view_sql(dataset: Dataset, files: list[str], as_of: int) -> str:
+def _view_sql(dataset: Dataset, files: list[str], version: int, available_at: int) -> str:
     stored = dataset.stored_schema
     columns = ", ".join(f'"{name}"' for name in (*_PARTITION_COLUMNS, *stored.names))
     if not files:
         typed = [f'CAST(NULL AS {t}) AS "{n}"' for n, t in _PARTITION_COLUMNS.items()]
         typed += [f'CAST(NULL AS {_DUCKDB_TYPES[f.type]}) AS "{f.name}"' for f in stored]
-        return f'CREATE VIEW "{dataset.name}" AS SELECT {", ".join(typed)} WHERE false'
+        return f'CREATE OR REPLACE VIEW "{dataset.name}" AS SELECT {", ".join(typed)} WHERE false'
 
     identity = ", ".join(f'"{name}"' for name in ("venue", "instrument", *dataset.key))
     # Latest knowledge first. The remaining columns only make the choice
     # deterministic if one batch holds the same record twice.
     tie_break = ", ".join(f'"{name}" DESC' for name in stored.names if name != "knowledge_ts")
     hive_types = ", ".join(f"'{n}': {t}" for n, t in _PARTITION_COLUMNS.items())
+    # Both cutoffs apply before a version is chosen: the version of a record a
+    # session sees is the latest among the rows it had received (ADR 0017).
     return f"""
-        CREATE VIEW "{dataset.name}" AS
+        CREATE OR REPLACE VIEW "{dataset.name}" AS
         SELECT {columns} FROM (
             SELECT {columns}, row_number() OVER (
                 PARTITION BY {identity} ORDER BY "knowledge_ts" DESC, {tie_break}
@@ -172,74 +289,130 @@ def _view_sql(dataset: Dataset, files: list[str], as_of: int) -> str:
                 [{", ".join(_quote(f) for f in files)}],
                 hive_partitioning = true, hive_types = {{{hive_types}}}
             )
-            WHERE "knowledge_ts" <= {as_of}
+            WHERE "knowledge_ts" <= {version} AND "recv_ts" <= {available_at}
         ) WHERE _version_rank = 1
     """
 
 
-class PITSession:
-    """Read the store as it was known at ``as_of``.
+def _create_views(
+    con: duckdb.DuckDBPyConnection, files: list[_DataFile], version: int, available_at: int
+) -> None:
+    """(Re)define the four views for ``available_at``, all of them or none."""
+    day = available_at // _NS_PER_DAY
+    con.execute("BEGIN")
+    try:
+        for dataset in DATASETS.values():
+            # A file of a later receipt day cannot hold a row received by now.
+            paths = [f.path for f in files if f.dataset == dataset.name and f.day <= day]
+            con.execute(_view_sql(dataset, paths, version, available_at))
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
 
-    ``as_of`` is a required keyword: there is no default and no way to change
-    it afterwards. To read as of another time, open another session.
+
+def _open(
+    session: "PITSession", root: Any, *, available_at: int, version: int | None, horizon: int
+) -> list[_DataFile]:
+    """Set ``session`` up to read ``root`` at the two cutoffs.
+
+    ``horizon`` is the latest ``available_at`` the session's engine may ever
+    serve: ``available_at`` itself for a plain session, the cursor's end for a
+    replay cursor. Returns the files the engine may open.
+    """
+    _check_time("available_at", available_at)
+    if version is not None:
+        if type(version) is not int:
+            raise TypeError(
+                f"version must be int nanoseconds or None, got {type(version).__name__}"
+            )
+        if not 0 <= version <= INT64_MAX:
+            raise ValueError(f"version={version} is outside the int64 nanosecond range")
+
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise FileNotFoundError(f"store directory does not exist: {root_path}")
+    if any("=" in part for part in root_path.parts):
+        raise ValueError(
+            f"store path must not contain '=' (it would be read as a partition): {root_path}"
+        )
+
+    committed, latest = _committed_files(root_path)
+    if version is None:
+        version = latest
+    elif version > latest:
+        raise ValueError(
+            f"version={version} is later than the latest committed batch ({latest}). Such a "
+            "version would not be repeatable: a batch committed later could fall inside it. "
+            f"Omit version to read the latest committed batch, or pass version={latest}."
+        )
+    files = [f for f in committed if f.knowledge_ts <= version and f.day <= horizon // _NS_PER_DAY]
+    _check_versions(root_path, files)
+
+    con = duckdb.connect(":memory:", config={"python_enable_replacements": False})
+    try:
+        _create_views(con, files, version, available_at)
+        # From here on this database can open only the files listed, and
+        # none of these settings can be changed again.
+        con.execute(f"SET allowed_paths = [{', '.join(_quote(f.path) for f in files)}]")
+        con.execute("SET enable_external_access = false")
+        con.execute("SET autoinstall_known_extensions = false")
+        con.execute("SET autoload_known_extensions = false")
+        con.execute("SET lock_configuration = true")
+    except BaseException:
+        con.close()
+        raise
+
+    object.__setattr__(session, "_available_at", available_at)
+    object.__setattr__(session, "_version", version)
+    object.__setattr__(session, "_con", con)
+    object.__setattr__(session, "_redactions", (root_path.as_posix(), str(root_path)))
+    return files
+
+
+class PITSession:
+    """Read the store as it was received by ``available_at``, at one version.
+
+    ``available_at`` is a required keyword: there is no default and no way to
+    change it afterwards. ``version`` defaults to the latest committed batch.
+    To read at another time or version, open another session; a backtest that
+    moves through time uses a ``ReplayCursor``.
     """
 
-    __slots__ = ("_as_of", "_con", "_redactions")
+    __slots__ = ("_available_at", "_version", "_con", "_redactions")
 
-    def __init__(self, root: Any, *, as_of: int):
-        if type(as_of) is not int:
-            raise TypeError(f"as_of must be int nanoseconds, got {type(as_of).__name__}")
-        if not 0 <= as_of <= INT64_MAX:
-            raise ValueError(f"as_of={as_of} is outside the int64 nanosecond range")
+    def __new__(cls, *args: Any, **kwargs: Any) -> "PITSession":
+        if "as_of" in kwargs:
+            raise TypeError(_AS_OF_RETIRED)
+        return super().__new__(cls)
 
-        root_path = Path(root).resolve()
-        if not root_path.is_dir():
-            raise FileNotFoundError(f"store directory does not exist: {root_path}")
-        if any("=" in part for part in root_path.parts):
-            raise ValueError(
-                f"store path must not contain '=' (it would be read as a partition): {root_path}"
-            )
-
-        files = _visible_files(root_path, as_of)
-        _check_versions(root_path, files)
-        readable = [path for paths in files.values() for path in paths]
-
-        con = duckdb.connect(":memory:", config={"python_enable_replacements": False})
-        try:
-            for dataset in DATASETS.values():
-                con.execute(_view_sql(dataset, files[dataset.name], as_of))
-            # From here on this database can open only the files listed, and
-            # none of these settings can be changed again.
-            con.execute(f"SET allowed_paths = [{', '.join(_quote(p) for p in readable)}]")
-            con.execute("SET enable_external_access = false")
-            con.execute("SET autoinstall_known_extensions = false")
-            con.execute("SET autoload_known_extensions = false")
-            con.execute("SET lock_configuration = true")
-        except BaseException:
-            con.close()
-            raise
-
-        object.__setattr__(self, "_as_of", as_of)
-        object.__setattr__(self, "_con", con)
-        object.__setattr__(self, "_redactions", (root_path.as_posix(), str(root_path)))
+    def __init__(self, root: Any, *, available_at: int, version: int | None = None):
+        _open(self, root, available_at=available_at, version=version, horizon=available_at)
 
     # --- public surface -----------------------------------------------------
 
     @property
-    def as_of(self) -> int:
-        return self._as_of
+    def available_at(self) -> int:
+        """Simulated time: only rows with ``recv_ts`` at or before it are visible."""
+        return self._available_at
+
+    @property
+    def version(self) -> int:
+        """The knowledge cutoff in force: the committed batch this session reads up to."""
+        return self._version
 
     def trades(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
-        """Trades with ``start <= event_ts < end``, latest known version of each."""
+        """Trades received in ``start <= recv_ts < end``, latest known version of each."""
         return self._range(TRADES, venue, instrument, start, end)
 
     def book_events(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
-        """Book levels with ``start <= event_ts < end``, latest known version of each."""
+        """Book levels received in ``start <= recv_ts < end``, latest known version of each."""
         return self._range(BOOK_EVENTS, venue, instrument, start, end)
 
     def stream_events(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
-        """Integrity events (gaps, reconnects, checksum mismatches, ...) with
-        ``start <= event_ts < end``. Their ``event_ts`` is the receipt time."""
+        """Integrity events (gaps, reconnects, checksum mismatches, ...) noticed at
+        records received in ``start <= recv_ts < end``: the same window, on the
+        same clock, as the market data they qualify."""
         return self._range(STREAM_EVENTS, venue, instrument, start, end)
 
     def instruments(self, venue: str, instrument: str) -> pa.Table:
@@ -257,12 +430,12 @@ class PITSession:
     def instrument(
         self, venue: str, instrument: str, *, at: int | None = None
     ) -> InstrumentMeta | None:
-        """The metadata version in effect at time ``at`` (default: ``as_of``).
+        """The metadata version in effect at time ``at`` (default: ``available_at``).
 
-        Only versions known at ``as_of`` are considered, whatever ``at`` is.
-        Returns None if no known version was in effect at that time.
+        Only versions the session can see are considered, whatever ``at`` is.
+        Returns None if no such version was in effect at that time.
         """
-        effective = self._as_of if at is None else at
+        effective = self._available_at if at is None else at
         _check_time("at", effective)
         versions = self.instruments(venue, instrument).to_pylist()
         in_effect = [row for row in versions if row["event_ts"] <= effective]
@@ -282,12 +455,14 @@ class PITSession:
         )
 
     def sql(self, query: str) -> pa.Table:
-        """Run one SELECT over the views ``trades``, ``book_events`` and ``instruments``.
+        """Run one SELECT over the views ``trades``, ``book_events``, ``instruments``
+        and ``stream_events``.
 
         Each view has the columns venue, instrument, date, then the dataset's
-        stored columns, and holds the latest version of each record known at
-        ``as_of``. Anything other than a single allowed SELECT raises
-        QueryRejected without being run; see ``sqlguard`` for what is allowed.
+        stored columns, and holds the latest version of each record inside the
+        session's two cutoffs. Anything other than a single allowed SELECT
+        raises QueryRejected without being run; see ``sqlguard`` for what is
+        allowed.
         """
         if not isinstance(query, str):
             raise TypeError(f"query must be str, got {type(query).__name__}")
@@ -328,9 +503,10 @@ class PITSession:
         replay_order = ("log_id", "seq")  # ADR 0012, ADR 0013
         rest = [name for name in names if name not in replay_order]
         order = ", ".join(f'"{name}"' for name in (*replay_order, *rest))
+        # The window is receipt time for every dataset (ADR 0017).
         table = self._run(
             f'SELECT {columns} FROM "{dataset.name}" WHERE "venue" = ? AND "instrument" = ? '
-            f'AND "event_ts" >= ? AND "event_ts" < ? ORDER BY {order}',
+            f'AND "recv_ts" >= ? AND "recv_ts" < ? ORDER BY {order}',
             [venue, instrument, start, end],
         )
         return table.cast(dataset.stored_schema)
@@ -354,10 +530,12 @@ class PITSession:
         self.close()
 
     def __repr__(self) -> str:
-        return f"PITSession(as_of={self._as_of})"
+        return f"PITSession(available_at={self._available_at}, version={self._version})"
 
     def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("PITSession is immutable; open a new session for another as_of")
+        raise AttributeError(
+            "PITSession is immutable; open a new session for another available_at or version"
+        )
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError("PITSession is immutable")
@@ -367,3 +545,106 @@ class PITSession:
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("PITSession cannot be subclassed")
+
+
+# __new__ takes anything so that it can refuse as_of with a useful message; the
+# constructor's real signature is __init__'s.
+PITSession.__signature__ = inspect.Signature(
+    list(inspect.signature(PITSession.__init__).parameters.values())[1:]
+)
+
+
+class ReplayCursor:
+    """One session for a whole backtest, and the only thing that can move its time.
+
+    The harness opens a cursor over the replay's span, hands ``cursor.session``
+    to the strategy, and calls ``advance`` as simulated time passes. The
+    session reads exactly what a new ``PITSession(available_at=now)`` at the
+    same version would read, without reopening the store. Time only moves
+    forward, and never past ``end``.
+
+    The strategy must be given the session, never the cursor: the session has
+    no method that moves time and holds no reference to its cursor.
+    """
+
+    __slots__ = ("_session", "_files", "_end")
+
+    def __init__(self, root: Any, *, start: int, end: int, version: int | None = None):
+        _check_time("start", start)
+        _check_time("end", end)
+        if end < start:
+            raise ValueError(f"end={end} is before start={start}")
+        session = object.__new__(PITSession)
+        files = _open(session, root, available_at=start, version=version, horizon=end)
+        object.__setattr__(self, "_session", session)
+        object.__setattr__(self, "_files", files)
+        object.__setattr__(self, "_end", end)
+
+    @property
+    def session(self) -> PITSession:
+        """The session to hand to research code. It follows this cursor's time."""
+        return self._session
+
+    @property
+    def available_at(self) -> int:
+        return self._session.available_at
+
+    @property
+    def end(self) -> int:
+        """The latest time this cursor can be advanced to."""
+        return self._end
+
+    def advance(self, available_at: int) -> None:
+        """Move simulated time forward to ``available_at``."""
+        _check_time("available_at", available_at)
+        session = self._session
+        con = session._connection()
+        if available_at < session.available_at:
+            raise ValueError(
+                f"a replay cursor cannot move backwards: it is at {session.available_at}, "
+                f"asked for {available_at}. Open a new cursor to replay from an earlier time."
+            )
+        if available_at > self._end:
+            raise ValueError(
+                f"available_at={available_at} is past this cursor's end ({self._end}); "
+                "open the cursor with a later end"
+            )
+        if available_at == session.available_at:
+            return
+        try:
+            _create_views(con, self._files, session.version, available_at)
+        except duckdb.Error as error:
+            message = str(error)
+        else:
+            object.__setattr__(session, "_available_at", available_at)
+            return
+        for text in session._redactions:
+            message = message.replace(text, "<store>")
+        raise QueryError(message)
+
+    def close(self) -> None:
+        self._session.close()
+
+    def __enter__(self) -> "ReplayCursor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"ReplayCursor(available_at={self.available_at}, end={self._end}, "
+            f"version={self._session.version})"
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ReplayCursor is immutable; move time with advance()")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("ReplayCursor is immutable")
+
+    def __reduce_ex__(self, protocol: object) -> None:
+        raise TypeError("ReplayCursor cannot be copied or pickled")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ReplayCursor cannot be subclassed")

@@ -1,6 +1,6 @@
 # 0011: The recording clock must be synchronized, and is measured
 
-Status: Accepted (owner decision)
+Status: Accepted (owner decision), amended by 0017
 Date: 2026-11-12
 Amends: 0005, 0010
 

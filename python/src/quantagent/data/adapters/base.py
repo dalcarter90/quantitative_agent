@@ -566,25 +566,32 @@ def ingest(
 ) -> Report:
     """Normalize a raw log into ``store`` and return what happened to every record.
 
-    Rows are appended whenever ``batch_rows`` of them are pending, one append
-    per dataset and instrument. That bounds memory (a single book snapshot can
+    One load is one batch (ADR 0017): every row of the log, in every dataset,
+    gets the same ``knowledge_ts``, and none of it is readable until the whole
+    log has been written and the batch is committed. If the load fails,
+    nothing of it was ever readable and its files are removed.
+
+    Rows are written whenever ``batch_rows`` of them are pending, one file per
+    dataset, instrument and day. That bounds memory (a single book snapshot can
     be tens of thousands of rows, so the limit is on rows, not messages) and
     keeps the store from filling with one small file per message.
     """
     reader = read_raw_log(path)
     normalizer = Normalizer()
 
-    def flush() -> None:
-        pending = normalizer.take_rows()
-        for key in sorted(pending, key=lambda k: (_APPEND_ORDER[k[0]], k)):
-            dataset_name, venue, instrument = key
-            dataset = DATASETS[dataset_name]
-            store.append(dataset, venue, instrument, table_from_rows(dataset, pending[key]))
+    with store.batch() as batch:
 
-    for record in reader:
-        normalizer.feed(record)
-        if normalizer.pending_rows >= batch_rows:
-            flush()
-    flush()
+        def flush() -> None:
+            pending = normalizer.take_rows()
+            for key in sorted(pending, key=lambda k: (_APPEND_ORDER[k[0]], k)):
+                dataset_name, venue, instrument = key
+                dataset = DATASETS[dataset_name]
+                batch.append(dataset, venue, instrument, table_from_rows(dataset, pending[key]))
+
+        for record in reader:
+            normalizer.feed(record)
+            if normalizer.pending_rows >= batch_rows:
+                flush()
+        flush()
     normalizer.report.truncated = reader.truncated
     return normalizer.report

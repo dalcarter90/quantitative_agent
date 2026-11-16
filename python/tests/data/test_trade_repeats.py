@@ -109,7 +109,7 @@ def test_an_identical_repeat_is_dropped_and_the_store_keeps_the_first_observatio
     assert normalized.report.rows["trades"] == 1
     assert normalized.report.trade_repeats == 1
     ingest(write_log(tmp_path / "a.qaraw", records), AppendOnlyStore(tmp_path / "store"))
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         trades = session.trades("kraken", INSTRUMENT, 0, INT64_MAX).to_pylist()
     assert [t["trade_id"] for t in trades] == ["115202912"]
     assert (trades[0]["seq"], trades[0]["recv_ts"]) == (records[-2].seq, records[-2].recv_ts)
@@ -270,7 +270,7 @@ def test_a_conflict_is_an_error_in_the_quality_report_and_the_store_keeps_one_ro
     (finding,) = [f for f in result.findings if f.what == "trade_conflict"]
     assert finding.severity == Severity.ERROR and finding.dataset == "stream_events"
     assert "115202912" in finding.message and "price" in finding.message
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         assert session.trades("kraken", INSTRUMENT, 0, INT64_MAX).num_rows == 1
 
 

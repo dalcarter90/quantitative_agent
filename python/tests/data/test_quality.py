@@ -97,7 +97,7 @@ def planted(tmp_path, base_rows, edit) -> Path:
 
 
 def run(check, root, venue="kraken", config=None, window=ALL) -> CheckResult:
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         return check(session, venue, INSTRUMENT, *window, config or QualityConfig())
 
 
@@ -159,7 +159,7 @@ def test_clean_fixture_stats_show_the_checks_actually_looked(clean_store):
 
 
 def test_run_checks_covers_every_venue_and_instrument_in_the_store(clean_store):
-    with PITSession(clean_store, as_of=INT64_MAX) as session:
+    with PITSession(clean_store, available_at=INT64_MAX) as session:
         results = run_checks(session, *ALL)
     assert sorted({(r.venue, r.instrument) for r in results}) == [
         ("coinbase", INSTRUMENT),
@@ -171,7 +171,7 @@ def test_run_checks_covers_every_venue_and_instrument_in_the_store(clean_store):
         ("coinbase", "clock_not_recorded", Severity.INFO),
         ("kraken", "clock_not_recorded", Severity.INFO),
     ]
-    with PITSession(clean_store, as_of=INT64_MAX) as session:
+    with PITSession(clean_store, available_at=INT64_MAX) as session:
         only = run_checks(session, *ALL, venue="kraken")
         assert {r.venue for r in only} == {"kraken"}
         assert run_checks(session, 0, 1) == []  # nothing that early
@@ -620,10 +620,14 @@ def test_findings_are_limited_to_the_requested_time_range(tmp_path, kraken_rows)
         ]
 
     root = planted(tmp_path, kraken_rows, edit)
-    at = victim["event_ts"]
+    at = victim["recv_ts"]  # ranges are receipt time (ADR 0017)
     assert len(run(check_outliers, root, window=(at, at + 1)).findings) == 1
     assert run(check_outliers, root, window=(at + 1, INT64_MAX)).findings == []
     assert run(check_outliers, root, window=(0, at)).findings == []
+    # Venue time does not select it: the trade happened before it was received.
+    assert victim["event_ts"] < at
+    happened = victim["event_ts"]
+    assert run(check_outliers, root, window=(happened, happened + 1)).findings == []
 
 
 def test_findings_are_capped_and_the_result_says_so(clean_store):
@@ -633,19 +637,25 @@ def test_findings_are_capped_and_the_result_says_so(clean_store):
     assert result.truncated is True
 
 
-def test_checks_only_see_what_was_known_at_as_of(tmp_path, kraken_rows):
+def test_checks_only_see_what_the_session_sees(tmp_path, kraken_rows):
+    victim = live_trades(kraken_rows)[60]
+
     def edit(rows):
-        victim = live_trades(rows)[60]
         rows[TRADES] = [
             {**r, "qty": 0} if r["trade_id"] == victim["trade_id"] else r for r in rows[TRADES]
         ]
 
+    def findings(**cutoffs):
+        with PITSession(root, **cutoffs) as session:
+            return check_outliers(session, "kraken", INSTRUMENT, *ALL, QualityConfig()).findings
+
     root = planted(tmp_path, kraken_rows, edit)
     first_file = min(int(p.name[5:25]) for p in root.rglob("*.parquet"))
-    with PITSession(root, as_of=first_file - 1) as before:
-        assert check_outliers(before, "kraken", INSTRUMENT, *ALL, QualityConfig()).findings == []
-    with PITSession(root, as_of=INT64_MAX) as after:
-        assert len(check_outliers(after, "kraken", INSTRUMENT, *ALL, QualityConfig()).findings) == 1
+    # A version before the trades were loaded, and a time before the bad one arrived.
+    assert findings(available_at=INT64_MAX, version=first_file - 1) == []
+    assert findings(available_at=victim["recv_ts"] - 1) == []
+    assert len(findings(available_at=victim["recv_ts"])) == 1
+    assert len(findings(available_at=INT64_MAX)) == 1
 
 
 def test_running_every_check_changes_nothing_in_the_store(tmp_path, kraken_rows):
@@ -665,7 +675,7 @@ def test_running_every_check_changes_nothing_in_the_store(tmp_path, kraken_rows)
         }
 
     before = digests()
-    with PITSession(root, as_of=INT64_MAX) as session:
+    with PITSession(root, available_at=INT64_MAX) as session:
         results = run_checks(session, *ALL)
         whats = sorted(f.what for r in results for f in r.findings)
         assert whats == ["clock_not_recorded", "nonpositive_price"]
@@ -688,7 +698,7 @@ def test_the_quality_module_reads_only_through_pitsession():
 @pytest.mark.parametrize("name", ["venue", "instrument"])
 def test_names_are_validated_before_they_reach_sql(clean_store, name):
     arguments = {"venue": "kraken", "instrument": INSTRUMENT, name: "x' OR '1'='1"}
-    with PITSession(clean_store, as_of=INT64_MAX) as session:
+    with PITSession(clean_store, available_at=INT64_MAX) as session:
         for check in CHECKS:
             with pytest.raises(ValueError):
                 check(session, arguments["venue"], arguments["instrument"], *ALL, QualityConfig())
@@ -808,11 +818,40 @@ def test_report_date_range_and_filters(clean_store, capsys):
     assert "coinbase/BTC-USD" in capsys.readouterr().out
 
 
-def test_report_as_of_shows_what_was_known_then(clean_store, capsys):
+def test_report_at_an_earlier_version_or_time_shows_what_was_there_then(clean_store, capsys):
+    store = ["--store", str(clean_store), *DAY]
     first_file = min(int(p.name[5:25]) for p in clean_store.rglob("*.parquet"))
-    early = ["--store", str(clean_store), *DAY, "--as-of", str(first_file - 1)]
-    assert quality.main(early) == 0
+    assert quality.main([*store, "--version", str(first_file - 1)]) == 0
     assert "no data" in capsys.readouterr().out
+
+    with PITSession(clean_store, available_at=INT64_MAX) as session:
+        (first,) = session.sql("SELECT min(recv_ts) AS t FROM stream_events").to_pylist()
+    assert quality.main([*store, "--available-at", str(first["t"] - 1)]) == 0
+    assert "no data" in capsys.readouterr().out
+    assert quality.main([*store, "--available-at", str(first["t"])]) == 0
+    output = capsys.readouterr().out
+    assert "no data" not in output and f"received by {first['t']}" in output
+
+
+def test_report_names_the_store_version_it_read(clean_store, capsys):
+    with PITSession(clean_store, available_at=INT64_MAX) as session:
+        version = session.version
+    assert quality.main(["--store", str(clean_store), *DAY]) == 0
+    assert f"store version {version}" in capsys.readouterr().out
+
+
+def test_report_refuses_the_retired_as_of_and_a_version_that_is_not_committed(clean_store, capsys):
+    store = ["--store", str(clean_store), *DAY]
+    with pytest.raises(SystemExit) as stopped:
+        quality.main([*store, "--as-of", "5"])
+    assert stopped.value.code == 2
+    error = capsys.readouterr().err
+    assert "--version" in error and "--available-at" in error and "ADR 0017" in error
+
+    with pytest.raises(SystemExit) as stopped:
+        quality.main([*store, "--version", str(INT64_MAX)])
+    assert stopped.value.code == 2
+    assert "latest committed" in capsys.readouterr().err
 
 
 def test_report_uses_a_config_file(clean_store, tmp_path, capsys):

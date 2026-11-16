@@ -707,7 +707,7 @@ def test_the_command_line_writes_golden_files(tmp_path):
 def test_the_store_read_gives_the_same_messages_as_normalizing_directly(tmp_path):
     ingest(fixture_path("kraken"), AppendOnlyStore(tmp_path / "store"))
     direct, _ = from_records(kraken_records(), "kraken")
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         stored = list(messages_from_table(session.book_events("kraken", INSTRUMENT, 0, INT64_MAX)))
     assert stored == direct
 
@@ -731,7 +731,7 @@ RECORDINGS = Path(__file__).parents[3] / "data" / "raw"
 def test_the_one_hour_recordings_match_every_check_snapshot(venue, tmp_path):
     (path,) = sorted((RECORDINGS / venue / INSTRUMENT).glob("*.qaraw.zst"))
     ingest(path, AppendOnlyStore(tmp_path / "store"))
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         messages = list(messages_from_table(session.book_events(venue, INSTRUMENT, 0, INT64_MAX)))
         events = session.stream_events(venue, INSTRUMENT, 0, INT64_MAX).to_pylist()
     results = verify_check_snapshots(venue, messages, events)
