@@ -1,6 +1,6 @@
 # 0017: The time model: two cutoffs, committed batches, receipt-time windows
 
-Status: Accepted (owner decision, 2026-11-15); implementation choices to be confirmed by the owner, see "Review"
+Status: Accepted (owner decision, 2026-11-15; implementation choices confirmed by the owner 2026-11-15, see "Review")
 Date: 2026-11-15
 Amends: 0006, 0008, 0011, 0015
 
@@ -217,7 +217,7 @@ again.
 The owner decided the four points under "Decision", including the names
 `available_at` and `version`, refusing stores without markers, and
 partitioning by the date of `recv_ts`. These choices were made while building
-it and are to be confirmed:
+it, and the owner confirmed all ten on 2026-11-15:
 
 1. **A `version` later than the latest committed batch is refused,** not
    clamped. It is what makes "the same version reads the same rows" true
@@ -242,6 +242,13 @@ it and are to be confirmed:
    request, and refusing it is the fix. R09's required a window that excludes
    the gap event to hold book messages from after the loss; with one clock
    that window holds none, which is the fix. Each now checks the property its
-   finding was about, and each fails on the code before this ADR.
+   finding was about. Run as-is against main (before this ADR), the reshaped
+   tests fail on the parameter name (`available_at` does not exist there).
+   With the parameter names translated to main's `as_of`, they fail for the
+   R03 and R09 findings: R03's with `DID NOT RAISE ValueError`, because main
+   accepts the knowledge cutoff of 2000 while the batch at 1000 is
+   unpublished; R09's because a window ending just after the first book
+   message past the loss holds that message and replays without the gap. The
+   breakage pass, which undoes each fix inside the new code, also caught both.
 10. **One message in the quality report was corrected:** a bad recording
     clock puts `recv_ts` off, not `knowledge_ts` (review, X2).

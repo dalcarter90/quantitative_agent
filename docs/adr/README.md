@@ -30,7 +30,7 @@ confirms it.
 | [0014](0014-coinbase-check-snapshots-by-stream-batch.md) | Coinbase check snapshots are judged by stream batch: exact on a batch time; between batches, exact except on the next batch's levels | Accepted; implementation choices confirmed; amended by 0015 |
 | [0015](0015-owner-review-of-0013-and-0014.md) | Owner review of 0013 and 0014: `PITSession` refuses files of another schema version; a trade repeated with a different price, quantity or side is an ERROR; a session with no compared check snapshot is a WARNING | Accepted, amended by 0016 and 0017 |
 | [0016](0016-keep-the-first-observation-of-a-repeated-trade.md) | An identical repeat of a trade is dropped and recorded as a `TRADE_REPEAT` event, so the store keeps the first observation; confirms 0015's reading of "no check snapshot compared" | Accepted |
-| [0017](0017-time-model-two-cutoffs-and-committed-batches.md) | The time model: a session has two cutoffs (`available_at` on receipt time, `version` on knowledge time) and `as_of` is retired; a load is one batch, readable only once its commit marker is written; time windows and date partitions are receipt time; a replay cursor advances one session | Accepted; implementation choices to be confirmed |
+| [0017](0017-time-model-two-cutoffs-and-committed-batches.md) | The time model: a session has two cutoffs (`available_at` on receipt time, `version` on knowledge time) and `as_of` is retired; a load is one batch, readable only once its commit marker is written; time windows and date partitions are receipt time; a replay cursor advances one session | Accepted; implementation choices confirmed |
 
 ## Template
 

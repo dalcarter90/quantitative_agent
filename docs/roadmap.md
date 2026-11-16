@@ -1310,7 +1310,9 @@ findings R01, R02, R03 and R09 (ADR 0017).
 - The R01, R02, R03 and R09 review tests pass unmarked. R01 and R02 changed
   only in the session's parameters. **R03 and R09 had to change shape**,
   because the fix makes the situation each set up impossible (ADR 0017,
-  Review item 9); each fails again when its fix is undone (breakage pass).
+  Review item 9). Run as-is against main they fail on the parameter name;
+  with the names translated to main's `as_of` they fail for the R03 and R09
+  findings; and the breakage pass caught both.
 - The 16 review tests still marked `xfail(strict=True)` (R04 to R08, R10,
   R11) each still fail for the reason the review gives.
 - Breakage pass: 25 deliberate breakages of the new code (both view filters, the order of filtering and version choice, each half of the engine's file limit, uncommitted files, the version ceiling, receipt-time ranges, the `as_of` refusal, five in the cursor, the marker checks, the receipt-date partition, the commit-order check, abandoning, empty batches, one knowledge time per batch, knowledge times from 1, reserving dead batches' times, `ingest` as one batch, and the quality ranges): all 25 caught.
@@ -1333,9 +1335,10 @@ findings R01, R02, R03 and R09 (ADR 0017).
 - **R10 is narrower but open.** A trade seen live and resent by a later log is
   seen as its live observation by a session whose `available_at` is before
   the resend. After it, the store still shows the later observation.
-- **For the owner: ADR 0017's "Review" section** lists ten choices made while
-  building this, to confirm. The main one: a `version` later than the latest
-  committed batch is refused rather than clamped.
+- **ADR 0017's "Review" section** lists ten choices made while building
+  this. The owner confirmed all ten on 2026-11-15, including refusing a
+  `version` later than the latest committed batch rather than clamping it,
+  and the reshaped R03 and R09 tests.
 - **A load that dies leaves its files** without a commit marker. Sessions
   ignore them and nothing deletes them; a store that has seen many failed
   loads carries dead files.
