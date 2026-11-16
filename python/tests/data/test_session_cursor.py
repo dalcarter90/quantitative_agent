@@ -175,14 +175,14 @@ def test_a_cursor_is_fixed_too(history):
 
 def test_batches_committed_after_the_cursor_opened_never_appear(history):
     with ReplayCursor(history.root, start=RECV_A, end=END) as cursor:
-        history.store.append(TRADES, *KRK, trade_table(("z", T0, 1), seq=9))
+        history.store._append(TRADES, *KRK, trade_table(("z", T0, 1), seq=9))
         cursor.advance(END)
         assert cursor.session.version == 9000
         assert trade_ids(cursor.session) == ["a", "b", "c"]
 
 
 def test_an_uncommitted_batch_never_appears(history):
-    history.store.batch().append(TRADES, *KRK, trade_table(("u", T0, 1), seq=9))
+    history.store._batch().append(TRADES, *KRK, trade_table(("u", T0, 1), seq=9))
     with ReplayCursor(history.root, start=RECV_A, end=END) as cursor:
         cursor.advance(END)
         assert trade_ids(cursor.session) == ["a", "b", "c"]

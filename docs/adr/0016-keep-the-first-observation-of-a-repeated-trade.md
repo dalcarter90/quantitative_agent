@@ -1,6 +1,6 @@
 # 0016: An identical repeat of a trade is dropped; the store keeps the first observation
 
-Status: Accepted (owner decision, 2026-11-13)
+Status: Accepted (owner decision, 2026-11-13), amended by 0018
 Date: 2026-11-13
 Amends: 0010, 0015
 

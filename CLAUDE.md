@@ -13,8 +13,9 @@ A quantitative trading agent, built in phases. Five layers:
 2. **Python data core** (`python/src/quantagent/data/`, built in Phase 1):
    append-only bitemporal storage (event, receipt and knowledge time) queried
    only through `PITSession(available_at=...)`, which shows the rows received
-   by that time at one version of the store (ADR 0017), plus a reference
-   order book reconstructor (Phase 2) that the C++ book is verified against.
+   by that time at one version of the store (ADR 0017), each raw log from its
+   latest complete load (ADR 0018), plus a reference order book
+   reconstructor (Phase 2) that the C++ book is verified against.
 3. **Signal layer**: order flow imbalance, technicals, regime detection, one
    blended model, validated walk-forward with purged CV and real costs.
 4. **Risk/portfolio**: sizing, exposure limits, drawdown guard that pauses
@@ -181,7 +182,8 @@ Things that commonly go wrong:
 - **Release and Debug share one `.pyd` path.** The last configuration built
   is the one Python imports.
 - **`StoreVersionError` when opening a store**: it was written by an earlier
-  version of the code (before commit markers, ADR 0017, or another schema).
+  version of the code (before loads, ADR 0018; before commit markers, ADR
+  0017; or another schema).
   Rebuild it from the raw logs into a new directory with the adapters command
   above. `PITSession(..., as_of=...)` is a `TypeError` for the same reason:
   pass `available_at`, and `version` for a knowledge cutoff.

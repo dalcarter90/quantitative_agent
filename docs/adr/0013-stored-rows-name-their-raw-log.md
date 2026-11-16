@@ -1,6 +1,6 @@
 # 0013: Stored rows name their raw log; keys and order use `(log_id, seq)`
 
-Status: Accepted (owner decision; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015
+Status: Accepted (owner decision; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015 and 0018
 Date: 2026-11-12
 Amends: 0006, 0009, 0010, 0012
 

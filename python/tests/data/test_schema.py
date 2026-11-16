@@ -330,7 +330,9 @@ def test_a_receipt_row_must_hold_recv_ts_in_event_ts(dataset):
 
 def test_book_events_are_keyed_by_raw_record_and_position():
     assert BOOK_EVENTS.key == ("log_id", "seq", "level_index")
-    assert TRADES.key == ("trade_id",)
+    # Trades too, since ADR 0018; the session shows one row per trade_id.
+    assert TRADES.key == ("log_id", "seq", "trade_id")
+    assert TRADES.one_row_per == ("trade_id",)
     assert INSTRUMENTS.key == ("log_id", "seq")
 
 

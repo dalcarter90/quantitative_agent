@@ -57,7 +57,7 @@ from quantagent.data.adapters.base import (
     receipt_time,
     venue_time,
 )
-from quantagent.data.fixedpoint import to_mantissa
+from quantagent.data.fixedpoint import INT64_MAX, to_mantissa
 from quantagent.data.rawlog import RawRecord
 from quantagent.data.schema import BookEventKind, Side, StreamEventKind
 
@@ -240,6 +240,12 @@ class CoinbaseAdapter(VenueAdapter):
     def _track_sequence(self, record: RawRecord, received: Any) -> None:
         if type(received) is not int:
             raise TypeError(f"sequence_num is not an integer: {received!r}")
+        if not 0 <= received < INT64_MAX:
+            # Refused before it becomes the connection's highest number: the
+            # store holds int64, and so must the next number expected. Kept, one
+            # such number would make every later message look out of order
+            # against a value no event can hold (ADR 0018).
+            raise ValueError(f"sequence_num {received} is outside 0 to 2^63 - 2")
         last = self._last_sequence.get(record.channel)
         if last is not None and received != last + 1:
             if record.channel == STREAM_CHANNEL:

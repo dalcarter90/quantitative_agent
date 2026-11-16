@@ -1,8 +1,12 @@
-"""A trade seen twice (ADRs 0015 and 0016).
+"""A trade seen twice (ADRs 0015, 0016 and 0018).
 
 A venue can send the same trade twice: Coinbase resends some trades in its
-live stream, a stream reconnect resends history, and two logs fed to one
-normalizer can overlap. The store keeps one row per trade_id.
+live stream, a stream reconnect resends history, the next session resends
+the last trades of the previous one, and two logs fed to one normalizer can
+overlap. A session shows one row per trade_id: its first observation in
+(log_id, seq) order (ADR 0018), across logs and loads.
+
+Within one normalizer:
 
 - An identical repeat (same price, quantity and side) is dropped: the first
   observation is the one stored, and the repeat is a TRADE_REPEAT stream
@@ -14,7 +18,7 @@ normalizer can overlap. The store keeps one row per trade_id.
 import json
 
 import pytest
-from _builders import INT64_MAX
+from _builders import INT64_MAX, trade_table
 from test_adapters import (
     COINBASE_CONNECT,
     COINBASE_PRODUCT,
@@ -28,8 +32,8 @@ from test_quality import run, store_from_rows
 
 from quantagent.data.adapters import ingest, normalize
 from quantagent.data.quality import QualityConfig, Severity, check_stream_integrity
-from quantagent.data.rawlog import RawLogWriter, RawRecord
-from quantagent.data.schema import Side, StreamEventKind
+from quantagent.data.rawlog import RawLogWriter, RawRecord, log_id_of
+from quantagent.data.schema import TRADES, Side, StreamEventKind
 from quantagent.data.session import PITSession
 from quantagent.data.store import AppendOnlyStore
 
@@ -298,6 +302,117 @@ def test_each_session_with_repeats_gets_its_own_finding(tmp_path):
                 if f.what == "trades_repeated"]  # fmt: skip
     assert len(findings) == 2 and len({f.log_id for f in findings}) == 2
     assert all("1 trade " in f.message for f in findings)
+
+
+def test_two_logs_fed_together_report_a_conflict_and_show_the_first_observation(tmp_path):
+    """TRADE_CONFLICT comes from the normalizer, so it needs both observations
+    in one normalizer. The session shows the first observation (ADR 0018)."""
+    first = kraken(kraken_trade())
+    second = [RawRecord(r.recv_ts + 10**12, r.seq, r.venue, r.channel, r.payload)
+              for r in kraken(kraken_trade(qty="9"))]  # fmt: skip
+    normalized = normalize(first + second)
+    assert len(conflicts(normalized, "kraken")) == 1
+    root = store_from_rows(tmp_path / "store", normalized.rows)
+    with PITSession(root, available_at=INT64_MAX) as session:
+        (shown,) = session.trades("kraken", INSTRUMENT, 0, INT64_MAX).to_pylist()
+    assert (shown["log_id"], shown["qty"]) == (trade_rows(normalized, "kraken")[0]["log_id"], 51042)
+
+
+# --- which observation a session shows: the first in replay order (ADR 0018) -------------
+#
+# Trades are keyed by the raw record they were observed in, like the other
+# datasets, and every observation the normalizer keeps is stored. The session
+# shows one row per trade_id: its first observation in (log_id, seq) order,
+# among the observations inside both cutoffs. Across logs, across loads, and
+# whatever the venue's or our clock say.
+
+
+def later_log(records, hours=1):
+    return [RawRecord(r.recv_ts + hours * 3600 * 10**9, r.seq, r.venue, r.channel, r.payload)
+            for r in records]  # fmt: skip
+
+
+def shown(root, available_at=INT64_MAX, version=None):
+    with PITSession(root, available_at=available_at, version=version) as session:
+        trades = session.trades("kraken", INSTRUMENT, 0, INT64_MAX).to_pylist()
+    return [(t["log_id"], t["seq"], t["recv_ts"], t["price"]) for t in trades]
+
+
+def test_trades_are_keyed_by_raw_record_and_shown_one_per_trade_id():
+    assert TRADES.key == ("log_id", "seq", "trade_id")
+    assert TRADES.one_row_per == ("trade_id",)
+
+
+@pytest.mark.parametrize("order", ["in recording order", "later log loaded first"])
+def test_a_trade_in_two_logs_loaded_separately_shows_the_earlier_logs_observation(tmp_path, order):
+    live = kraken(kraken_trade())
+    resent = later_log(kraken(kraken_trade(kind="snapshot")))
+    paths = [write_log(tmp_path / "live.qaraw", live), write_log(tmp_path / "resent.qaraw", resent)]
+    if order != "in recording order":
+        paths.reverse()
+    root = tmp_path / "store"
+    store = AppendOnlyStore(root)
+    for path in paths:
+        ingest(path, store)
+    ((log_id, seq, recv_ts, _),) = shown(root)
+    assert (log_id, seq, recv_ts) == (log_id_of(live[0]), live[3].seq, live[3].recv_ts)
+
+
+def test_reloading_the_earlier_log_does_not_change_which_observation_is_shown(tmp_path):
+    live = write_log(tmp_path / "live.qaraw", kraken(kraken_trade()))
+    resent = write_log(tmp_path / "resent.qaraw", later_log(kraken(kraken_trade(kind="snapshot"))))
+    root = tmp_path / "store"
+    store = AppendOnlyStore(root)
+    for path in (live, resent, live, resent):  # the latest load of each log is read
+        ingest(path, store)
+    ((_, seq, recv_ts, _),) = shown(root)
+    first = kraken(kraken_trade())[3]
+    assert (seq, recv_ts) == (first.seq, first.recv_ts)
+
+
+def test_a_conflicting_repeat_in_one_log_shows_the_first_observation(tmp_path):
+    records = kraken(kraken_trade(price="100.0"), kraken_trade(price="101.0"))
+    root = tmp_path / "store"
+    report = ingest(write_log(tmp_path / "a.qaraw", records), AppendOnlyStore(root))
+    assert report.events["TRADE_CONFLICT"] == 1  # still an error
+    with PITSession(root, available_at=INT64_MAX) as session:
+        stored = session.sql("SELECT count(*) AS n FROM trades").column("n").to_pylist()
+    assert stored == [1]
+    assert [(seq, price) for _, seq, _, price in shown(root)] == [(3, 1000)]
+
+
+def _trade(log_id, seq, recv_ts, price):
+    """One observation of trade "t", received at ``recv_ts`` (the builders' lag is 5 ms)."""
+    return trade_table(("t", recv_ts - 5_000_000, price), log_id=log_id, seq=seq)
+
+
+def test_before_the_first_observation_arrived_a_session_shows_the_one_that_had(tmp_path):
+    """Both cutoffs apply before the choice. Two recorders ran at once; the log
+    that began later received the trade 30 ms sooner."""
+    early_log = "20261111T030000.000000000Z-00000000000a"
+    late_log = "20261111T030001.000000000Z-00000000000b"
+    t = 1_794_366_407 * 10**9
+    root = tmp_path / "store"
+    store = AppendOnlyStore(root)
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(early_log, 9, t + 30_000_000, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(late_log, 4, t, 1))
+    assert shown(root, available_at=t - 1) == []
+    assert shown(root, available_at=t + 1) == [(late_log, 4, t, 1)]
+    assert shown(root) == [(early_log, 9, t + 30_000_000, 1)]
+
+
+def test_a_window_holds_a_trade_when_its_shown_observation_was_received_in_it(tmp_path):
+    log_a = "20261111T030000.000000000Z-00000000000a"
+    log_b = "20261111T040000.000000000Z-00000000000b"
+    t = 1_794_366_407 * 10**9
+    root = tmp_path / "store"
+    store = AppendOnlyStore(root)
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(log_a, 3, t, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(log_b, 3, t + 3600 * 10**9, 1))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert session.trades("kraken", INSTRUMENT, t, t + 1).num_rows == 1
+        # The resend an hour later is not a trade of that hour.
+        assert session.trades("kraken", INSTRUMENT, t + 1, INT64_MAX).num_rows == 0
 
 
 def test_repeats_never_crowd_out_errors(tmp_path):

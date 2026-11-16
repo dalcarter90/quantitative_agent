@@ -4,7 +4,7 @@ The Python data core (`python/src/quantagent/data/`) captures public market
 data, normalizes it into an append-only bitemporal store, serves it only
 through a point-in-time session, and checks its quality. This document
 describes what is built. The decisions behind it are ADRs 0005, 0006 and 0008
-to 0017; the architecture's section 3.2 explains how it fits the rest of the
+to 0018; the architecture's section 3.2 explains how it fits the rest of the
 system.
 
 ```
@@ -46,7 +46,7 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
 | `event_ts_source` | `"venue"` or `"receipt"`: where `event_ts` came from, decided by the kind of message | The adapter |
 | `recv_ts` | When our process received the bytes (wall clock) | The recorder |
 | `recv_mono_ns` | The monotonic counter at the same moment; raw log records only, not stored rows (ADR 0012) | The recorder |
-| `knowledge_ts` | Which load of the store the row belongs to: its version. Every row of one load has the same one | The store, when the load begins |
+| `knowledge_ts` | Which batch of the store the row was written in: its version. Every row of one batch has the same one | The store, when the batch opens |
 
 Each of the three has one job (ADR 0017):
 
@@ -79,7 +79,7 @@ No key uses `recv_ts`, which is a measurement (ADR 0012).
 
 | Dataset | One row per | Key (within venue and instrument) | Other columns |
 |---------|-------------|-----------------------------------|---------------|
-| `trades` | Trade | `trade_id` | `price`, `qty`, `side` (the aggressor: `BUY`, `SELL` or `UNKNOWN`) |
+| `trades` | Observation of a trade; a session shows one row per `trade_id` (ADR 0018) | `log_id, seq, trade_id` | `price`, `qty`, `side` (the aggressor: `BUY`, `SELL` or `UNKNOWN`) |
 | `book_events` | Price level of a book message | `log_id, seq, level_index` | `kind` (`SNAPSHOT`, `DELTA`, `CHECK_SNAPSHOT`), `side`, `price`, `qty`, `level_index`, and the venue's integrity fields `venue_seq_first`, `venue_seq_last`, `checksum`, `depth` (each optional; ADR 0009) |
 | `instruments` | Version of an instrument's metadata, as observed in one raw record | `log_id, seq` (`event_ts` says when the version takes effect) | `price_exp`, `qty_exp`, `tick_size`, `lot_size` |
 | `stream_events` | Integrity event (ADR 0010) | `log_id, seq, event_index` | `kind`, `connection`, `expected`, `observed`, `detail` |
@@ -107,7 +107,10 @@ columns, unknown enum values, negative timestamps, invalid metadata, and a
 not of the form above. Implausible
 market values (a zero price) are stored as received and left to the quality
 checks. Build tables with `schema.table_from_rows`, which refuses floats,
-bools and numeric strings that pyarrow would silently convert.
+bools and numeric strings that pyarrow would silently convert;
+`schema.check_row` applies the same rules to one row. The normalizer checks
+every row with it, so a message carrying a value the schema cannot hold (a
+venue time after 2262) is a rejected message, not a failed load (section 5).
 
 ## 3. Store
 
@@ -117,16 +120,27 @@ bools and numeric strings that pyarrow would silently convert.
 <root>/_batches/batch-<knowledge_ts, 20 digits>.json        one commit marker per batch
 ```
 
+This is store layout 3 (ADR 0018).
+
 - `date` is the UTC date of `recv_ts`: the day we received the row (ADR 0017).
-- **A write is a batch.** `AppendOnlyStore(root).batch()` opens one; every
-  table appended to it, in every dataset, gets the same `knowledge_ts`, read
-  from the clock when the batch opens and strictly greater than any issued
-  before (including in earlier processes, and by batches that were never
-  committed). `append(dataset, venue, instrument, table)` is a batch of one
-  table. A raw log is loaded as one batch.
+- **Every write is a load of one raw log** (ADR 0018), and `load` is the
+  writer's only public operation: `AppendOnlyStore(root).load(log_id)`
+  returns a `Load`, whose batches (`load.batch(last=False)`) may hold only
+  rows of that log. Its `load_id` is the knowledge time of its first batch.
+  It is complete once its last batch (`last=True`, or the empty batch
+  `load.finish()` commits) is committed. `ingest` loads a raw log as one load
+  of one batch.
+- **A load is written in batches.** Every table appended to a batch, in every
+  dataset, gets the same `knowledge_ts`, read from the clock when the batch
+  opens and strictly greater than any issued before (including in earlier
+  processes, and by batches that were never committed). The store's private
+  `_batch()` and `_append()` write a batch outside any load; they are for
+  tests that build a store row by row, and no production code calls them.
 - **A batch is readable only once it is committed.** Its data files are
   written first. Its commit marker (JSON: the layout number, the knowledge
-  time, every file of the batch, row counts) is published last, in one step.
+  time, every file of the batch, row counts, and its load: `null`, or its
+  `load_id`, `log_id` and whether it is the load's `last` batch) is published
+  last, in one step.
   A data file that no marker names is not part of the store: sessions ignore
   it. That is what a load that is still running, failed or died looks like.
 - A batch that fails is abandoned and its files are removed; nothing of it
@@ -135,11 +149,16 @@ bools and numeric strings that pyarrow would silently convert.
 - Existing files are never opened for writing, renamed or removed. A data
   file is created under its final name and the create fails if the name is
   taken; a marker is published by hard link, which cannot replace a file.
-- A **correction** is a new row with the same key and a later `knowledge_ts`.
-  Because book events, stream events and instrument versions are keyed by the
-  raw record they came from, and a log keeps its `log_id`, normalizing a raw
-  log again produces corrections, not duplicates. Two logs never collide, so
+- **Loading a raw log again replaces it.** A session reads each log from one
+  load, its latest complete one (section 4), so the rows a new load no longer
+  produces stop appearing, in every dataset: after an adapter fix, the errors
+  the fix resolved are gone. The earlier load stays on disk and is what a
+  session at an earlier version reads. Every key names the raw record a row
+  came from, and a log keeps its `log_id`, so two logs never collide and
   several recorders of one instrument can run at once (ADR 0013).
+- A **correction** of a record is a new row with the same key and a later
+  `knowledge_ts`. That is how the batches of one load correct each other (and
+  how tests' batches written outside a load do).
 - **Order.** The range methods return rows in `(log_id, seq)` order: one log
   after another, in the order they began, each in the order its records
   arrived. Logs are not interleaved in the store; merging logs by arrival is
@@ -150,11 +169,11 @@ bools and numeric strings that pyarrow would silently convert.
   1; version 0 is the empty store.
 - **Schema and layout versions.** Every file records its dataset and schema
   version (`qa.dataset`, `qa.schema_version`), and every marker the store
-  layout (2). `PITSession` checks every file it opens and refuses one of
+  layout (3). `PITSession` checks every file it opens and refuses one of
   another dataset, version or set of columns with a `StoreVersionError` saying
   to rebuild the store from the raw logs (ADR 0015). A store written before
-  commit markers (ADR 0017) or before ADR 0013 is refused this way, by the
-  session and by the writer. To rebuild, load each raw log into a new
+  loads (layout 2, ADR 0018), before commit markers (ADR 0017) or before ADR
+  0013 is refused this way, by the session and by the writer. To rebuild, load each raw log into a new
   directory with
   `python -m quantagent.data.adapters <log> --store <new store>`.
 - Limits: one writer per store root (assumed, not locked; a batch refuses to
@@ -180,9 +199,20 @@ A session has two cutoffs (ADR 0017):
 | `available_at`, required, no default | A simulated time. Only rows with `recv_ts <= available_at` are visible |
 | `version`, optional | A knowledge cutoff. Among the rows available, each record's latest version with `knowledge_ts <= version` is returned. Defaults to the latest committed batch |
 
-- Both cutoffs apply before a version is chosen. If a record was observed
-  twice, a session whose `available_at` is before the second observation
-  arrived sees the first.
+- **Each log is read from one load** (ADR 0018): its latest complete load
+  (greatest `load_id` whose last batch is within the version). If it has no
+  complete load, its latest incomplete load, that is, the committed batches of
+  it within the version: a log's first load is readable while it is still
+  being written. A reload in progress never hides the previous complete load,
+  so a session never sees half a reload. (Rows written outside a load, which
+  only tests do, are read for logs that have no load.)
+- Both cutoffs apply before a version is chosen. If a record was corrected by
+  a batch received later, a session whose `available_at` is before then sees
+  the original.
+- **One row per trade** (ADR 0018). Every observation of a trade is stored; the
+  `trades` method and view show, per `trade_id`, the first observation in
+  `(log_id, seq)` order among those inside both cutoffs, across logs and
+  loads. A window holds a trade if that observation was received in it.
 - A `version` later than the latest committed batch is refused with a
   `ValueError`: a batch committed later could fall inside it, so it would not
   read the same twice. `session.version` says which version is in force.
@@ -206,7 +236,8 @@ Look-ahead is blocked in three independent layers, each covering both
 cutoffs and uncommitted batches:
 
 1. **Views** filtered to `recv_ts <= available_at` and
-   `knowledge_ts <= version`. Nothing else is queryable.
+   `knowledge_ts <= version`, each log read from its chosen load. Nothing else
+   is queryable.
 2. **Statement validation** (`sqlguard`): `sql` accepts exactly one SELECT.
    DuckDB parses the query, the parse tree is checked against an allow-list of
    node kinds, tables, functions and types, and the session executes that same
@@ -216,7 +247,8 @@ cutoffs and uncommitted batches:
    similar names.
 3. **Engine lockdown**: each session has its own DuckDB instance that may open
    only the files of committed batches at or before its version whose date
-   partition is on or before the day of `available_at`. It cannot write,
+   partition is on or before the day of `available_at`, and not those of a
+   load the session does not read. It cannot write,
    attach or load anything, and cannot be reconfigured.
 
 Other properties: `available_at` is a required keyword and neither cutoff can
@@ -289,12 +321,27 @@ disconnect, rest, stop).
 ### Adapters
 
 `adapters.normalize(records)`, the streaming `Normalizer`, and
-`adapters.ingest(path, store)`, which loads a log as one batch (section 3):
-one knowledge time for all of it, readable when the whole log is written.
-`python -m quantagent.data.adapters <log>` checks a log without writing; with
-`--store <dir>` it loads it. Every raw record ends as `data`, `ignored` (a
-known kind of message with no market data) or `rejected` (with a reason), and
-a message is all or nothing.
+`adapters.ingest(path, store)`, which loads a log as one load of one batch
+(section 3): one knowledge time for all of it, readable when the whole log is
+written, replacing any earlier load of the log. `python -m
+quantagent.data.adapters <log>` checks a log without writing; with `--store
+<dir>` it loads it. Every raw record ends as `data`, `ignored` (a known kind of
+message with no market data) or `rejected` (with a reason), and a message is
+all or nothing.
+
+- **A value the schema cannot hold** makes its record rejected, reason
+  `schema_refused`, with the schema's message as detail (ADR 0018). Every row
+  and stream event is checked before any is kept. As for every rejected
+  record, the events noted for it that the store can hold are kept; those it
+  cannot are named in the `MESSAGE_REJECTED` detail. Coinbase's adapter
+  refuses a `sequence_num` outside int64 before it becomes the connection's
+  state.
+- **Feed one raw log at a time, in `seq` order** (ADR 0018). A record does not
+  say which log it is from, so a normalizer fed records whose `seq` is neither
+  0 nor the previous one plus one raises `InterleavedLogs` and refuses
+  everything after: logs were interleaved (as `logorder.merge_logs` yields
+  them) or a log was fed out of order. `ingest` reads one file, so it is never
+  affected.
 
 | | Kraken (WebSocket v2) | Coinbase (Advanced Trade) |
 |---|---|---|
@@ -309,26 +356,25 @@ Kraken's checksum covers only ten levels per side and is checked after each
 message, so it misses some lost updates: on the recorded fixture, of 250
 single updates removed one at a time, 64% were caught and 36% never were.
 
-**A trade seen again** (ADRs 0015 and 0016). A venue resends history after a
-reconnect, and Coinbase sometimes sends a trade again in a later message of
-its live stream (0.07% of trades in the 30-minute 2026-11-13 recording, always
-identical). The normalizer compares each trade with the first observation of
-its `trade_id`, across every log fed to it. The store keeps one row per
-trade.
-- **An identical repeat** (same price, quantity and side) is dropped, so the
-  stored row is the first observation, with its `seq` and `recv_ts`. The
-  normalizer writes a `TRADE_REPEAT` event at the repeat's record: `observed`
-  is the delay after the first observation in ns, and `detail` names the
-  `trade_id` and the first observation's `log_id` and `seq`.
-- **A repeat that differs** is stored, so the store shows the later value. The
-  normalizer writes a `TRADE_CONFLICT` event at the later record, naming the
-  fields and both observations.
+**A trade seen again** (ADRs 0015, 0016 and 0018). A venue resends history
+after a reconnect or in the next session, and Coinbase sometimes sends a trade
+again in a later message of its live stream (0.07% of trades in the 30-minute
+2026-11-13 recording, always identical). Whatever is stored, a session shows
+one row per trade: its first observation in `(log_id, seq)` order (section 4).
+Within one normalizer, each trade is also compared with the first observation
+of its `trade_id`, across every log fed to it:
+- **An identical repeat** (same price, quantity and side) is dropped and not
+  stored. The normalizer writes a `TRADE_REPEAT` event at the repeat's record:
+  `observed` is the delay after the first observation in ns, and `detail`
+  names the `trade_id` and the first observation's `log_id` and `seq`.
+- **A repeat that differs** is stored (the session still shows the first
+  observation). The normalizer writes a `TRADE_CONFLICT` event at the later
+  record, naming the fields and both observations.
 
 The report counts trades seen again, conflicts and identical repeats dropped.
 The raw log keeps every observation. Logs loaded in separate runs are not
-compared with each other; for those the store keeps the later observation. A
-session whose `available_at` is before the later observation arrived still
-sees the earlier one.
+compared with each other: both observations are stored, the session shows
+the first, and a conflict between them is not reported.
 
 ## 6. Quality checks
 

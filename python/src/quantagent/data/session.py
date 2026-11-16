@@ -14,6 +14,20 @@ A session answers two different questions with two cutoffs (ADR 0017):
 Only committed batches exist for a session: the files of a load that is still
 running, failed or died have no commit marker and are never opened.
 
+**Loads (ADR 0018).** Every ingest of a raw log is a load. For each log, a
+session reads only the rows of one load: the log's latest complete load (by
+``load_id``, its last batch within the version), or, if it has none, its
+latest incomplete load (its committed batches within the version). A log
+loaded again is therefore read from the new load alone, once it is complete:
+rows the earlier load produced and the new one does not are gone from the
+session, though not from the store, and a reload in progress never hides the
+previous complete load. Batches written outside a load (tests only) are read
+record by record, for logs that have no load.
+
+**One row per trade.** Trades are stored once per observation. The session
+shows each trade once: its first observation in ``(log_id, seq)`` order among
+the observations inside both cutoffs.
+
 That is enforced in three independent ways (architecture section 3.2):
 
 1. **Views.** Every query runs against views that keep the rows inside both
@@ -23,7 +37,8 @@ That is enforced in three independent ways (architecture section 3.2):
    views, checked on DuckDB's own syntax tree (see ``sqlguard``).
 3. **Engine lockdown.** The session's private DuckDB instance is configured
    so it can open only the files of committed batches at or before the
-   session's version, received on or before the day of ``available_at``. It
+   session's version that it reads (not those of a load another load
+   replaced), received on or before the day of ``available_at``. It
    cannot write, attach or load anything, and that configuration cannot be
    changed. Even a statement that slipped past the validator could not reach
    a later version, an uncommitted batch or a later day.
@@ -65,6 +80,7 @@ from quantagent.data.schema import (
 from quantagent.data.sqlguard import MAX_QUERY_LENGTH, QueryRejected, validate
 from quantagent.data.store import (
     _LEGACY_PART,
+    _LOG_ID,
     _MARKER,
     _PART,
     BATCH_DIRECTORY,
@@ -140,9 +156,98 @@ def _data_file(root: Path, parts: tuple[str, ...]) -> _DataFile | None:
     return _DataFile(parts[0], day, int(match.group(1)), root.joinpath(*parts).as_posix())
 
 
-def _committed_files(root: Path) -> tuple[list[_DataFile], int]:
-    """The files of every committed batch, and the latest committed knowledge
-    time (0 if no batch was ever committed).
+@dataclass(frozen=True, slots=True)
+class _LoadOf:
+    """What a commit marker says about the load its batch belongs to (ADR 0018)."""
+
+    load_id: int
+    log_id: str
+    last: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedBatch:
+    knowledge_ts: int
+    files: tuple[_DataFile, ...]
+    load: _LoadOf | None  # None: written outside a load
+
+
+@dataclass(frozen=True, slots=True)
+class _Selection:
+    """What a session at one version reads."""
+
+    files: tuple[_DataFile, ...]
+    # Rows of these logs in batches written outside a load are not read: each
+    # of these logs is read from its load.
+    outside_loads: tuple[int, ...]  # knowledge times of the batches outside a load
+    loaded_logs: tuple[str, ...]
+
+
+def _load_of(where: str, knowledge_ts: int, content: dict) -> _LoadOf | None:
+    if "load" not in content:
+        raise ValueError(f"{where} does not say which load its batch belongs to")
+    load = content["load"]
+    if load is None:
+        return None
+    if not isinstance(load, dict):
+        raise ValueError(f"{where} has a load that is not a JSON object")
+    load_id, log_id, last = load.get("load_id"), load.get("log_id"), load.get("last")
+    if type(load_id) is not int or not 1 <= load_id <= knowledge_ts:
+        raise ValueError(
+            f"{where} has a load_id that is not the knowledge time of an earlier batch"
+        )
+    if not isinstance(log_id, str) or _LOG_ID.fullmatch(log_id) is None:
+        raise ValueError(f"{where} names a load of something that is not a log id")
+    if type(last) is not bool:
+        raise ValueError(f"{where} does not say whether its batch is its load's last")
+    return _LoadOf(load_id, log_id, last)
+
+
+def _check_loads(batches: list[_CommittedBatch]) -> None:
+    """A load is of one log, and has no batch after its last."""
+    seen: dict[int, tuple[str, int | None]] = {}  # load_id -> (log_id, knowledge time of its last)
+    for batch in sorted(batches, key=lambda b: b.knowledge_ts):
+        load = batch.load
+        if load is None:
+            continue
+        where = f"commit marker batch-{batch.knowledge_ts:020d}.json"
+        log_id, last = seen.get(load.load_id, (load.log_id, None))
+        if log_id != load.log_id:
+            raise ValueError(f"{where}: load {load.load_id} is of log {log_id}, not {load.log_id}")
+        if last is not None:
+            raise ValueError(f"{where}: a batch of load {load.load_id} after its last batch")
+        seen[load.load_id] = (log_id, batch.knowledge_ts if load.last else None)
+
+
+def _select(batches: list[_CommittedBatch], version: int, horizon_day: int) -> _Selection:
+    """Each log from one load (ADR 0018): its latest load complete within
+    ``version``, or, if it has none, its latest incomplete load, read as far as
+    its batches within ``version`` go. Batches outside a load (tests only) are
+    read for the logs that have no load."""
+    known = [b for b in batches if b.knowledge_ts <= version]
+    complete: dict[str, int] = {}  # log_id -> load_id of its latest complete load
+    started: dict[str, int] = {}  # log_id -> load_id of its latest load of any kind
+    for batch in known:
+        load = batch.load
+        if load is None:
+            continue
+        started[load.log_id] = max(started.get(load.log_id, 0), load.load_id)
+        if load.last:
+            complete[load.log_id] = max(complete.get(load.log_id, 0), load.load_id)
+    # A reload in progress never hides the previous complete load.
+    chosen = {log_id: complete.get(log_id, latest) for log_id, latest in started.items()}
+    read = set(chosen.values())
+    kept = [b for b in known if b.load is None or b.load.load_id in read]
+    return _Selection(
+        files=tuple(f for b in kept for f in b.files if f.day <= horizon_day),
+        outside_loads=tuple(sorted(b.knowledge_ts for b in kept if b.load is None)),
+        loaded_logs=tuple(sorted(chosen)),
+    )
+
+
+def _committed_batches(root: Path) -> tuple[list[_CommittedBatch], int]:
+    """Every committed batch, and the latest committed knowledge time (0 if no
+    batch was ever committed).
 
     A data file that no commit marker names belongs to a batch that was not
     committed, and is left out. Anything that is not the layout this code
@@ -167,7 +272,7 @@ def _committed_files(root: Path) -> tuple[list[_DataFile], int]:
             )
         return [], 0
 
-    committed: list[_DataFile] = []
+    committed: list[_CommittedBatch] = []
     latest = 0
     for marker in sorted(directory.iterdir()):
         if marker.name.startswith("."):
@@ -193,14 +298,18 @@ def _committed_files(root: Path) -> tuple[list[_DataFile], int]:
         names = content.get("files")
         if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
             raise ValueError(f"{where} has no list of files")
+        files = []
         for name in names:
             listed = _data_file(root, tuple(name.split("/")))
             if listed is None or listed.knowledge_ts != knowledge_ts:
                 raise ValueError(f"{where} names a file that is not one of its batch's data files")
             if name not in on_disk:
                 raise ValueError(f"committed store file {name} is missing; the store is damaged")
-            committed.append(on_disk[name])
+            files.append(on_disk[name])
+        load = _load_of(where, knowledge_ts, content)
+        committed.append(_CommittedBatch(knowledge_ts, tuple(files), load))
         latest = max(latest, knowledge_ts)
+    _check_loads(committed)
     return committed, latest
 
 
@@ -264,7 +373,9 @@ def _quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _view_sql(dataset: Dataset, files: list[str], version: int, available_at: int) -> str:
+def _view_sql(
+    dataset: Dataset, files: list[str], version: int, available_at: int, selection: _Selection
+) -> str:
     stored = dataset.stored_schema
     columns = ", ".join(f'"{name}"' for name in (*_PARTITION_COLUMNS, *stored.names))
     if not files:
@@ -279,8 +390,13 @@ def _view_sql(dataset: Dataset, files: list[str], version: int, available_at: in
     hive_types = ", ".join(f"'{n}': {t}" for n, t in _PARTITION_COLUMNS.items())
     # Both cutoffs apply before a version is chosen: the version of a record a
     # session sees is the latest among the rows it had received (ADR 0017).
-    return f"""
-        CREATE OR REPLACE VIEW "{dataset.name}" AS
+    where = f'"knowledge_ts" <= {version} AND "recv_ts" <= {available_at}'
+    if selection.outside_loads and selection.loaded_logs:
+        # A log read from its load is not read from batches outside a load (ADR 0018).
+        batches = ", ".join(str(k) for k in selection.outside_loads)
+        logs = ", ".join(_quote(log) for log in selection.loaded_logs)
+        where += f' AND NOT ("knowledge_ts" IN ({batches}) AND "log_id" IN ({logs}))'
+    versions = f"""
         SELECT {columns} FROM (
             SELECT {columns}, row_number() OVER (
                 PARTITION BY {identity} ORDER BY "knowledge_ts" DESC, {tie_break}
@@ -289,13 +405,27 @@ def _view_sql(dataset: Dataset, files: list[str], version: int, available_at: in
                 [{", ".join(_quote(f) for f in files)}],
                 hive_partitioning = true, hive_types = {{{hive_types}}}
             )
-            WHERE "knowledge_ts" <= {version} AND "recv_ts" <= {available_at}
+            WHERE {where}
         ) WHERE _version_rank = 1
     """
+    if dataset.one_row_per:
+        # One row per trade: the first observation in replay order among those
+        # inside both cutoffs (ADR 0018). (log_id, seq) is unique within one
+        # partition, because both are in the key.
+        per = ", ".join(f'"{name}"' for name in ("venue", "instrument", *dataset.one_row_per))
+        versions = f"""
+            SELECT {columns} FROM (
+                SELECT {columns}, row_number() OVER (
+                    PARTITION BY {per} ORDER BY "log_id", "seq"
+                ) AS _first
+                FROM ({versions})
+            ) WHERE _first = 1
+        """
+    return f'CREATE OR REPLACE VIEW "{dataset.name}" AS {versions}'
 
 
 def _create_views(
-    con: duckdb.DuckDBPyConnection, files: list[_DataFile], version: int, available_at: int
+    con: duckdb.DuckDBPyConnection, selection: _Selection, version: int, available_at: int
 ) -> None:
     """(Re)define the four views for ``available_at``, all of them or none."""
     day = available_at // _NS_PER_DAY
@@ -303,8 +433,8 @@ def _create_views(
     try:
         for dataset in DATASETS.values():
             # A file of a later receipt day cannot hold a row received by now.
-            paths = [f.path for f in files if f.dataset == dataset.name and f.day <= day]
-            con.execute(_view_sql(dataset, paths, version, available_at))
+            paths = [f.path for f in selection.files if f.dataset == dataset.name and f.day <= day]
+            con.execute(_view_sql(dataset, paths, version, available_at, selection))
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -313,12 +443,13 @@ def _create_views(
 
 def _open(
     session: "PITSession", root: Any, *, available_at: int, version: int | None, horizon: int
-) -> list[_DataFile]:
+) -> _Selection:
     """Set ``session`` up to read ``root`` at the two cutoffs.
 
     ``horizon`` is the latest ``available_at`` the session's engine may ever
     serve: ``available_at`` itself for a plain session, the cursor's end for a
-    replay cursor. Returns the files the engine may open.
+    replay cursor. Returns what the session reads, including the files its
+    engine may open.
     """
     _check_time("available_at", available_at)
     if version is not None:
@@ -337,7 +468,7 @@ def _open(
             f"store path must not contain '=' (it would be read as a partition): {root_path}"
         )
 
-    committed, latest = _committed_files(root_path)
+    committed, latest = _committed_batches(root_path)
     if version is None:
         version = latest
     elif version > latest:
@@ -346,12 +477,13 @@ def _open(
             "version would not be repeatable: a batch committed later could fall inside it. "
             f"Omit version to read the latest committed batch, or pass version={latest}."
         )
-    files = [f for f in committed if f.knowledge_ts <= version and f.day <= horizon // _NS_PER_DAY]
-    _check_versions(root_path, files)
+    selection = _select(committed, version, horizon // _NS_PER_DAY)
+    files = selection.files
+    _check_versions(root_path, list(files))
 
     con = duckdb.connect(":memory:", config={"python_enable_replacements": False})
     try:
-        _create_views(con, files, version, available_at)
+        _create_views(con, selection, version, available_at)
         # From here on this database can open only the files listed, and
         # none of these settings can be changed again.
         con.execute(f"SET allowed_paths = [{', '.join(_quote(f.path) for f in files)}]")
@@ -367,7 +499,7 @@ def _open(
     object.__setattr__(session, "_version", version)
     object.__setattr__(session, "_con", con)
     object.__setattr__(session, "_redactions", (root_path.as_posix(), str(root_path)))
-    return files
+    return selection
 
 
 class PITSession:
@@ -402,7 +534,12 @@ class PITSession:
         return self._version
 
     def trades(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
-        """Trades received in ``start <= recv_ts < end``, latest known version of each."""
+        """Trades received in ``start <= recv_ts < end``, latest known version of each.
+
+        One row per trade: its first observation in ``(log_id, seq)`` order
+        among those the session can see (ADR 0018). A trade is in the window
+        if that observation was received in it.
+        """
         return self._range(TRADES, venue, instrument, start, end)
 
     def book_events(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
@@ -460,7 +597,8 @@ class PITSession:
 
         Each view has the columns venue, instrument, date, then the dataset's
         stored columns, and holds the latest version of each record inside the
-        session's two cutoffs. Anything other than a single allowed SELECT
+        session's two cutoffs, each log read from its latest complete load;
+        ``trades`` holds one row per trade (ADR 0018). Anything other than a single allowed SELECT
         raises QueryRejected without being run; see ``sqlguard`` for what is
         allowed.
         """
@@ -567,7 +705,7 @@ class ReplayCursor:
     no method that moves time and holds no reference to its cursor.
     """
 
-    __slots__ = ("_session", "_files", "_end")
+    __slots__ = ("_session", "_selection", "_end")
 
     def __init__(self, root: Any, *, start: int, end: int, version: int | None = None):
         _check_time("start", start)
@@ -575,9 +713,9 @@ class ReplayCursor:
         if end < start:
             raise ValueError(f"end={end} is before start={start}")
         session = object.__new__(PITSession)
-        files = _open(session, root, available_at=start, version=version, horizon=end)
+        selection = _open(session, root, available_at=start, version=version, horizon=end)
         object.__setattr__(self, "_session", session)
-        object.__setattr__(self, "_files", files)
+        object.__setattr__(self, "_selection", selection)
         object.__setattr__(self, "_end", end)
 
     @property
@@ -612,7 +750,7 @@ class ReplayCursor:
         if available_at == session.available_at:
             return
         try:
-            _create_views(con, self._files, session.version, available_at)
+            _create_views(con, self._selection, session.version, available_at)
         except duckdb.Error as error:
             message = str(error)
         else:

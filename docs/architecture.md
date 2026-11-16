@@ -117,13 +117,23 @@ look-ahead structurally rather than by convention:
 - Every query runs against views already filtered to
   `recv_ts <= available_at` and `knowledge_ts <= version`. The unfiltered
   tables are not reachable through the session.
-- Only committed batches exist for a session. A load is one batch; its files
-  are readable only once its commit marker is written, so a session never
-  sees part of a load, or market data without the integrity events loaded
-  with it.
-- The store is append-only. A correction or backfill is a new row with a later
-  `knowledge_ts`, so a session at an earlier `version` still sees what the
-  store held then. A version that can be asked for never changes afterwards.
+- Only committed batches exist for a session. A batch's files are readable
+  only once its commit marker is written, so a session never sees market data
+  without the integrity events written with it.
+- **Each raw log is read from one load** (ADR 0018). Every ingest of a raw log
+  is a load (one or more batches); a session reads each log only from its
+  latest load that is complete within its version, or, if it has none, from
+  its latest incomplete one (a first load still being written). Loading a log
+  again, after an adapter fix, replaces what the earlier load said about it,
+  including rows it no longer produces, and a reload in progress never hides
+  the previous complete load. Loads are the store's only write path.
+- **One row per trade** (ADR 0018). Every observation of a trade is stored;
+  the session shows its first observation in `(log_id, seq)` order, among
+  those inside both cutoffs.
+- The store is append-only. A correction is a new row with a later
+  `knowledge_ts`, and a reload is a new load; the earlier rows stay, so a
+  session at an earlier `version` still sees what the store held then. A
+  version that can be asked for never changes afterwards.
 - `sql` accepts exactly one `SELECT` statement over those views. DDL, DML,
   multi-statement input, and anything that reads a file path or URL
   (`read_parquet` and similar) are rejected. The check is an allow-list applied
@@ -131,8 +141,8 @@ look-ahead structurally rather than by convention:
   is no second parser to disagree with the engine. Tables, functions, types and
   expression kinds not on the list are refused, as are `WITH` clauses.
 - Independently of that check, each session's database is locked so it can
-  open only the files of committed batches at or before its version, received
-  on or before the day of `available_at`. It cannot write, attach or load
+  open only the files of committed batches at or before its version, of the
+  loads it reads, received on or before the day of `available_at`. It cannot write, attach or load
   anything, and cannot be reconfigured. A hole in the statement check would
   still not reach a later version, an uncommitted batch or a later day.
 - The session does not hand out its database connection or the store's file
@@ -305,7 +315,7 @@ All timestamps are `int64` nanoseconds since the Unix epoch, UTC.
 | `event_ts` | When the venue says it happened | The venue (its precision varies; stored as given, scaled to ns). If the message has no venue timestamp, it holds `recv_ts` (ADR 0008) |
 | `event_ts_source` | Where `event_ts` came from: `"venue"` or `"receipt"` | The adapter, from the message type (ADR 0008) |
 | `recv_ts` | When our process received the bytes. **The availability time**: what a session at simulated time T may see, every time window and the store's date partition are on it (ADR 0017) | Feed thread, wall clock |
-| `knowledge_ts` | Which load of the store a row belongs to: its **version**. One per batch, read when the load begins; the batch is readable from its commit | Data core at write time. A correction or backfill gets a new, later `knowledge_ts`; the old row is kept |
+| `knowledge_ts` | Which batch of the store a row was written in: its **version**. One per batch, read when the batch opens; the batch is readable from its commit. A load of a raw log is one or more batches (ADR 0018) | Data core at write time. A correction or a reload gets a new, later `knowledge_ts`; the old row is kept |
 | `recv_mono_ns` | The system's monotonic high-resolution counter, read with `recv_ts` | Feed thread (recorder). Comparable only between logs from the same machine, boot and counter (ADR 0012) |
 | `seq` | Local sequence number at receipt | Feed thread. **Within one raw log, replay order is `seq` alone**; logs are merged by `recv_mono_ns`. `recv_ts` is a measurement, never an ordering key (ADR 0012) |
 | `log_id` | The raw log a stored row came from, derived from that log's first record (not a time field; listed because it orders stored data with `seq`) | Normalizer. Stored rows are keyed and ordered by `(log_id, seq)`, never by `recv_ts` (ADR 0013) |
@@ -407,7 +417,7 @@ Details and alternatives are in ADR 0006.
 | Tier | Content | Format | Used by |
 |------|---------|--------|---------|
 | Raw log | Exact bytes received, with `recv_ts` and `seq` | Append-only length-prefixed binary, zstd per segment | Replay engine, normalizer. Never rewritten |
-| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps, and the raw record each row came from (`log_id`, `seq`; ADR 0013); bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/receipt date, integer mantissas. Written in batches, one per load, each readable once its commit marker exists (ADR 0017) | `PITSession`, via DuckDB |
+| Normalized store | Trades, book events, instrument metadata and stream integrity events (ADR 0010), all three timestamps, and the raw record each row came from (`log_id`, `seq`; ADR 0013); bars are computed on demand (Phase 12) | Parquet, partitioned by venue/instrument/receipt date, integer mantissas. Written in batches, each readable once its commit marker exists (ADR 0017); each ingest of a raw log is a load, and a log is read from its latest complete load (ADR 0018) | `PITSession`, via DuckDB |
 | Journal | Every hot-path decision, order, risk result and fill | Append-only fixed-record binary | Reconciliation, audit, monitoring |
 | Experiment registry | Hypotheses, configs, results, trial counts | DuckDB/SQLite file | Validation harness, agent |
 | Audit log | Every agent tool call with its reasoning | Append-only JSON lines | Humans |

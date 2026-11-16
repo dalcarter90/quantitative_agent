@@ -160,7 +160,7 @@ def _load(root: Path, history_spec):
     store = AppendOnlyStore(root, clock=clock)
     history = []
     for spec in history_spec:
-        batch = store.batch()
+        batch = store._batch()
         for table in spec["tables"]:
             dataset = DATASETS[table["dataset"]]
             batch.append(

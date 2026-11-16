@@ -126,7 +126,7 @@ def root(tmp_path):
 
 def test_append_writes_one_parquet_file_in_the_hive_partition(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    result = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
+    result = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
 
     assert isinstance(result, AppendResult)
     assert result.knowledge_ts == 1_000
@@ -141,7 +141,7 @@ def test_append_writes_one_parquet_file_in_the_hive_partition(root):
 def test_stored_rows_equal_input_plus_knowledge_ts(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     table = trades(("a", T0, 9712310), ("b", T0 + 1, 9712320))
-    result = store.append(TRADES, "kraken", "ETH-USD", table)
+    result = store._append(TRADES, "kraken", "ETH-USD", table)
 
     stored = pq.read_table(result.files[0])
     assert stored.schema.equals(TRADES.stored_schema)
@@ -153,7 +153,7 @@ def test_stored_rows_equal_input_plus_knowledge_ts(root):
 
 def test_files_record_dataset_and_schema_version(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    result = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+    result = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     metadata = pq.read_schema(result.files[0]).metadata
     assert metadata[b"qa.dataset"] == b"trades"
     assert metadata[b"qa.schema_version"] == str(TRADES.version).encode()
@@ -169,7 +169,7 @@ def test_rows_are_partitioned_by_utc_date_of_recv_ts(root):
         ("c", last_ns_of_day + 1 - LAG, 3),
     )
     assert table.column("event_ts")[0].as_py() < DAY_19675  # the venue's day is the 13th
-    result = store.append(TRADES, "kraken", "ETH-USD", table)
+    result = store._append(TRADES, "kraken", "ETH-USD", table)
 
     by_date = {p.parent.name: pq.read_table(p).column("trade_id").to_pylist() for p in result.files}
     assert by_date == {"date=2023-11-14": ["a", "b"], "date=2023-11-15": ["c"]}
@@ -180,9 +180,9 @@ def test_rows_are_partitioned_by_utc_date_of_recv_ts(root):
 
 def test_venues_instruments_and_datasets_are_separate_partitions(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
-    store.append(TRADES, "coinbase", "BTC-USD", trades(("a", T0, 1)))
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+    store._append(TRADES, "coinbase", "BTC-USD", trades(("a", T0, 1)))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
 
     relative = {p.relative_to(root).parts[:3] for p in data_files(root)}
     assert relative == {
@@ -228,7 +228,7 @@ def test_book_events_snapshot_and_delta_are_stored(root):
             "qty": 0,
         },
     ]
-    store.append(BOOK_EVENTS, "kraken", "ETH-USD", table_from_rows(BOOK_EVENTS, rows))
+    store._append(BOOK_EVENTS, "kraken", "ETH-USD", table_from_rows(BOOK_EVENTS, rows))
     stored = read_all(root, BOOK_EVENTS)
     assert [r["kind"] for r in stored] == [BookEventKind.SNAPSHOT, BookEventKind.DELTA]
     assert [r["venue_seq_first"] for r in stored] == [None, 101]
@@ -236,8 +236,8 @@ def test_book_events_snapshot_and_delta_are_stored(root):
 
 def test_duckdb_reads_the_store_with_hive_partitioning(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
-    store.append(TRADES, "coinbase", "BTC-USD", trades(("b", T0 + NS_PER_DAY, 9712320)))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
+    store._append(TRADES, "coinbase", "BTC-USD", trades(("b", T0 + NS_PER_DAY, 9712320)))
 
     glob = (root / "trades" / "**" / "*.parquet").as_posix()
     rows = duckdb.sql(
@@ -255,7 +255,7 @@ def test_duckdb_reads_the_store_with_hive_partitioning(root):
 
 
 def test_append_takes_no_knowledge_ts_argument():
-    parameters = inspect.signature(AppendOnlyStore.append).parameters
+    parameters = inspect.signature(AppendOnlyStore._append).parameters
     assert list(parameters) == ["self", "dataset", "venue", "instrument", "rows"]
 
 
@@ -264,18 +264,18 @@ def test_caller_supplied_knowledge_ts_column_is_rejected(root):
     table = trades(("a", T0, 1))
     with_kts = table.append_column("knowledge_ts", pa.array([5], type=pa.int64()))
     with pytest.raises(SchemaError, match="knowledge_ts"):
-        store.append(TRADES, "kraken", "ETH-USD", with_kts)
+        store._append(TRADES, "kraken", "ETH-USD", with_kts)
     # A table already in stored layout is rejected too.
     stored_layout = with_kts.select(TRADES.stored_schema.names)
     with pytest.raises(SchemaError, match="knowledge_ts"):
-        store.append(TRADES, "kraken", "ETH-USD", stored_layout)
+        store._append(TRADES, "kraken", "ETH-USD", stored_layout)
     assert all_files(root) == []
 
 
 def test_knowledge_ts_strictly_increases_even_if_the_clock_goes_backwards(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 500, 500, 1_001, 5_000))
     seen = [
-        store.append(TRADES, "kraken", "ETH-USD", trades((f"t{i}", T0, i))).knowledge_ts
+        store._append(TRADES, "kraken", "ETH-USD", trades((f"t{i}", T0, i))).knowledge_ts
         for i in range(5)
     ]
     assert seen == [1_000, 1_001, 1_002, 1_003, 5_000]
@@ -283,19 +283,19 @@ def test_knowledge_ts_strictly_increases_even_if_the_clock_goes_backwards(root):
 
 def test_knowledge_ts_keeps_increasing_across_datasets_and_partitions(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    a = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1))).knowledge_ts
-    b = store.append(TRADES, "coinbase", "BTC-USD", trades(("a", T0, 1))).knowledge_ts
-    c = store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0)).knowledge_ts
+    a = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1))).knowledge_ts
+    b = store._append(TRADES, "coinbase", "BTC-USD", trades(("a", T0, 1))).knowledge_ts
+    c = store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0)).knowledge_ts
     assert a < b < c
 
 
 def test_knowledge_ts_never_decreases_after_reopening_with_an_earlier_clock(root):
     first = AppendOnlyStore(root, clock=FakeClock(9_000))
-    first.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
-    first.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # knowledge_ts 9_001
+    first._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
+    first._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # knowledge_ts 9_001
 
     reopened = AppendOnlyStore(root, clock=FakeClock(10))
-    result = reopened.append(TRADES, "coinbase", "BTC-USD", trades(("b", T0, 2)))
+    result = reopened._append(TRADES, "coinbase", "BTC-USD", trades(("b", T0, 2)))
     assert result.knowledge_ts == 9_002
 
 
@@ -303,7 +303,7 @@ def test_default_clock_is_wall_time_in_nanoseconds(root):
     import time
 
     before = time.time_ns()
-    result = AppendOnlyStore(root).append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+    result = AppendOnlyStore(root)._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     after = time.time_ns()
     assert before <= result.knowledge_ts <= after
 
@@ -312,31 +312,62 @@ def test_default_clock_is_wall_time_in_nanoseconds(root):
 def test_a_clock_that_does_not_return_int64_nanoseconds_is_an_error(root, bad):
     store = AppendOnlyStore(root, clock=lambda: bad)
     with pytest.raises((TypeError, ValueError)):
-        store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     assert all_files(root) == []
 
 
 # --- append-only -------------------------------------------------------------
 
 
-def test_the_only_public_operations_are_append_and_batch():
+def test_the_stores_public_surface_is_the_load_api_only():
+    """Loads are the only production write path (ADR 0018, Review item 3)."""
     public = {name for name in dir(AppendOnlyStore) if not name.startswith("_")}
-    assert public == {"append", "batch"}  # append is a batch of one table (ADR 0017)
+    assert public == {"load"}
+    load = AppendOnlyStore(Path("unused")).load(LOG)
+    assert {name for name in dir(load) if not name.startswith("_")} == {
+        "batch", "finish", "finished", "load_id", "log_id"}  # fmt: skip
+    assert inspect.signature(AppendOnlyStore.load).parameters.keys() == {"self", "log_id"}
+
+
+def test_no_production_code_writes_outside_a_load():
+    """``_batch`` and ``_append`` are for tests. No module of the package may
+    call them (checked on the syntax tree, not the text)."""
+    import ast
+
+    import quantagent
+
+    package = Path(quantagent.__file__).parent
+    calls = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in ("_batch", "_append"):
+                calls.append(f"{path.relative_to(package).as_posix()}:{node.lineno}")
+    # store.py's own _append opens its batch with _batch; nothing else may.
+    assert calls == ["data/store.py:" + str(_own_batch_call_line())], calls
+
+
+def _own_batch_call_line():
+    import quantagent.data.store as store_module
+
+    source = Path(store_module.__file__).read_text(encoding="utf-8").split("\n")
+    (line,) = [i + 1 for i, text in enumerate(source) if "self._batch()" in text]
+    return line
 
 
 def test_appending_never_changes_the_bytes_of_existing_files(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + 1, 2)))
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + 1, 2)))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
     before = digests(root)
     assert len(before) == 4  # two data files and their two commit markers
 
     # Same partition, same key, other partitions, other datasets, a reopen.
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 999)))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("c", T0 + 2, 3)))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("d", T0 + NS_PER_DAY, 4)))
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=5))
-    AppendOnlyStore(root, clock=FakeClock(1)).append(
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 999)))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("c", T0 + 2, 3)))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("d", T0 + NS_PER_DAY, 4)))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=5))
+    AppendOnlyStore(root, clock=FakeClock(1))._append(
         TRADES, "kraken", "ETH-USD", trades(("e", T0, 5))
     )
 
@@ -348,10 +379,10 @@ def test_appending_never_changes_the_bytes_of_existing_files(root):
 
 def test_a_correction_is_a_new_row_and_the_original_stays_on_disk(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    original = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
+    original = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712310)))
     original_bytes = original.files[0].read_bytes()
 
-    correction = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712399)))
+    correction = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 9712399)))
 
     assert correction.files[0] != original.files[0]
     assert original.files[0].read_bytes() == original_bytes
@@ -360,39 +391,40 @@ def test_a_correction_is_a_new_row_and_the_original_stays_on_disk(root):
         ("a", 9712310, 1_000),
         ("a", 9712399, 2_000),
     ]
-    assert TRADES.key == ("trade_id",)
+    # Trades are keyed by raw record (ADR 0018); a correction reuses the record.
+    assert TRADES.key == ("log_id", "seq", "trade_id")
     assert correction.knowledge_ts > original.knowledge_ts
 
 
 def test_an_existing_file_is_never_overwritten(root):
     # Something else already occupies the path the next append would use.
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    first = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+    first = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     squatter = first.files[0].with_name(part(1_001))
     squatter.write_bytes(b"not ours")
 
     with pytest.raises(FileExistsError):
-        store.append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))
+        store._append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))
     assert squatter.read_bytes() == b"not ours"
     assert len(markers(root)) == 1  # the refused batch was not committed
 
 
 def test_a_failed_multi_partition_append_publishes_nothing(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    first = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0 + NS_PER_DAY, 1)))
+    first = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0 + NS_PER_DAY, 1)))
     squatter = first.files[0].with_name(part(1_001))
     squatter.write_bytes(b"not ours")
     before = digests(root)
 
     two_days = trades(("b", T0, 2), ("c", T0 + NS_PER_DAY, 3))
     with pytest.raises(FileExistsError):
-        store.append(TRADES, "kraken", "ETH-USD", two_days)
+        store._append(TRADES, "kraken", "ETH-USD", two_days)
     assert digests(root) == before
 
 
 def test_no_temporary_files_are_left_behind(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + NS_PER_DAY, 2)))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + NS_PER_DAY, 2)))
     assert all_files(root) == sorted(data_files(root) + markers(root))
     assert len(data_files(root)) == 2 and len(markers(root)) == 1
 
@@ -403,11 +435,11 @@ def test_no_temporary_files_are_left_behind(root):
 def test_instrument_metadata_is_stored_bitemporally(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000))
     later = T0 + 30 * NS_PER_DAY
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=1))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=1))
     # The venue changes the tick size: a new version, effective later.
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(later, tick_size=10, seq=1))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(later, tick_size=10, seq=1))
     # We learn the first version was recorded wrongly: same key, later knowledge.
-    store.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=5))
+    store._append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0, tick_size=5))
 
     rows = read_all(root, INSTRUMENTS)
     assert INSTRUMENTS.key == ("log_id", "seq")
@@ -430,41 +462,41 @@ def test_instrument_metadata_is_stored_bitemporally(root):
 def test_venue_and_instrument_names_cannot_escape_or_break_the_layout(root, name):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     with pytest.raises(ValueError):
-        store.append(TRADES, name, "ETH-USD", trades(("a", T0, 1)))
+        store._append(TRADES, name, "ETH-USD", trades(("a", T0, 1)))
     with pytest.raises(ValueError):
-        store.append(TRADES, "kraken", name, trades(("a", T0, 1)))
+        store._append(TRADES, "kraken", name, trades(("a", T0, 1)))
     assert all_files(root) == []
 
 
 @pytest.mark.parametrize("name", ["kraken", "ETH-USD", "BTC-USD", "BTC_USD", "1000SHIB.P", "x"])
 def test_ordinary_venue_and_instrument_names_are_accepted(root, name):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.append(TRADES, name, name, trades(("a", T0, 1)))
+    store._append(TRADES, name, name, trades(("a", T0, 1)))
 
 
 def test_wrong_schema_is_rejected_and_writes_nothing(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     with pytest.raises(SchemaError):
-        store.append(BOOK_EVENTS, "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append(BOOK_EVENTS, "kraken", "ETH-USD", trades(("a", T0, 1)))
     with pytest.raises(TypeError):
-        store.append(TRADES, "kraken", "ETH-USD", [{"trade_id": "a"}])
+        store._append(TRADES, "kraken", "ETH-USD", [{"trade_id": "a"}])
     with pytest.raises(TypeError):
-        store.append("trades", "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append("trades", "kraken", "ETH-USD", trades(("a", T0, 1)))
     assert all_files(root) == []
 
 
 def test_empty_append_is_rejected(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     with pytest.raises(ValueError, match="empty"):
-        store.append(TRADES, "kraken", "ETH-USD", trades())
+        store._append(TRADES, "kraken", "ETH-USD", trades())
     assert all_files(root) == []
 
 
 def test_a_rejected_append_does_not_consume_a_knowledge_ts(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
     with pytest.raises(ValueError):
-        store.append(TRADES, "kraken", "ETH-USD", trades())
-    result = store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append(TRADES, "kraken", "ETH-USD", trades())
+    result = store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     assert result.knowledge_ts == 1_000
 
 
@@ -473,7 +505,7 @@ def test_a_rejected_append_does_not_consume_a_knowledge_ts(root):
 
 def test_a_batch_gives_every_table_in_it_one_knowledge_ts(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    with store.batch() as batch:
+    with store._batch() as batch:
         assert batch.knowledge_ts == 1_000
         batch.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
         batch.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
@@ -483,12 +515,12 @@ def test_a_batch_gives_every_table_in_it_one_knowledge_ts(root):
     assert {p.name for p in data_files(root)} == {part(1_000)}
     assert [p.name for p in markers(root)] == [f"batch-{1_000:020d}.json"]
     # The next batch is a later version.
-    assert store.append(TRADES, "kraken", "ETH-USD", trades(("c", T0, 3))).knowledge_ts == 2_000
+    assert store._append(TRADES, "kraken", "ETH-USD", trades(("c", T0, 3))).knowledge_ts == 2_000
 
 
 def test_several_appends_to_one_partition_are_numbered_files_of_the_same_batch(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    with store.batch() as batch:
+    with store._batch() as batch:
         batch.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
         batch.append(TRADES, "kraken", "ETH-USD", trades(("b", T0 + 1, 2)))
     assert [p.name for p in data_files(root)] == [part(1_000, 0), part(1_000, 1)]
@@ -497,7 +529,7 @@ def test_several_appends_to_one_partition_are_numbered_files_of_the_same_batch(r
 
 def test_the_commit_marker_is_written_last_and_names_every_file(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    batch = store.batch()
+    batch = store._batch()
     batch.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + NS_PER_DAY, 2)))
     batch.append(INSTRUMENTS, "kraken", "ETH-USD", instrument(T0))
     assert len(data_files(root)) == 3 and markers(root) == []  # written, not yet committed
@@ -509,7 +541,8 @@ def test_the_commit_marker_is_written_last_and_names_every_file(root):
     (marker,) = markers(root)
     content = json.loads(marker.read_text(encoding="utf-8"))
     assert content["knowledge_ts"] == 1_000
-    assert content["layout"] == 2
+    assert content["layout"] == 3
+    assert content["load"] is None  # written outside a load (ADR 0018)
     assert sorted(content["files"]) == sorted(
         p.relative_to(root).as_posix() for p in data_files(root)
     )
@@ -519,17 +552,17 @@ def test_the_commit_marker_is_written_last_and_names_every_file(root):
 def test_a_batch_that_fails_is_abandoned_and_leaves_nothing(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
     with pytest.raises(RuntimeError, match="the load failed"):
-        with store.batch() as batch:
+        with store._batch() as batch:
             batch.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
             raise RuntimeError("the load failed")
     assert all_files(root) == []
     # The store is usable again, and the failed batch's knowledge time is not reused.
-    assert store.append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2))).knowledge_ts == 2_000
+    assert store._append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2))).knowledge_ts == 2_000
 
 
 def test_a_rejected_table_does_not_end_the_batch_by_itself(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    with store.batch() as batch:
+    with store._batch() as batch:
         with pytest.raises(SchemaError):
             batch.append(BOOK_EVENTS, "kraken", "ETH-USD", trades(("a", T0, 1)))
         with pytest.raises(ValueError, match="empty"):
@@ -540,21 +573,21 @@ def test_a_rejected_table_does_not_end_the_batch_by_itself(root):
 
 def test_a_batch_with_no_rows_commits_nothing(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    with store.batch():
+    with store._batch():
         pass
     assert all_files(root) == []
-    result = store.batch().commit()
+    result = store._batch().commit()
     assert (result.rows, result.files) == (0, ())
     assert all_files(root) == []
 
 
 def test_only_one_batch_can_be_open_and_a_finished_batch_cannot_be_used(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000))
-    first = store.batch()
+    first = store._batch()
     with pytest.raises(RuntimeError, match="already open"):
-        store.batch()
+        store._batch()
     with pytest.raises(RuntimeError, match="already open"):
-        store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     first.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     first.commit()
     for use in (
@@ -563,7 +596,7 @@ def test_only_one_batch_can_be_open_and_a_finished_batch_cannot_be_used(root):
     ):
         with pytest.raises(RuntimeError, match="finished"):
             use()
-    second = store.batch()
+    second = store._batch()
     second.abandon()
     with pytest.raises(RuntimeError, match="finished"):
         second.append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))
@@ -576,25 +609,25 @@ def test_a_commit_marker_is_never_overwritten(root):
     squatter = root / "_batches" / f"batch-{1_000:020d}.json"
     squatter.write_text("not ours", encoding="utf-8")
     with pytest.raises(FileExistsError):
-        store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
+        store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     assert squatter.read_text(encoding="utf-8") == "not ours"
     assert data_files(root) == []  # the batch was abandoned
 
 
 def test_knowledge_ts_starts_at_one_so_version_zero_means_an_empty_store(root):
     store = AppendOnlyStore(root, clock=FakeClock(0))
-    assert store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1))).knowledge_ts == 1
+    assert store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1))).knowledge_ts == 1
 
 
 def test_a_reopened_store_continues_after_an_uncommitted_batch(root):
     """A load that died: its files are on disk without a marker. The next
     batch must still get a later knowledge time."""
     crashed = AppendOnlyStore(root, clock=FakeClock(5_000))
-    crashed.batch().append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # never committed
+    crashed._batch().append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # never committed
     assert len(data_files(root)) == 1 and markers(root) == []
 
     reopened = AppendOnlyStore(root, clock=FakeClock(10))
-    result = reopened.append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))
+    result = reopened._append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))
     assert result.knowledge_ts == 5_001
     assert [p.name for p in markers(root)] == [f"batch-{5_001:020d}.json"]
 
@@ -604,10 +637,10 @@ def test_a_batch_cannot_commit_behind_a_later_committed_batch(root):
     was readable would change afterwards. Two writers on one root are not
     supported; this is what stops them from breaking that."""
     slow = AppendOnlyStore(root, clock=FakeClock(1_000))
-    batch = slow.batch()
+    batch = slow._batch()
     batch.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))
     other = AppendOnlyStore(root, clock=FakeClock(2_000))
-    other.append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))  # committed at 2_000
+    other._append(TRADES, "kraken", "ETH-USD", trades(("b", T0, 2)))  # committed at 2_000
     with pytest.raises(RuntimeError, match="later batch"):
         batch.commit()
     assert [p.name for p in markers(root)] == [f"batch-{2_000:020d}.json"]
@@ -624,7 +657,7 @@ def test_the_marker_is_published_in_one_step_after_every_data_file(root, monkeyp
         real_link(source, target)
 
     monkeypatch.setattr(os, "link", watch)
-    store.append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + NS_PER_DAY, 2)))
+    store._append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1), ("b", T0 + NS_PER_DAY, 2)))
     assert seen == [(f"batch-{1_000:020d}.json", 2, 0)]
 
 
@@ -642,6 +675,6 @@ def test_the_marker_directory_exists_before_the_first_data_file(root):
     directory is what tells a reader this is a store of the current layout with
     nothing committed, not one written before commit markers."""
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.batch().append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # never committed
+    store._batch().append(TRADES, "kraken", "ETH-USD", trades(("a", T0, 1)))  # never committed
     assert len(data_files(root)) == 1
     assert (root / "_batches").is_dir() and markers(root) == []

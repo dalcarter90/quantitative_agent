@@ -36,6 +36,7 @@ before making it.
 | 3c | Owner review of ADRs 0013 and 0014 (ADR 0015) | Done |
 | 3d | Keep the first observation of a repeated trade (ADR 0016) | Done |
 | 3e | The time model: two cutoffs, committed batches, receipt-time windows (ADR 0017) | Done |
+| 3f | Loads, one observation per trade, refused input (ADR 0018) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -256,7 +257,9 @@ validated tree.
   is decided by an arbitrary but deterministic tie-break. Adapters should not
   emit the same key twice in a batch.
 - **No retraction.** A record can be corrected but not withdrawn. If a venue
-  can cancel a trade, that needs a schema decision.
+  can cancel a trade, that needs a schema decision. *(Phase 3f, ADR 0018: a
+  reload of a raw log withdraws the rows it no longer produces, which covers
+  our own fixes. A venue's cancellation of a trade is still undecided.)*
 - **Limits of the guarantee.** The session's private connection is reachable
   by Python code that deliberately reads underscore attributes. Layer 3
   still holds then, but superseded versions and file paths become visible.
@@ -435,7 +438,8 @@ data before the adapters were written):
   about 1,400 pairs; only the recorded pair is stored.
 - **Trade snapshots.** Both venues send recent trades on subscribe. A trade
   seen again in a later session has the same `trade_id` and is treated as a
-  correction, not a duplicate.
+  correction, not a duplicate. *(Changed in Phase 3f, ADR 0018: each
+  observation is stored, and a session shows the first.)*
 - **`ingest` batches by rows** (200,000 pending rows per append by
   default), not by messages: one Coinbase snapshot message is about 38,000
   rows. A one-hour log becomes a handful of files per dataset, and memory
@@ -1154,7 +1158,8 @@ confirmed every implementation choice listed in the "Review" sections of ADRs
   `recv_ts` was the second arrival (up to 267 ms late in the recording
   above).
 - **Trades repeated across logs loaded in separate runs are not compared**
-  (ADR 0015, "Consequences"). `ingest` loads one raw log per run.
+  (ADR 0015, "Consequences"). `ingest` loads one raw log per run. *(Still true
+  after Phase 3f; the session shows the first observation, ADR 0018.)*
 - **Session open reads one footer per file.** About 3 s at 10,000 files; if
   stores grow that large, fewer, larger files are the remedy.
 
@@ -1225,7 +1230,8 @@ Added by the owner after Phase 3c (ADR 0016), before Phase 4.
 
 - **After a conflict, a later repeat matching the first observation is
   dropped**, so the store holds the conflicting value (ADR 0016,
-  "Consequences"). The conflict is already an ERROR.
+  "Consequences"). The conflict is already an ERROR. *(Changed in Phase 3f,
+  ADR 0018: the session shows the first observation.)*
 - **A trade seen first in a trade-history snapshot and later live keeps the
   backfilled observation.** No recording shows this.
 
@@ -1327,14 +1333,16 @@ findings R01, R02, R03 and R09 (ADR 0017).
   a session per decision. The cost of a range query, which resolves versions
   over everything the session can see before filtering on the window, is
   unchanged (review, D4).
-- **Still open from the review:** R04 (a correction cannot remove a row), R05
+- **Still open from the review:** ~~R04 (a correction cannot remove a row), R05
   (a value the schema refuses stops a load; the load is now abandoned whole
-  instead of left half-written), R06, R07, R08, R10, R11, the design findings
-  D1 to D7 and the test findings T1 to T3. D1 to D3 should be settled before
+  instead of left half-written),~~ R06, R07, R08, ~~R10, R11,~~ the design findings
+  D1 to D7 and the test findings T1 to T3. *(R04, R05, R10 and R11 settled in
+  Phase 3f, ADR 0018.)* D1 to D3 should be settled before
   code is written against `MarketEvent` in Phase 4.
-- **R10 is narrower but open.** A trade seen live and resent by a later log is
-  seen as its live observation by a session whose `available_at` is before
-  the resend. After it, the store still shows the later observation.
+- ~~**R10 is narrower but open.**~~ **Settled in Phase 3f (ADR 0018): a trade is
+  shown as its first observation.** A trade seen live and resent by a later
+  log is seen as its live observation by a session whose `available_at` is
+  before the resend. After it, the store still shows the later observation.
 - **ADR 0017's "Review" section** lists ten choices made while building
   this. The owner confirmed all ten on 2026-11-15, including refusing a
   `version` later than the latest committed batch rather than clamping it,
@@ -1347,6 +1355,158 @@ findings R01, R02, R03 and R09 (ADR 0017).
 - **Every store from before this phase is refused.** On the owner's machine
   `data/normalized` was rebuilt; `data/normalized-before-adr0013` and
   `data/normalized-before-adr0017` are refused with the rebuild message.
+
+### Phase 3f: Loads, one observation per trade, refused input (done)
+
+Added by the owner after Phase 3e, before Phase 4. It fixes the review's
+findings R04, R05, R10 and R11 (ADR 0018).
+
+- [x] Every ingest of a raw log is a load with its own `load_id`. A load can
+      span several batches. For each `log_id`, a session reads only rows from
+      that log's latest load whose batches are all within its version; rows an
+      older load produced and the latest does not stop appearing. Older loads
+      stay on disk.
+- [x] One rule for which observation of a trade is shown: the first in replay
+      order (`log_id`, then `seq`), across logs and loads. Conflicts are still
+      `TRADE_CONFLICT` errors.
+- [x] The normalizer refuses logs fed interleaved, with a clear error.
+- [x] A value the adapter accepts but the schema refuses is a rejected message
+      (`MESSAGE_REJECTED`), not a crashed load.
+- [x] The R04, R05, R10 and R11 review tests pass with their `xfail` markers
+      removed.
+- [x] `data/normalized` rebuilt and compared with the previous store.
+- [x] Owner decisions on ADR 0018's Review (2026-11-16): per log, read the
+      latest complete load; if the log has no complete load, read its latest
+      incomplete load (its committed batches within the version). Tested,
+      including that a reload in progress never hides the previous complete
+      load.
+- [x] Loads are the only production write path: writing outside a load is
+      private (`_batch`, `_append`) and test-only, and a test asserts the
+      store's public surface is the load API only.
+- [x] ADR 0018's Review items marked decided by the owner.
+- [ ] **Next PR:** trade conflicts between logs loaded in separate runs (ADR
+      0018, Review item 7, deferred by the owner).
+
+**What was built:**
+
+- `store.py`: store layout 3. Each commit marker names its batch's load
+  (`null`, or `load_id`, `log_id`, `last`). `AppendOnlyStore.load(log_id)`
+  returns a `Load` (`batch(last=...)`, `finish()`, `load_id`, `log_id`,
+  `finished`); a load's batches take rows of its log only, and its last batch
+  publishes a marker even with no rows. `load` is the store's only public
+  operation; `_batch` and `_append` (outside any load) are private, for
+  tests. The writer refuses a store of another layout.
+- `session.py`: each log is read from one load: its latest complete load
+  (greatest `load_id` whose last batch is within the version), or, if it has
+  none, its latest incomplete load, as far as its committed batches within the
+  version go. Rows written outside a load are read only for logs with no load.
+  The engine cannot open the files of a load it does not read. Markers whose
+  loads do not add up are refused. `trades` shows one row per `trade_id`.
+- `schema.py`: `trades` keyed by `(log_id, seq, trade_id)`, with
+  `Dataset.one_row_per = ("trade_id",)`; `check_row`, the schema's rules for
+  one row.
+- `adapters/base.py`: `ingest` is one load of one batch; every row and event is
+  checked with `check_row` before it is kept, and a record with a value the
+  schema refuses is rejected (`schema_refused`); events of any rejected record
+  that the store cannot hold are named in its `MESSAGE_REJECTED` detail
+  instead of stored; `InterleavedLogs`, raised for a record whose `seq` is
+  neither 0 nor the previous plus one, after which the normalizer refuses
+  everything. `adapters/coinbase.py`: a `sequence_num` outside int64 is
+  refused before it becomes the connection's state.
+- `python/tests/data/damage.py`: `removed` renumbers the records after the one
+  it removes, as a written log would; `original_seq` maps back.
+- ADR 0018; `docs/data-core.md` sections 2 to 5; architecture sections 3.2,
+  6.2 and 7; CLAUDE.md (the data core and `StoreVersionError`).
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,421 Python tests,
+  6 expected failures (the review findings still open: R06, R07, R08), after
+  the owner's decisions of 2026-11-16 (1,418 before them).
+- New tests, written before the code: `test_loads.py` (the writer, every case
+  of the read rule, the engine's file limit, the cursor, damaged markers,
+  `ingest` as a load, and the review's R04 experiment on Coinbase);
+  `test_session_loads_property.py` (random histories over two logs of batches
+  outside loads and inside loads, complete or not, some never committed, with
+  trades shared between logs and records: every read path of a session and of
+  a cursor equals an oracle written from the rule); `test_normalizer_input.py`
+  (`check_row` accepts exactly what `table_from_rows` does, a property test;
+  rejected records and their events; a fuzz of the fixtures whose every row
+  must fit the schema; interleaved and out-of-order feeds); new tests in
+  `test_trade_repeats.py` for the trade rule.
+- **The fuzz test found a defect before the code was done:** events noted for
+  a record rejected the ordinary way (a parse error after the adapter noted a
+  sequence event) were stored unchecked, and one of them could not be. Every
+  rejected record's events are now checked.
+- The R04, R05, R10 and R11 review tests pass unmarked. Two had to change
+  shape because the owner decided a behavior other than the one they
+  required (ADR 0018, Review item 10): R10's conflicting-repeat test required
+  the later value and now requires the first, with two more cases; R11's
+  required interleaved logs to keep their own ids, which no normalizer can do,
+  and now requires a refusal. Run against main's code (with a stand-in for the
+  new exception), every R04, R05, R10 and R11 test fails for its finding,
+  except the two original cases of the R10 conflict test, which main passes by
+  accident of the clocks; the two new cases fail with `(4, 1010)`.
+- Tests that pinned the replaced trade rule were updated to the new one
+  (ADR 0018, Review item 10). The damaged-fixture tests in `test_book.py` state
+  their record numbers through `damage.original_seq`.
+- Breakage pass: 37 deliberate breakages (seven in the writer, nine in load
+  selection, three in the trade view, one in the trade key, five in
+  `check_row`, nine in the normalizer, one in the Coinbase adapter, two in
+  `ingest`). The first run caught 35 of the 36 then planned; the survivor (a
+  cursor that stopped hiding a loaded log's rows from outside its load after
+  `advance`) got a test. The Coinbase one was added with its fix and caught.
+- **After the owner's decisions (2026-11-16):** new tests in `test_loads.py`
+  (a log's first load read chunk by chunk, each version reading what it read
+  while the load was written; of two incomplete loads the latest; a first
+  load that died; a reload in progress, over several chunks, never hiding the
+  previous complete load; rows outside a load read only for logs with no
+  load), the property test's oracle changed to the new rule, and
+  `test_store.py` asserting that the store's public surface is `load` alone
+  and, on the syntax tree, that no module of the package calls `_batch` or
+  `_append` except the store's own `_append`. Every test call of the old
+  public `batch()` and `append()` (108 call sites, found by recording the
+  callers during one full run; none outside the tests) now calls the private
+  names. The breakage pass was rerun with the read-rule breakages rewritten
+  and eight added (four in the new rule, two in the rows outside a load, two
+  in the write path): 43 breakages, all caught.
+- `data/normalized` rebuilt from the two one-hour logs (the old store is kept as
+  `data/normalized-before-adr0018` and is refused with the rebuild message,
+  `quality` exiting 2). The same row counts in all four datasets on both
+  venues (319,421 / 4,569 / 2 / 35 and 871,546 / 18,372 / 1 / 35), the same
+  price and quantity sums, stream event kinds and receipt-time ranges, 6 of 6
+  check snapshots exact on each venue with the same snapshots, never crossed,
+  23 files, and the same quality report apart from the version it names.
+- Each one-hour log loaded twice into a scratch store reads exactly as loading
+  it once (46 files instead of 23).
+- Loading took 14.9 s and 28.3 s; main's code on the same machine, the same
+  hour, took 12.7 s and 23.8 s. The schema check per row costs 17 to 19%.
+
+**Notes for the next phases:**
+
+- **ADR 0018's "Review" section** lists ten choices made while building this;
+  the owner decided all of them on 2026-11-16. Two were changed (the read rule
+  for a log with no complete load, and loads as the only write path) and one
+  deferred (below).
+- **Next PR: trade conflicts across separate runs.** `TRADE_CONFLICT` comes
+  from the normalizer, so a conflict between two logs loaded in separate runs
+  is not reported. Both observations are stored; the option is a view of
+  every observation of a trade (inside both cutoffs) and a quality check over
+  it, which would also allow `TRADE_REPEAT` across logs (ADR 0018, Review
+  item 7).
+- **A log's first load is readable while it is written,** chunk by chunk, and
+  looks like a log that ended early until it completes. A first load that
+  died is read until the log has a complete load.
+- **Phase 7 and research** see one row per trade. A trade resent by a later
+  log is its first observation; a window holds a trade if that observation
+  was received in it.
+- **A normalizer fed `merge_logs` output raises.** Phase 7 drives handlers
+  from merged logs, not one normalizer; nothing in the repository feeds a
+  normalizer merged records.
+- **The store grows with every reload.** There is no compaction.
+- **Still open from the review:** R06, R07, R08, the design findings D1 to D7
+  and the test findings T1 to T3. D1 to D3 should be settled before code is
+  written against `MarketEvent` in Phase 4.
 
 ### Phase 4: C++ order book, verified
 
