@@ -185,7 +185,7 @@ def comparison(seq, ts, result, *, violations=0, unverified=0):
 
 
 def events_store(root, rows):
-    AppendOnlyStore(root).append(STREAM_EVENTS, "coinbase", INSTRUMENT,
+    AppendOnlyStore(root)._append(STREAM_EVENTS, "coinbase", INSTRUMENT,
                                  table_from_rows(STREAM_EVENTS, rows))  # fmt: skip
     return root
 
@@ -302,7 +302,7 @@ def test_r03_a_session_opened_after_a_batchs_knowledge_time_always_sees_it(root,
         real_link(source, target)
 
     monkeypatch.setattr(os, "link", look_then_publish)
-    result = AppendOnlyStore(root, clock=FakeClock(1_000)).append(
+    result = AppendOnlyStore(root, clock=FakeClock(1_000))._append(
         TRADES, "kraken", "ETH-USD", trade_table(("a", T0, 100))
     )
     monkeypatch.undo()

@@ -122,10 +122,11 @@ look-ahead structurally rather than by convention:
   without the integrity events written with it.
 - **Each raw log is read from one load** (ADR 0018). Every ingest of a raw log
   is a load (one or more batches); a session reads each log only from its
-  latest load that is complete within its version. Loading a log again,
-  after an adapter fix, replaces what the earlier load said about it,
-  including rows it no longer produces, and a load still in progress is not
-  read at all.
+  latest load that is complete within its version, or, if it has none, from
+  its latest incomplete one (a first load still being written). Loading a log
+  again, after an adapter fix, replaces what the earlier load said about it,
+  including rows it no longer produces, and a reload in progress never hides
+  the previous complete load. Loads are the store's only write path.
 - **One row per trade** (ADR 0018). Every observation of a trade is stored;
   the session shows its first observation in `(log_id, seq)` order, among
   those inside both cutoffs.

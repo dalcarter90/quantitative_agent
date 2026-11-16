@@ -18,11 +18,11 @@ ignore its files, whether the load is still running, failed, or died.
 A **load** is one ingest of one raw log (ADR 0018): one or more batches, all
 of whose rows name that log. Its ``load_id`` is the knowledge time of its
 first batch, and its last batch says so in its marker. A reader reads each
-log from its latest complete load, so loading a log again replaces what an
-earlier load said about it, including rows the new load no longer produces,
-while the earlier load stays on disk. Batches written outside a load
-(``append``, ``batch()``) are read record by record until their log has a
-complete load.
+log from its latest complete load (or, if it has none, its latest
+incomplete one), so loading a log again replaces what an earlier load said
+about it, including rows the new load no longer produces, while the earlier
+load stays on disk. ``load`` is the writer's only public operation; the
+private ``_batch`` and ``_append`` write outside any load, for tests only.
 
 Existing files are never opened for writing, renamed or removed, and there is
 no update or delete operation: a correction is another batch, or another
@@ -104,7 +104,7 @@ def _legacy(path: Path) -> StoreVersionError:
 
 
 class Batch:
-    """One load into the store. Get one from ``AppendOnlyStore.batch()``.
+    """One batch of the store. Get one from ``Load.batch()``.
 
     Every table appended shares ``knowledge_ts``. Nothing is readable until
     ``commit``; used as a context manager, the batch is committed when the
@@ -261,8 +261,9 @@ class Load:
 
     A load is one or more batches, every row of which names ``log_id``. It is
     complete once its last batch is committed: a batch opened with
-    ``last=True``, or the empty one ``finish`` commits. Until then readers do
-    not read it at all, and read the log from its previous complete load.
+    ``last=True``, or the empty one ``finish`` commits. Until then readers
+    read the log from its previous complete load, or, if it has none, from
+    this load's committed batches.
     ``load_id`` is the knowledge time of the load's first batch.
     """
 
@@ -316,9 +317,13 @@ class Load:
 
 
 class AppendOnlyStore:
-    """Writer for the normalized store. Its operations are ``load`` (a raw
-    log's batches, ADR 0018), ``batch`` and ``append``, which is a batch of
-    one table."""
+    """Writer for the normalized store. Its one operation is ``load``: every
+    write is a load of a raw log (ADR 0018).
+
+    ``_batch`` and ``_append`` write a batch outside any load. They exist for
+    tests that build a store row by row, and are not part of the store's
+    interface: no production code may call them.
+    """
 
     def __init__(self, root: str | os.PathLike[str], *, clock: Callable[[], int] = time.time_ns):
         self._root = Path(root)
@@ -333,9 +338,9 @@ class AppendOnlyStore:
             raise ValueError(f"a load is of one raw log, named by its log id; got {log_id!r}")
         return Load(self, log_id)
 
-    def batch(self) -> Batch:
-        """Open a batch outside any load: one knowledge time for everything
-        appended to it, readable only once it is committed (ADR 0017)."""
+    def _batch(self) -> Batch:
+        """Tests only: open a batch outside any load. One knowledge time for
+        everything appended to it, readable only once it is committed."""
         return self._open(None, False)
 
     def _open(self, load: Load | None, last: bool) -> Batch:
@@ -346,8 +351,11 @@ class AppendOnlyStore:
         self._open_batch = Batch(self, knowledge_ts, load, last)
         return self._open_batch
 
-    def append(self, dataset: Dataset, venue: str, instrument: str, rows: pa.Table) -> AppendResult:
-        """Append ``rows`` as a batch of its own and return the knowledge time it was given.
+    def _append(
+        self, dataset: Dataset, venue: str, instrument: str, rows: pa.Table
+    ) -> AppendResult:
+        """Tests only: append ``rows`` as a batch of its own, outside any load,
+        and return the knowledge time it was given.
 
         ``rows`` must match ``dataset.schema`` exactly (build it with
         ``schema.table_from_rows``). A table that is refused consumes no
@@ -356,7 +364,7 @@ class AppendOnlyStore:
         if self._open_batch is not None:
             raise RuntimeError("a batch is already open on this store; append to that batch")
         _validate(dataset, venue, instrument, rows)
-        with self.batch() as batch:
+        with self._batch() as batch:
             batch.append(dataset, venue, instrument, rows)
             return batch.commit()
 

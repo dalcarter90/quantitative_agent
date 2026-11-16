@@ -302,8 +302,8 @@ def test_the_version_is_chosen_among_the_rows_available(root):
     the record; the next test covers the resend.)"""
     hour = 3600 * NS_PER_SECOND
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    store.append(TRADES, *KRK, trade_table(("t", T0, 100)))
-    store.append(TRADES, *KRK, trade_table(("t", T0 + hour, 100)))  # the same record, seq 0
+    store._append(TRADES, *KRK, trade_table(("t", T0, 100)))
+    store._append(TRADES, *KRK, trade_table(("t", T0 + hour, 100)))  # the same record, seq 0
 
     def seen(available_at, version=None):
         with PITSession(root, available_at=available_at, version=version) as session:
@@ -323,8 +323,8 @@ def test_a_trade_resent_later_is_shown_as_its_first_observation(root):
     (log_id, seq) order among those it can see (ADR 0018)."""
     hour = 3600 * NS_PER_SECOND
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    store.append(TRADES, *KRK, trade_table(("t", T0, 100)))
-    store.append(TRADES, *KRK, trade_table(("t", T0 + hour, 100), seq=7))  # same trade_id
+    store._append(TRADES, *KRK, trade_table(("t", T0, 100)))
+    store._append(TRADES, *KRK, trade_table(("t", T0 + hour, 100), seq=7))  # same trade_id
 
     def seen(available_at, version=None):
         with PITSession(root, available_at=available_at, version=version) as session:
@@ -365,7 +365,7 @@ def test_a_window_selects_every_dataset_by_the_same_clock(root):
     event = {"event_ts": received, "event_ts_source": "receipt", "recv_ts": received,
              "log_id": LOG, "seq": 4, "event_index": 0, "kind": 10, "connection": "ws",
              "expected": 8, "observed": 9, "detail": None}  # fmt: skip
-    with AppendOnlyStore(root, clock=FakeClock(1_000)).batch() as batch:
+    with AppendOnlyStore(root, clock=FakeClock(1_000))._batch() as batch:
         batch.append(BOOK_EVENTS, *KRK, table_from_rows(BOOK_EVENTS, [level]))
         batch.append(STREAM_EVENTS, *KRK, table_from_rows(STREAM_EVENTS, [event]))
     with PITSession(root, available_at=INT64_MAX) as session:
@@ -379,8 +379,8 @@ def test_a_window_selects_every_dataset_by_the_same_clock(root):
 
 def test_a_correction_that_moves_a_row_in_time_leaves_the_old_time_range(root):
     store = AppendOnlyStore(root, clock=FakeClock(1000, 2000))
-    store.append(TRADES, *KRK, trade_table(("a", T0, 100)))
-    store.append(TRADES, *KRK, trade_table(("a", T0 + NS_PER_DAY, 100)))  # other partition
+    store._append(TRADES, *KRK, trade_table(("a", T0, 100)))
+    store._append(TRADES, *KRK, trade_table(("a", T0 + NS_PER_DAY, 100)))  # other partition
 
     with PITSession(root, available_at=INT64_MAX, version=1000) as before:
         assert [t[0] for t in trade_view(before, start=RECV_A, end=RECV_A + 1)] == ["a"]
@@ -472,8 +472,8 @@ def announced(effective, tick_size, seq):
 
 def test_instrument_defaults_to_the_version_in_effect_at_available_at(root):
     store = AppendOnlyStore(root, clock=FakeClock(100, 200))
-    store.append(INSTRUMENTS, *KRK, announced(1_000, tick_size=1, seq=0))
-    store.append(INSTRUMENTS, *KRK, announced(5_000, tick_size=2, seq=1))
+    store._append(INSTRUMENTS, *KRK, announced(1_000, tick_size=1, seq=0))
+    store._append(INSTRUMENTS, *KRK, announced(5_000, tick_size=2, seq=1))
     with PITSession(root, available_at=4_999) as session:
         assert session.instrument(*KRK).tick_size == 1
     with PITSession(root, available_at=5_000) as session:
@@ -496,7 +496,7 @@ def test_instrument_meta_is_immutable(history):
 def test_later_appends_are_invisible_to_an_open_session(history):
     with PITSession(history.root, available_at=INT64_MAX, version=8000) as session:
         before = trade_view(session)
-        history.store.append(TRADES, *KRK, trade_table(("a", T0, 999), ("z", T0, 1)))
+        history.store._append(TRADES, *KRK, trade_table(("a", T0, 999), ("z", T0, 1)))
         assert trade_view(session) == before
         assert session.sql("SELECT max(knowledge_ts) AS k FROM trades").to_pylist() == [{"k": 8000}]
 
@@ -504,7 +504,7 @@ def test_later_appends_are_invisible_to_an_open_session(history):
 def test_a_session_at_the_default_version_does_not_follow_later_batches(history):
     with PITSession(history.root, available_at=INT64_MAX) as session:
         before = trade_view(session)
-        later = history.store.append(TRADES, *KRK, trade_table(("z", T0, 1), seq=9))
+        later = history.store._append(TRADES, *KRK, trade_table(("z", T0, 1), seq=9))
         assert session.version == 9000  # fixed when the session was opened
         assert trade_view(session) == before
     with PITSession(history.root, available_at=INT64_MAX) as reopened:
@@ -667,7 +667,7 @@ def test_error_messages_do_not_reveal_store_paths(history):
 def test_the_data_package_exports_no_other_read_path():
     # The store is write-only and nothing else in the package reads files back.
     public_store = {n for n in dir(AppendOnlyStore) if not n.startswith("_")}
-    assert public_store == {"append", "batch", "load"}
+    assert public_store == {"load"}
     modules = {
         name for name in dir(data_package) if not name.startswith("_") and name != "annotations"
     }
@@ -704,7 +704,7 @@ def test_rows_come_back_in_log_and_seq_order_even_if_recv_ts_goes_backwards(root
         rows.append({"event_ts": T0, "event_ts_source": "venue", "recv_ts": recv_ts,
                      "log_id": log_id, "seq": seq, "trade_id": f"{log_id[-1]}{seq}",
                      "price": 1, "qty": 1, "side": 1})  # fmt: skip
-    store.append(TRADES, *KRK, table_from_rows(TRADES, rows))
+    store._append(TRADES, *KRK, table_from_rows(TRADES, rows))
     with PITSession(root, available_at=INT64_MAX) as session:
         got = session.trades(*KRK, 0, INT64_MAX).to_pylist()
     assert [(r["log_id"], r["seq"]) for r in got] == [
@@ -716,7 +716,7 @@ def test_rows_come_back_in_log_and_seq_order_even_if_recv_ts_goes_backwards(root
 
 
 def test_a_batch_is_invisible_until_it_is_committed(history):
-    batch = history.store.batch()
+    batch = history.store._batch()
     batch.append(TRADES, *KRK, trade_table(("u", T0, 77), seq=9))
     with PITSession(history.root, available_at=INT64_MAX) as session:
         assert session.version == 9000  # the open batch is not a version yet
@@ -735,14 +735,14 @@ def test_a_batch_is_invisible_until_it_is_committed(history):
 
 def test_the_files_of_a_load_that_died_are_never_visible(history):
     crashed = AppendOnlyStore(history.root, clock=FakeClock(20_000))
-    crashed.batch().append(TRADES, *KRK, trade_table(("dead", T0, 1), seq=9))  # no commit, ever
+    crashed._batch().append(TRADES, *KRK, trade_table(("dead", T0, 1), seq=9))  # no commit, ever
     leftover = [p for p in history.root.rglob("*.parquet") if "20000" in p.name]
     assert len(leftover) == 1
     with PITSession(history.root, available_at=INT64_MAX) as session:
         assert session.version == 9000
         assert "dead" not in [t[0] for t in trade_view(session)]
     # A later batch commits normally, and the dead one stays invisible.
-    later = AppendOnlyStore(history.root, clock=FakeClock(1)).append(
+    later = AppendOnlyStore(history.root, clock=FakeClock(1))._append(
         TRADES, *KRK, trade_table(("alive", T0, 2), seq=10)
     )
     with PITSession(history.root, available_at=INT64_MAX) as session:
@@ -761,7 +761,7 @@ def test_a_committed_file_that_is_missing_is_an_error(history):
 def test_a_store_whose_first_load_never_committed_reads_as_empty(root):
     """Found by the property test: not a store from before commit markers, just
     one with nothing committed yet."""
-    AppendOnlyStore(root, clock=FakeClock(1_000)).batch().append(
+    AppendOnlyStore(root, clock=FakeClock(1_000))._batch().append(
         TRADES, *KRK, trade_table(("a", T0, 100))
     )
     with PITSession(root, available_at=INT64_MAX) as session:

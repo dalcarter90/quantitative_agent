@@ -15,12 +15,14 @@ Only committed batches exist for a session: the files of a load that is still
 running, failed or died have no commit marker and are never opened.
 
 **Loads (ADR 0018).** Every ingest of a raw log is a load. For each log, a
-session reads only the rows of that log's latest load (by ``load_id``) whose
-last batch is within its version. A log loaded again is therefore read from
-the new load alone: rows the earlier load produced and the new one does not
-are gone from the session, though not from the store. A load that is not yet
-complete is not read at all. Batches written outside a load are read as
-before, record by record, for every log that has no complete load.
+session reads only the rows of one load: the log's latest complete load (by
+``load_id``, its last batch within the version), or, if it has none, its
+latest incomplete load (its committed batches within the version). A log
+loaded again is therefore read from the new load alone, once it is complete:
+rows the earlier load produced and the new one does not are gone from the
+session, though not from the store, and a reload in progress never hides the
+previous complete load. Batches written outside a load (tests only) are read
+record by record, for logs that have no load.
 
 **One row per trade.** Trades are stored once per observation. The session
 shows each trade once: its first observation in ``(log_id, seq)`` order among
@@ -218,14 +220,22 @@ def _check_loads(batches: list[_CommittedBatch]) -> None:
 
 
 def _select(batches: list[_CommittedBatch], version: int, horizon_day: int) -> _Selection:
-    """Each log from its latest load complete within ``version``; batches outside
-    a load for the logs that have none (ADR 0018)."""
+    """Each log from one load (ADR 0018): its latest load complete within
+    ``version``, or, if it has none, its latest incomplete load, read as far as
+    its batches within ``version`` go. Batches outside a load (tests only) are
+    read for the logs that have no load."""
     known = [b for b in batches if b.knowledge_ts <= version]
-    chosen: dict[str, int] = {}  # log_id -> load_id
+    complete: dict[str, int] = {}  # log_id -> load_id of its latest complete load
+    started: dict[str, int] = {}  # log_id -> load_id of its latest load of any kind
     for batch in known:
         load = batch.load
-        if load is not None and load.last:
-            chosen[load.log_id] = max(chosen.get(load.log_id, 0), load.load_id)
+        if load is None:
+            continue
+        started[load.log_id] = max(started.get(load.log_id, 0), load.load_id)
+        if load.last:
+            complete[load.log_id] = max(complete.get(load.log_id, 0), load.load_id)
+    # A reload in progress never hides the previous complete load.
+    chosen = {log_id: complete.get(log_id, latest) for log_id, latest in started.items()}
     read = set(chosen.values())
     kept = [b for b in known if b.load is None or b.load.load_id in read]
     return _Selection(

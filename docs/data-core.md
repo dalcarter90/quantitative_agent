@@ -123,18 +123,19 @@ venue time after 2262) is a rejected message, not a failed load (section 5).
 This is store layout 3 (ADR 0018).
 
 - `date` is the UTC date of `recv_ts`: the day we received the row (ADR 0017).
-- **A write is a batch.** `AppendOnlyStore(root).batch()` opens one; every
-  table appended to it, in every dataset, gets the same `knowledge_ts`, read
-  from the clock when the batch opens and strictly greater than any issued
-  before (including in earlier processes, and by batches that were never
-  committed). `append(dataset, venue, instrument, table)` is a batch of one
-  table.
-- **A load is one ingest of one raw log** (ADR 0018):
-  `AppendOnlyStore(root).load(log_id)` returns a `Load`, whose batches
-  (`load.batch(last=False)`) may hold only rows of that log. Its `load_id` is
-  the knowledge time of its first batch. It is complete once its last batch
-  (`last=True`, or the empty batch `load.finish()` commits) is committed.
-  `ingest` loads a raw log as one load of one batch.
+- **Every write is a load of one raw log** (ADR 0018), and `load` is the
+  writer's only public operation: `AppendOnlyStore(root).load(log_id)`
+  returns a `Load`, whose batches (`load.batch(last=False)`) may hold only
+  rows of that log. Its `load_id` is the knowledge time of its first batch.
+  It is complete once its last batch (`last=True`, or the empty batch
+  `load.finish()` commits) is committed. `ingest` loads a raw log as one load
+  of one batch.
+- **A load is written in batches.** Every table appended to a batch, in every
+  dataset, gets the same `knowledge_ts`, read from the clock when the batch
+  opens and strictly greater than any issued before (including in earlier
+  processes, and by batches that were never committed). The store's private
+  `_batch()` and `_append()` write a batch outside any load; they are for
+  tests that build a store row by row, and no production code calls them.
 - **A batch is readable only once it is committed.** Its data files are
   written first. Its commit marker (JSON: the layout number, the knowledge
   time, every file of the batch, row counts, and its load: `null`, or its
@@ -148,16 +149,16 @@ This is store layout 3 (ADR 0018).
 - Existing files are never opened for writing, renamed or removed. A data
   file is created under its final name and the create fails if the name is
   taken; a marker is published by hard link, which cannot replace a file.
-- **Loading a raw log again replaces it.** A session reads each log from its
-  latest complete load only (section 4), so the rows a new load no longer
+- **Loading a raw log again replaces it.** A session reads each log from one
+  load, its latest complete one (section 4), so the rows a new load no longer
   produces stop appearing, in every dataset: after an adapter fix, the errors
   the fix resolved are gone. The earlier load stays on disk and is what a
   session at an earlier version reads. Every key names the raw record a row
   came from, and a log keeps its `log_id`, so two logs never collide and
   several recorders of one instrument can run at once (ADR 0013).
 - A **correction** of a record is a new row with the same key and a later
-  `knowledge_ts`. That is how batches of one load, and batches written outside
-  any load (`append`, `batch()`), correct each other.
+  `knowledge_ts`. That is how the batches of one load correct each other (and
+  how tests' batches written outside a load do).
 - **Order.** The range methods return rows in `(log_id, seq)` order: one log
   after another, in the order they began, each in the order its records
   arrived. Logs are not interleaved in the store; merging logs by arrival is
@@ -198,12 +199,13 @@ A session has two cutoffs (ADR 0017):
 | `available_at`, required, no default | A simulated time. Only rows with `recv_ts <= available_at` are visible |
 | `version`, optional | A knowledge cutoff. Among the rows available, each record's latest version with `knowledge_ts <= version` is returned. Defaults to the latest committed batch |
 
-- **Each log is read from one load** (ADR 0018): the latest (greatest
-  `load_id`) whose last batch is within the version. A load that is not
-  complete within the version is not read at all, so a reload in progress
-  never shows half a log. A log with no complete load is read from batches
-  written outside a load, record by record; once it has one, those rows are
-  not read.
+- **Each log is read from one load** (ADR 0018): its latest complete load
+  (greatest `load_id` whose last batch is within the version). If it has no
+  complete load, its latest incomplete load, that is, the committed batches of
+  it within the version: a log's first load is readable while it is still
+  being written. A reload in progress never hides the previous complete load,
+  so a session never sees half a reload. (Rows written outside a load, which
+  only tests do, are read for logs that have no load.)
 - Both cutoffs apply before a version is chosen. If a record was corrected by
   a batch received later, a session whose `available_at` is before then sees
   the original.

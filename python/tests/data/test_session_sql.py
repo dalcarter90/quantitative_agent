@@ -658,8 +658,8 @@ def test_a_batch_whose_name_understates_its_knowledge_time_is_still_filtered(roo
     from quantagent.data.store import AppendOnlyStore
 
     store = AppendOnlyStore(root, clock=FakeClock(9000))
-    result = store.append(TRADES, "kraken", "ETH-USD", trade_table(("late", T0, 1)))
-    store.append(TRADES, "kraken", "ETH-USD", trade_table(("later", T0, 2), seq=1))  # 9001
+    result = store._append(TRADES, "kraken", "ETH-USD", trade_table(("late", T0, 1)))
+    store._append(TRADES, "kraken", "ETH-USD", trade_table(("later", T0, 2), seq=1))  # 9001
     # Test-only tampering: the batch written at 9000 now claims to be from 1000,
     # consistently in its file name, its marker's name and the marker's content.
     disguised = result.files[0].with_name(f"part-{1000:020d}-000000.parquet")
@@ -711,7 +711,7 @@ def test_engine_cannot_read_the_files_of_an_uncommitted_batch(history):
 
     from quantagent.data.schema import TRADES
 
-    history.store.batch().append(TRADES, "kraken", "ETH-USD", trade_table(("u", T0, 1), seq=9))
+    history.store._batch().append(TRADES, "kraken", "ETH-USD", trade_table(("u", T0, 1), seq=9))
     (uncommitted,) = [p.as_posix() for p in history.root.rglob("*.parquet") if "9001" in p.name]
     with PITSession(history.root, available_at=INT64_MAX) as s:
         con = _connection(s)

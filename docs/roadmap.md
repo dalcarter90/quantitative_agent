@@ -1375,6 +1375,17 @@ findings R04, R05, R10 and R11 (ADR 0018).
 - [x] The R04, R05, R10 and R11 review tests pass with their `xfail` markers
       removed.
 - [x] `data/normalized` rebuilt and compared with the previous store.
+- [x] Owner decisions on ADR 0018's Review (2026-11-16): per log, read the
+      latest complete load; if the log has no complete load, read its latest
+      incomplete load (its committed batches within the version). Tested,
+      including that a reload in progress never hides the previous complete
+      load.
+- [x] Loads are the only production write path: writing outside a load is
+      private (`_batch`, `_append`) and test-only, and a test asserts the
+      store's public surface is the load API only.
+- [x] ADR 0018's Review items marked decided by the owner.
+- [ ] **Next PR:** trade conflicts between logs loaded in separate runs (ADR
+      0018, Review item 7, deferred by the owner).
 
 **What was built:**
 
@@ -1382,11 +1393,13 @@ findings R04, R05, R10 and R11 (ADR 0018).
   (`null`, or `load_id`, `log_id`, `last`). `AppendOnlyStore.load(log_id)`
   returns a `Load` (`batch(last=...)`, `finish()`, `load_id`, `log_id`,
   `finished`); a load's batches take rows of its log only, and its last batch
-  publishes a marker even with no rows. The writer refuses a store of another
-  layout.
-- `session.py`: each log is read from its latest load (greatest `load_id`)
-  whose last batch is within the version; a log with no complete load is read
-  from batches written outside a load, whose rows of a loaded log are hidden.
+  publishes a marker even with no rows. `load` is the store's only public
+  operation; `_batch` and `_append` (outside any load) are private, for
+  tests. The writer refuses a store of another layout.
+- `session.py`: each log is read from one load: its latest complete load
+  (greatest `load_id` whose last batch is within the version), or, if it has
+  none, its latest incomplete load, as far as its committed batches within the
+  version go. Rows written outside a load are read only for logs with no load.
   The engine cannot open the files of a load it does not read. Markers whose
   loads do not add up are refused. `trades` shows one row per `trade_id`.
 - `schema.py`: `trades` keyed by `(log_id, seq, trade_id)`, with
@@ -1407,8 +1420,9 @@ findings R04, R05, R10 and R11 (ADR 0018).
 
 **Verified:**
 
-- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,418 Python tests,
-  6 expected failures (the review findings still open: R06, R07, R08).
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,421 Python tests,
+  6 expected failures (the review findings still open: R06, R07, R08), after
+  the owner's decisions of 2026-11-16 (1,418 before them).
 - New tests, written before the code: `test_loads.py` (the writer, every case
   of the read rule, the engine's file limit, the cursor, damaged markers,
   `ingest` as a load, and the review's R04 experiment on Coinbase);
@@ -1442,6 +1456,20 @@ findings R04, R05, R10 and R11 (ADR 0018).
   `ingest`). The first run caught 35 of the 36 then planned; the survivor (a
   cursor that stopped hiding a loaded log's rows from outside its load after
   `advance`) got a test. The Coinbase one was added with its fix and caught.
+- **After the owner's decisions (2026-11-16):** new tests in `test_loads.py`
+  (a log's first load read chunk by chunk, each version reading what it read
+  while the load was written; of two incomplete loads the latest; a first
+  load that died; a reload in progress, over several chunks, never hiding the
+  previous complete load; rows outside a load read only for logs with no
+  load), the property test's oracle changed to the new rule, and
+  `test_store.py` asserting that the store's public surface is `load` alone
+  and, on the syntax tree, that no module of the package calls `_batch` or
+  `_append` except the store's own `_append`. Every test call of the old
+  public `batch()` and `append()` (108 call sites, found by recording the
+  callers during one full run; none outside the tests) now calls the private
+  names. The breakage pass was rerun with the read-rule breakages rewritten
+  and eight added (four in the new rule, two in the rows outside a load, two
+  in the write path): 43 breakages, all caught.
 - `data/normalized` rebuilt from the two one-hour logs (the old store is kept as
   `data/normalized-before-adr0018` and is refused with the rebuild message,
   `quality` exiting 2). The same row counts in all four datasets on both
@@ -1456,11 +1484,19 @@ findings R04, R05, R10 and R11 (ADR 0018).
 
 **Notes for the next phases:**
 
-- **ADR 0018's "Review" section** lists ten choices made while building this,
-  for the owner to confirm. The two with the most consequence: an incomplete
-  load is never read (a future live loader's chunks are invisible until its
-  last batch), and conflicts between logs loaded in separate runs are still
-  not detected.
+- **ADR 0018's "Review" section** lists ten choices made while building this;
+  the owner decided all of them on 2026-11-16. Two were changed (the read rule
+  for a log with no complete load, and loads as the only write path) and one
+  deferred (below).
+- **Next PR: trade conflicts across separate runs.** `TRADE_CONFLICT` comes
+  from the normalizer, so a conflict between two logs loaded in separate runs
+  is not reported. Both observations are stored; the option is a view of
+  every observation of a trade (inside both cutoffs) and a quality check over
+  it, which would also allow `TRADE_REPEAT` across logs (ADR 0018, Review
+  item 7).
+- **A log's first load is readable while it is written,** chunk by chunk, and
+  looks like a log that ended early until it completes. A first load that
+  died is read until the log has a complete load.
 - **Phase 7 and research** see one row per trade. A trade resent by a later
   log is its first observation; a window holds a trade if that observation
   was received in it.

@@ -394,8 +394,8 @@ def test_before_the_first_observation_arrived_a_session_shows_the_one_that_had(t
     t = 1_794_366_407 * 10**9
     root = tmp_path / "store"
     store = AppendOnlyStore(root)
-    store.append(TRADES, "kraken", INSTRUMENT, _trade(early_log, 9, t + 30_000_000, 1))
-    store.append(TRADES, "kraken", INSTRUMENT, _trade(late_log, 4, t, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(early_log, 9, t + 30_000_000, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(late_log, 4, t, 1))
     assert shown(root, available_at=t - 1) == []
     assert shown(root, available_at=t + 1) == [(late_log, 4, t, 1)]
     assert shown(root) == [(early_log, 9, t + 30_000_000, 1)]
@@ -407,8 +407,8 @@ def test_a_window_holds_a_trade_when_its_shown_observation_was_received_in_it(tm
     t = 1_794_366_407 * 10**9
     root = tmp_path / "store"
     store = AppendOnlyStore(root)
-    store.append(TRADES, "kraken", INSTRUMENT, _trade(log_a, 3, t, 1))
-    store.append(TRADES, "kraken", INSTRUMENT, _trade(log_b, 3, t + 3600 * 10**9, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(log_a, 3, t, 1))
+    store._append(TRADES, "kraken", INSTRUMENT, _trade(log_b, 3, t + 3600 * 10**9, 1))
     with PITSession(root, available_at=INT64_MAX) as session:
         assert session.trades("kraken", INSTRUMENT, t, t + 1).num_rows == 1
         # The resend an hour later is not a trade of that hour.

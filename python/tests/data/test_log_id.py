@@ -149,8 +149,8 @@ def test_two_logs_with_the_same_receive_times_and_numbers_do_not_collide(tmp_pat
     b = "20231114T120000.000000000Z-bbbbbbbbbbbb"
     first, second = build(a), build(b)
     assert first.column("recv_ts").equals(second.column("recv_ts"))
-    store.append(dataset, "kraken", "ETH-USD", first)
-    store.append(dataset, "kraken", "ETH-USD", second)
+    store._append(dataset, "kraken", "ETH-USD", first)
+    store._append(dataset, "kraken", "ETH-USD", second)
     recv_ts = first.column("recv_ts")[0].as_py()
     with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         rows = session.sql(f"SELECT log_id, seq, recv_ts FROM {name} ORDER BY log_id").to_pylist()
@@ -166,8 +166,8 @@ def test_two_logs_with_the_same_trade_keep_one_row(tmp_path):
     store = AppendOnlyStore(tmp_path / "store", clock=FakeClock(1_000, 2_000))
     a = "20231114T120000.000000000Z-aaaaaaaaaaaa"
     b = "20231114T130000.000000000Z-bbbbbbbbbbbb"
-    store.append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=a))
-    store.append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=b, seq=7))
+    store._append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=a))
+    store._append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=b, seq=7))
     with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         rows = session.trades("kraken", "ETH-USD", 0, INT64_MAX).to_pylist()
     assert [(r["log_id"], r["seq"], r["trade_id"]) for r in rows] == [(a, 0, "t1")]

@@ -8,9 +8,13 @@ Rows an older load produced and the latest one does not stop appearing. The
 older load's files stay on disk, so the store is still append-only, and a
 session at an older version still reads them.
 
-Batches written outside a load (``AppendOnlyStore.append`` and ``batch()``)
-are versioned record by record, as before ADR 0018, until their log has a
-complete load.
+A log with no complete load is read from its latest incomplete load (the
+owner's decision on Review item 1), so a log's first load is readable while
+it is written; a reload in progress never hides the previous complete load.
+
+Loads are the store's only public write path. The private ``_batch`` and
+``_append`` write outside any load, for tests; such rows are read record by
+record, as before ADR 0018, for logs that have no load.
 """
 
 import json
@@ -99,7 +103,7 @@ def test_a_load_is_named_by_the_knowledge_time_of_its_first_batch(root):
 
 
 def test_a_batch_outside_a_load_says_so_in_its_marker(root):
-    AppendOnlyStore(root, clock=FakeClock(1_000)).append(TRADES, *KRK, trade_table(("a", T0, 1)))
+    AppendOnlyStore(root, clock=FakeClock(1_000))._append(TRADES, *KRK, trade_table(("a", T0, 1)))
     assert marker(root, 1_000)["load"] is None
 
 
@@ -187,7 +191,7 @@ def test_a_last_batch_that_fails_leaves_the_load_open(root):
 
 def test_a_store_of_the_previous_layout_is_refused(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000))
-    store.append(TRADES, *KRK, trade_table(("a", T0, 1)))
+    store._append(TRADES, *KRK, trade_table(("a", T0, 1)))
     path = markers(root)[0]
     content = json.loads(path.read_text(encoding="utf-8"))
     del content["load"]
@@ -239,40 +243,62 @@ def test_a_reload_leaves_other_logs_alone(root):
         assert prices(session) == [("b", 2), ("x", 9)]
 
 
-def test_an_incomplete_load_is_not_read_and_the_previous_load_still_is(root):
-    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000))
+def test_a_reload_in_progress_never_hides_the_previous_complete_load(root):
+    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000, 4_000))
     load_whole(store, LOG, (TRADES, KRK, trade_table(("a", T0, 1), ("b", T0, 2))))
     reload = store.load(LOG)
-    with reload.batch() as batch:  # first chunk of the reload
-        batch.append(TRADES, *KRK, trade_table(("a", T0, 10)))
-    with PITSession(root, available_at=INT64_MAX) as session:
-        assert session.version == 2_000
-        # Not half of the reload and half of the old load: the old load, whole.
-        assert prices(session) == [("a", 1), ("b", 2)]
+    for knowledge_ts, seq, (trade, price) in ((2_000, 0, ("a", 10)), (3_000, 2, ("c", 30))):
+        with reload.batch() as batch:  # the reload's chunks
+            batch.append(TRADES, *KRK, trade_table((trade, T0, price), seq=seq))
+        with PITSession(root, available_at=INT64_MAX) as session:
+            assert session.version == knowledge_ts
+            # Not half of the reload and half of the old load: the old load, whole.
+            assert prices(session) == [("a", 1), ("b", 2)]
     with reload.batch(last=True) as batch:
         batch.append(TRADES, *KRK, trade_table(("b", T0, 20), seq=1))
     with PITSession(root, available_at=INT64_MAX) as session:
-        assert prices(session) == [("a", 10), ("b", 20)]
+        assert prices(session) == [("a", 10), ("b", 20), ("c", 30)]
     # A version that was read once reads the same afterwards.
-    with PITSession(root, available_at=INT64_MAX, version=2_000) as session:
-        assert prices(session) == [("a", 1), ("b", 2)]
+    for version in (2_000, 3_000):
+        with PITSession(root, available_at=INT64_MAX, version=version) as session:
+            assert prices(session) == [("a", 1), ("b", 2)]
 
 
-def test_a_log_whose_only_load_is_incomplete_is_not_read_yet(root):
-    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
+def test_a_logs_first_load_is_read_while_it_is_being_written(root):
+    """No complete load yet: the latest incomplete load is read, as far as its
+    committed batches within the version go (owner decision, ADR 0018)."""
+    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000))
     load = store.load(LOG)
     with load.batch() as batch:
         batch.append(TRADES, *KRK, trade_table(("a", T0, 1)))
     with PITSession(root, available_at=INT64_MAX) as session:
-        assert prices(session) == []
+        assert prices(session) == [("a", 1)]
+    with load.batch() as batch:
+        batch.append(TRADES, *KRK, trade_table(("b", T0, 2), seq=1))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert prices(session) == [("a", 1), ("b", 2)]
     load.finish()
     with PITSession(root, available_at=INT64_MAX) as session:
-        assert prices(session) == [("a", 1)]
+        assert prices(session) == [("a", 1), ("b", 2)]
+    # Each version reads what it read while the load was being written.
     with PITSession(root, available_at=INT64_MAX, version=1_000) as session:
-        assert prices(session) == []
+        assert prices(session) == [("a", 1)]
+    with PITSession(root, available_at=INT64_MAX, version=2_000) as session:
+        assert prices(session) == [("a", 1), ("b", 2)]
 
 
-def test_a_load_that_died_is_never_read(root):
+def test_of_two_incomplete_loads_the_latest_is_read(root):
+    store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
+    for price in (1, 2):
+        with store.load(LOG).batch() as batch:  # neither load ever ends
+            batch.append(TRADES, *KRK, trade_table(("a", T0, price)))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert prices(session) == [("a", 2)]
+    with PITSession(root, available_at=INT64_MAX, version=1_000) as session:
+        assert prices(session) == [("a", 1)]
+
+
+def test_a_load_that_died_after_a_complete_one_is_not_read(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
     load_whole(store, LOG, (TRADES, KRK, trade_table(("a", T0, 1))))
     with store.load(LOG).batch() as batch:  # committed, and then the process died
@@ -280,6 +306,18 @@ def test_a_load_that_died_is_never_read(root):
     with PITSession(root, available_at=INT64_MAX) as session:
         assert prices(session) == [("a", 1)]
     restarted = AppendOnlyStore(root, clock=FakeClock(3_000))
+    load_whole(restarted, LOG, (TRADES, KRK, trade_table(("a", T0, 100))))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert prices(session) == [("a", 100)]
+
+
+def test_a_first_load_that_died_is_read_until_the_log_has_a_complete_load(root):
+    store = AppendOnlyStore(root, clock=FakeClock(1_000))
+    with store.load(LOG).batch() as batch:  # committed, and then the process died
+        batch.append(TRADES, *KRK, trade_table(("a", T0, 1), ("b", T0, 2), seq=0))
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert prices(session) == [("a", 1), ("b", 2)]
+    restarted = AppendOnlyStore(root, clock=FakeClock(2_000))
     load_whole(restarted, LOG, (TRADES, KRK, trade_table(("a", T0, 100))))
     with PITSession(root, available_at=INT64_MAX) as session:
         assert prices(session) == [("a", 100)]
@@ -323,30 +361,33 @@ def test_both_cutoffs_still_apply_inside_the_chosen_load(root):
         assert prices(session) == [("a", 1)]
 
 
-def test_rows_written_outside_a_load_are_read_until_their_log_has_a_complete_load(root):
+def test_rows_written_outside_a_load_are_read_only_for_logs_with_no_load(root):
+    """Tests write outside a load to build stores row by row (production never
+    does, ADR 0018). Such rows are read for a log only while it has no load."""
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000, 3_000))
     both = table_from_rows(TRADES, [
         *trade_table(("a", T0, 1), ("x", T0, 8)).to_pylist(),
         *trade_table(("y", T0, 9), log_id=OTHER, seq=0).to_pylist(),
     ])  # fmt: skip
-    store.append(TRADES, *KRK, both)  # one batch, two logs, no load
+    store._append(TRADES, *KRK, both)  # one batch, two logs, no load
+    with PITSession(root, available_at=INT64_MAX) as session:
+        assert prices(session) == [("a", 1), ("x", 8), ("y", 9)]
     load = store.load(LOG)
     with load.batch() as batch:
         batch.append(TRADES, *KRK, trade_table(("a", T0, 10)))
     with PITSession(root, available_at=INT64_MAX) as session:
-        # LOG's load is not complete, so its rows outside a load are still read.
-        assert prices(session) == [("a", 1), ("x", 8), ("y", 9)]
+        # LOG is read from its load, complete or not; OTHER has none, so its row stays.
+        assert prices(session) == [("a", 10), ("y", 9)]
     load.finish()
     with PITSession(root, available_at=INT64_MAX) as session:
-        # From LOG's load only; OTHER has no load, so its row stays.
         assert prices(session) == [("a", 10), ("y", 9)]
-    with PITSession(root, available_at=INT64_MAX, version=2_000) as session:
+    with PITSession(root, available_at=INT64_MAX, version=1_000) as session:
         assert prices(session) == [("a", 1), ("x", 8), ("y", 9)]
 
 
 def test_a_replay_cursor_does_not_read_a_loaded_logs_rows_from_outside_its_load(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    store.append(TRADES, *KRK, trade_table(("x", T0, 8)))  # outside a load
+    store._append(TRADES, *KRK, trade_table(("x", T0, 8)))  # outside a load
     load_whole(store, LOG, (TRADES, KRK, trade_table(("a", T0, 1))))
     with ReplayCursor(root, start=0, end=INT64_MAX) as cursor:
         for now in (T0 + 5_000_000, INT64_MAX):

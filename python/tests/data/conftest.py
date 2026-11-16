@@ -68,7 +68,7 @@ def history(root):
     ]
     files_by_kts = {}
     for dataset, (venue, instrument), table in batches:
-        result = store.append(dataset, venue, instrument, table)
+        result = store._append(dataset, venue, instrument, table)
         files_by_kts[result.knowledge_ts] = result.files
     assert sorted(files_by_kts) == list(range(1000, 10000, 1000))
     return History(root=root, store=store, files_by_kts=files_by_kts)

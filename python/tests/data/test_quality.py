@@ -82,7 +82,7 @@ def store_from_rows(root: Path, rows_by_key) -> Path:
     store = AppendOnlyStore(root)
     for key in sorted(rows_by_key, key=lambda k: (_ORDER[k[0]], k)):
         dataset = DATASETS[key[0]]
-        store.append(dataset, key[1], key[2], table_from_rows(dataset, rows_by_key[key]))
+        store._append(dataset, key[1], key[2], table_from_rows(dataset, rows_by_key[key]))
     return root
 
 

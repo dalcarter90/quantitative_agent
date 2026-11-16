@@ -64,7 +64,7 @@ def write_legacy_file(root, table, knowledge_ts=500, partition=PARTITION):
 
 def current_store(root):
     store = AppendOnlyStore(root, clock=FakeClock(1_000, 2_000))
-    store.append(TRADES, "kraken", "ETH-USD", trade_table(("a", T0, 100)))
+    store._append(TRADES, "kraken", "ETH-USD", trade_table(("a", T0, 100)))
     return root
 
 

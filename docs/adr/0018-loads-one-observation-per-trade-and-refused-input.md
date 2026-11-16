@@ -1,6 +1,6 @@
 # 0018: Loads, one observation per trade, and what the normalizer refuses
 
-Status: Accepted (owner decision, 2026-11-15); implementation choices awaiting the owner's confirmation, see "Review"
+Status: Accepted (owner decision, 2026-11-15; implementation choices decided by the owner 2026-11-16, see "Review")
 Date: 2026-11-15
 Amends: 0006, 0009, 0010, 0013, 0015, 0016, 0017
 
@@ -46,6 +46,16 @@ The owner decided the following on 2026-11-15.
 4. **R05: a value the adapter accepts but the schema refuses is a rejected
    message** (`MESSAGE_REJECTED`), not a crashed load.
 
+On 2026-11-16, reviewing the choices made while building it, the owner
+decided two more (see "Review"):
+
+5. **The read rule, for a log with no complete load:** per log, read the
+   latest complete load; if the log has no complete load, read its latest
+   incomplete load (its committed batches within the version). A reload in
+   progress never hides the previous complete load.
+6. **Loads are the only production write path.** Writing a batch outside a
+   load is for tests only, and the store's public surface is the load API.
+
 ## How it is built
 
 ### Loads (R04)
@@ -65,11 +75,13 @@ batch written outside any load, otherwise
 - `last` marks the batch that completes the load. A last batch with no rows
   still publishes its marker, because the marker is what completes the load.
 
-**Writer API.** `AppendOnlyStore.load(log_id)` returns a `Load` with
-`batch(*, last=False)`, `finish()` (completes the load with an empty batch,
-for a loader that learns only afterwards that the log has ended), and the
-properties `log_id`, `load_id` and `finished`. A finished load takes no more
-batches. `batch()` and `append()` are unchanged and write outside any load.
+**Writer API.** `AppendOnlyStore.load(log_id)` is the store's only public
+operation. It returns a `Load` with `batch(*, last=False)`, `finish()`
+(completes the load with an empty batch, for a loader that learns only
+afterwards that the log has ended), and the properties `log_id`, `load_id`
+and `finished`. A finished load takes no more batches. The store's private
+`_batch()` and `_append()` write a batch outside any load; they are kept for
+tests that build a store row by row, and no production code calls them.
 
 **`ingest`** loads a raw log as one load of one batch, opened with `last=True`.
 An empty raw log has no first record to name it and loads nothing.
@@ -77,23 +89,29 @@ An empty raw log has no first record to name it and loads nothing.
 **What a session reads,** at its version V:
 
 1. For each log, the load chosen is the one with the greatest `load_id` among
-   the loads whose last batch is at or before V. Only that load's batches at
-   or before V are read for the log. Loads that are not complete within V are
-   not read at all.
-2. A log with no complete load within V is read, as before ADR 0018, from the
-   batches written outside a load: the latest version of each record.
-3. Rows of a log that has a chosen load are not read from batches written
-   outside a load.
-4. Then both cutoffs and the choice of version per record, as in ADR 0017.
+   the loads whose last batch is at or before V: the latest complete load.
+2. If the log has no complete load within V, the load chosen is the one with
+   the greatest `load_id` among its loads with a committed batch at or before
+   V: its latest incomplete load. A log's first load is therefore readable
+   while it is still being written, chunk by chunk; a reload in progress is
+   not, because the log has a complete load.
+3. Only the chosen load's committed batches at or before V are read for the
+   log.
+4. Batches written outside a load (tests only) are read, record by record as
+   before ADR 0018, for the logs that have no load within V. Rows of a log
+   that has a chosen load are not read from them.
+5. Then both cutoffs and the choice of version per record, as in ADR 0017.
 
 The choice depends on V alone, never on `available_at`, and is made once
-when a session or replay cursor opens. Since batches commit in knowledge-time
-order and a load's last batch says so when it commits, the same V always
-chooses the same loads: versions stay repeatable.
+when a session or replay cursor opens. Batches commit in knowledge-time
+order, and a load's last batch says so when it commits, so the batches at or
+before V, and which loads they complete, never change: the same V always
+chooses the same loads, and versions stay repeatable. A load in progress
+read at V is read the same at V after more of its batches commit.
 
 **Layer 3** (the engine's file limit) covers the rule: the files of a load that
 was not chosen are not in `allowed_paths`, so they cannot be opened even
-through the session's private connection. For rule 3 the view filters rows;
+through the session's private connection. For rule 4 the view filters rows;
 the files of batches outside a load stay openable, since a file can hold rows
 of several logs.
 
@@ -172,13 +190,19 @@ load after its last batch.
 - **Delete or overwrite the earlier load.** Not append-only (CLAUDE.md rule 10).
 - **A `load_id` column on every row.** A schema change of all four datasets.
   The marker is enough, because every batch belongs to at most one load.
-- **Read a load as soon as any of its batches is committed.** A reload in
-  progress would show part of the new load and none of the old, a log that
-  looks short. And it would not be repeatable unless a load's end were
-  recorded anyway.
+- **Read the latest load as soon as any of its batches is committed,**
+  complete or not. A reload in progress would show part of the new load and
+  none of the old, a log that looks short. The rule chosen reads an
+  incomplete load only when the log has no complete one.
+- **Never read an incomplete load** (as first built). A log's first load,
+  written in chunks by a live loader, would be invisible until it ended. The
+  owner chose to read it.
 - **Treat each batch written outside a load as a load of its own.** Every
   record-level correction written with `append` would then remove every other
   row of the log, in every dataset.
+- **Keep writing outside a load as public API** (as first built). It would be a
+  second way to write the store that bypasses the load rule; the owner made
+  loads the only production path.
 - **Order loads by when they completed** rather than when they began. The two
   differ only for two loads of one log in flight at once, which `ingest` never
   does; `load_id` is simpler to state and to read off a marker.
@@ -228,8 +252,11 @@ load after its last batch.
   enough" for every kind of fix). A session at an earlier version still reads
   the earlier load.
 - **The store grows with every reload.** Nothing is compacted.
-- **A load that is not complete is not read,** including the first load of a
-  log while a live loader is still adding to it. See Review item 1.
+- **A log's first load is read while it is being written,** batch by batch
+  as each commits. A session cannot tell such a log from one that ended early,
+  until the load completes. A load that died before its last batch is read
+  until the log has a complete load.
+- **A reload in progress never hides the previous complete load.**
 - **A trade is one row to research,** however many logs and loads saw it. A
   window holds a trade if its first observation was received in it: a trade
   resent an hour later is not a trade of that later hour.
@@ -237,7 +264,8 @@ load after its last batch.
   observation, whatever order the logs were loaded in (review, R10).
 - **Conflicts between logs loaded in separate runs are not detected,** as
   before: `TRADE_CONFLICT` comes from the normalizer. Both observations are now
-  stored, so a query could find them. See Review item 7.
+  stored, so a query could find them. The owner left this for the next PR
+  (Review item 7; roadmap, Phase 3f).
 - **ADR 0016's consequence "after a conflict, the store holds the conflicting
   value" no longer holds:** the session shows the first observation.
 - **A message with an unstorable value is one rejected record,** reported as a
@@ -252,39 +280,42 @@ load after its last batch.
 
 ## Review
 
-These choices were made while building it and are not yet confirmed by the
-owner:
+These choices were made while building it. The owner decided them on
+2026-11-16, answering the six points listed on PR #19 (items 1, 3, 4, 6, 7
+and 10 below), and asked for every item to be marked confirmed.
 
-1. **An incomplete load is never read.** That is the decision's "batches all
-   within its version cutoff" with a load's end recorded in its last marker.
-   It includes a log's first load while a future live loader is still adding
-   chunks, and a multi-batch load that died before its last batch. If live
-   chunks should be readable as they arrive, one option is: read the latest
-   incomplete load of a log that has no complete load. A reload in progress
-   would still not hide the previous complete load.
-2. **"Latest" is the greatest `load_id`,** the knowledge time of the load's
-   first batch.
-3. **Batches outside a load remain** (`append`, `batch()`), read record by
-   record for logs with no complete load. No production code writes them; the
-   tests do. Their files stay openable by the engine for a loaded log (the
-   view filters the rows).
-4. **Store layout 3,** with layout 2 stores refused.
-5. **The writer API:** `load(log_id)`, `Load.batch(last=...)`, `Load.finish()`;
-   one load per raw log; `ingest` as one batch.
-6. **Trades keyed by `(log_id, seq, trade_id)`,** shown one per `trade_id`
-   through `Dataset.one_row_per`; no schema version bump.
-7. **Conflicts across separate loads stay undetected.** An option: a view of
-   every observation of a trade (still inside both cutoffs) and a quality
-   check over it, which would also make `TRADE_REPEAT` across logs possible.
-8. **R05's details:** reason `schema_refused`; events of a rejected record the
-   schema can hold are kept and the others named in the detail (for every
-   rejected record); the adapter's state is not rolled back, apart from the
-   Coinbase sequence number check above.
-9. **R11's rule is strict continuity,** refusing a missing record as well as
-   interleaving; the normalizer refuses everything after; `damage.removed`
-   renumbers.
-10. **Two review tests were reshaped,** because the owner decided a behavior
-    other than the one they required:
+1. **Changed by the owner: a log with no complete load is read from its
+   latest incomplete load.** As first built, an incomplete load was never
+   read, so a live loader's chunks would have been invisible until its last
+   batch. The rule is now "How it is built", rules 1 to 3. A reload in
+   progress still never hides the previous complete load.
+2. **Confirmed: "latest" is the greatest `load_id`,** the knowledge time of the
+   load's first batch.
+3. **Changed by the owner: loads are the only production write path.** As first
+   built, `AppendOnlyStore.batch()` and `append()` stayed public and wrote
+   outside any load. They are now private (`_batch`, `_append`), for tests
+   only, and a test asserts that the store's public surface is `load` alone.
+   Rows written outside a load are read only for logs that have no load.
+   Their files stay openable by the engine for a loaded log (the view filters
+   the rows); no production store has any.
+4. **Confirmed: store layout 3,** with layout 2 stores refused.
+5. **Confirmed: the writer API:** `load(log_id)`, `Load.batch(last=...)`,
+   `Load.finish()`; one load per raw log; `ingest` as one batch.
+6. **Confirmed: trades keyed by `(log_id, seq, trade_id)`,** shown one per
+   `trade_id` through `Dataset.one_row_per`; no schema version bump.
+7. **Deferred by the owner to the next PR: conflicts across separate loads.**
+   They stay undetected here. The option on the table: a view of every
+   observation of a trade (still inside both cutoffs) and a quality check over
+   it, which would also make `TRADE_REPEAT` across logs possible.
+8. **Confirmed: R05's details:** reason `schema_refused`; events of a rejected
+   record the schema can hold are kept and the others named in the detail
+   (for every rejected record); the adapter's state is not rolled back, apart
+   from the Coinbase sequence number check.
+9. **Confirmed: R11's rule is strict continuity,** refusing a missing record as
+   well as interleaving; the normalizer refuses everything after;
+   `damage.removed` renumbers.
+10. **Confirmed: two review tests were reshaped,** because the owner decided a
+    behavior other than the one they required:
     - R10's `test_r10_a_conflicting_repeat_shows_the_later_value` required the
       *later* value of a conflicting repeat, as data-core then said. The rule
       is the first observation. It is now
@@ -304,5 +335,5 @@ owner:
     (`test_session.py`, whose correction now reuses its record; the resend it
     used is a new test), and the assertions of `TRADES.key` in `test_store.py`
     and `test_schema.py`. The store's public operations and the marker layout
-    asserted in `test_store.py` and `test_session.py` gained `load` and
+    asserted in `test_store.py` and `test_session.py` became `load` alone and
     layout 3.

@@ -8,8 +8,10 @@ times. Every read path of a session, and of a replay cursor, is compared with
 an oracle computed in plain Python:
 
 - per log, the latest load (by ``load_id``) whose last batch is within the
-  version; only its committed batches within the version are read;
-- a log with no such load is read from the batches outside a load;
+  version; if there is none, the latest load with a committed batch within
+  the version; only that load's committed batches within the version are read;
+- a log with no load at all is read from the batches outside a load (which
+  only tests write);
 - both cutoffs, then the latest version of each record;
 - then one trade per ``trade_id``: its first observation in ``(log_id, seq)``
   order.
@@ -110,7 +112,7 @@ def _write(root, spec):
     for step in spec:
         load = None
         if step["kind"] == "outside":
-            batch = store.batch()
+            batch = store._batch()
         else:
             slot = (step["log"], step["slot"])
             load = in_flight.get(slot)
@@ -147,13 +149,15 @@ def _write(root, spec):
 
 def _oracle(history, available_at, version):
     known = [h for h in history if h["committed"] and h["knowledge_ts"] <= version]
-    complete = {}
+    loads = {}  # load_id -> (log, complete within the version)
     for h in known:
-        if h["load_id"] is not None and h["last"]:
-            complete[h["load_id"]] = h["log"]
+        if h["load_id"] is not None:
+            log, done = loads.get(h["load_id"], (h["log"], False))
+            loads[h["load_id"]] = (log, done or h["last"])
     chosen = {}
-    for load_id, log in complete.items():
-        chosen[log] = max(chosen.get(log, 0), load_id)
+    for log in {log for log, _ in loads.values()}:
+        mine = [(done, load_id) for load_id, (other, done) in loads.items() if other == log]
+        chosen[log] = max(mine)[1]  # a complete load first, then the latest
 
     latest = {}
     for h in sorted(known, key=lambda h: h["knowledge_ts"]):
