@@ -384,7 +384,7 @@ def test_the_between_batches_fixture_is_documented():
 def test_the_events_reach_the_store_and_read_back_through_pitsession(tmp_path):
     (path,) = sorted(BETWEEN_BATCHES.glob("*.qaraw.zst"))
     ingest(path, AppendOnlyStore(tmp_path / "store"))
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         events = session.stream_events("coinbase", INSTRUMENT, 0, INT64_MAX).to_pylist()
         messages = list(messages_from_table(session.book_events("coinbase", INSTRUMENT, 0,
                                                                 INT64_MAX)))  # fmt: skip

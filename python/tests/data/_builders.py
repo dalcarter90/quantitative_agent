@@ -13,6 +13,8 @@ NS_PER_SECOND = 1_000_000_000
 NS_PER_DAY = 86_400 * NS_PER_SECOND
 T0 = 19675 * NS_PER_DAY + 12 * 3600 * NS_PER_SECOND  # 2023-11-14T12:00:00Z
 INT64_MAX = 2**63 - 1
+# Every row built here is received this long after its venue time.
+LAG = 5_000_000
 
 # A well-formed log id (ADR 0013) for rows built by hand.
 LOG = "20231114T120000.000000000Z-000000000000"
@@ -41,7 +43,7 @@ def trade_table(*specs, log_id=LOG, seq=0):
         {
             "event_ts": event_ts,
             "event_ts_source": "venue",
-            "recv_ts": event_ts + 5_000_000,
+            "recv_ts": event_ts + LAG,
             "log_id": log_id,
             "seq": seq + i,
             "trade_id": trade_id,
@@ -64,7 +66,7 @@ def book_table(*specs, log_id=LOG):
         {
             "event_ts": event_ts,
             "event_ts_source": "venue",
-            "recv_ts": event_ts + 5_000_000,
+            "recv_ts": event_ts + LAG,
             "log_id": log_id,
             "seq": 0,
             "kind": BookEventKind.DELTA,
@@ -90,7 +92,7 @@ def instrument_table(
     row = {
         "event_ts": event_ts,
         "event_ts_source": "venue",
-        "recv_ts": event_ts + 5_000_000,
+        "recv_ts": event_ts + LAG,
         "log_id": log_id,
         "seq": seq,
         "price_exp": price_exp,

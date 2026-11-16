@@ -4,9 +4,13 @@
         --start 2026-11-11 --end 2026-11-11
 
 Each check is a function of a ``PITSession`` and a time range. It reads only
-through the session, so it sees the data as it was known at the session's
-``as_of``, and it cannot change anything: a finding points at a row, it never
-removes or alters it.
+through the session, so it sees what the session sees (the rows received by
+its ``available_at``, at its store ``version``), and it cannot change
+anything: a finding points at a row, it never removes or alters it.
+
+The time range is receipt time (``recv_ts``) for every dataset, like the
+session's own ranges (ADR 0017): a range of days means the data received on
+those days, together with the integrity events noticed on them.
 
 The checks:
 
@@ -29,7 +33,6 @@ A check returns its findings and some counts of what it examined, so that
 import argparse
 import json
 import sys
-import time
 from bisect import bisect_left, insort
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
@@ -178,7 +181,7 @@ class _Scope:
         p = f"{alias}." if alias else ""
         return (
             f"{p}venue = '{self.venue}' AND {p}instrument = '{self.instrument}' "
-            f"AND {p}event_ts >= {self.start} AND {p}event_ts < {self.end}"
+            f"AND {p}recv_ts >= {self.start} AND {p}recv_ts < {self.end}"
         )
 
     def rows(self, sql: str) -> list[dict[str, Any]]:
@@ -447,11 +450,10 @@ def check_recording_clock(
 ) -> CheckResult:
     """Each recording session's clock, as the recorder measured it (ADR 0011).
 
-    An offset beyond ``max_clock_offset_ns`` is an error: every ``recv_ts``
-    and ``knowledge_ts`` of that session is off by about that much. A session
-    whose clock could not be measured is a warning; one recorded before clocks
-    were measured at all is reported as information. Use of the recorder's
-    override is always reported.
+    An offset beyond ``max_clock_offset_ns`` is an error: every ``recv_ts`` of
+    that session is off by about that much. A session whose clock could not be
+    measured is a warning; one recorded before clocks were measured at all is
+    reported as information. Use of the recorder's override is always reported.
     """
     scope = _Scope("recording_clock", session, venue, instrument, start, end, config)
     kinds = (
@@ -516,7 +518,7 @@ def check_recording_clock(
                     clock,
                     f"the recording clock was {offset / 1e6:+.1f} ms from NTP time (positive: "
                     f"ahead), beyond the {config.max_clock_offset_ns / 1e6:.1f} ms limit; "
-                    f"recv_ts and knowledge_ts are off by about that much{note}",
+                    f"every recv_ts of the session is off by about that much{note}",
                 )
         begin = found["start"]
         monotonic = begin is not None and _start_detail(begin).get("monotonic_stamps") is True
@@ -761,8 +763,8 @@ def check_outliers(
 ) -> CheckResult:
     """Values that cannot be real, and trade prices far from recent trades.
 
-    A trade's reference is the median of the trades before it within the time
-    range, in venue-time order. A lasting move stops being flagged once the
+    A trade's reference is the median of the trades before it among those
+    received in the time range, in venue-time order. A lasting move stops being flagged once the
     new level is the majority of the window. Zero and negative prices are
     errors and are never used as a reference.
     """
@@ -862,7 +864,7 @@ def run_checks(
     for view in _DATA_VIEWS:
         pairs = session.sql(
             f"SELECT DISTINCT venue, instrument FROM {view} "
-            f"WHERE event_ts >= {start} AND event_ts < {end}"
+            f"WHERE recv_ts >= {start} AND recv_ts < {end}"
         )
         found.update((row["venue"], row["instrument"]) for row in pairs.to_pylist())
     results = []
@@ -926,16 +928,25 @@ def main(argv: list[str] | None = None) -> int:
         description="Run the data quality checks over a date range and print a summary.",
     )
     parser.add_argument("--store", required=True, help="directory of the normalized store")
-    parser.add_argument("--start", required=True, type=_day, help="first day, UTC (YYYY-MM-DD)")
-    parser.add_argument("--end", required=True, type=_day, help="last day, UTC, inclusive")
+    parser.add_argument(
+        "--start", required=True, type=_day, help="first day received, UTC (YYYY-MM-DD)"
+    )
+    parser.add_argument("--end", required=True, type=_day, help="last day received, UTC, inclusive")
     parser.add_argument("--venue")
     parser.add_argument("--instrument")
     parser.add_argument(
-        "--as-of",
+        "--available-at",
         type=int,
-        help="knowledge time in ns since the epoch: check the data as it was known then "
-        "(default: now)",
+        help="simulated time in ns since the epoch: check only what had been received by "
+        "then (default: everything received)",
     )
+    parser.add_argument(
+        "--version",
+        type=int,
+        help="knowledge time in ns since the epoch: check the store as of that committed "
+        "batch (default: the latest committed batch)",
+    )
+    parser.add_argument("--as-of", help=argparse.SUPPRESS)  # retired; see below
     parser.add_argument(
         "--fail-on",
         choices=[s.name.lower() for s in Severity],
@@ -947,6 +958,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.end < args.start:
         parser.error("--end is before --start")
+    if args.as_of is not None:
+        parser.error(
+            "--as-of was retired (ADR 0017): use --version for a knowledge cutoff and "
+            "--available-at for a receipt-time cutoff"
+        )
     try:
         config = QualityConfig.from_file(args.config) if args.config else QualityConfig()
     except (OSError, ValueError) as error:
@@ -954,19 +970,26 @@ def main(argv: list[str] | None = None) -> int:
 
     start = _midnight_ns(args.start)
     end = _midnight_ns(args.end + timedelta(days=1))
-    as_of = time.time_ns() if args.as_of is None else args.as_of
+    available_at = _INT64_MAX if args.available_at is None else args.available_at
     fail_on = Severity[args.fail_on.upper()]
 
     try:
-        with PITSession(args.store, as_of=as_of) as session:
+        with PITSession(args.store, available_at=available_at, version=args.version) as session:
+            version = session.version
             results = run_checks(
                 session, start, end, config, venue=args.venue, instrument=args.instrument
             )
     except StoreVersionError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    except ValueError as error:  # a version later than the latest committed batch
+        parser.error(str(error))
 
-    print(f"Data quality, {args.start} to {args.end} (UTC), as known at {as_of}")
+    received = "" if args.available_at is None else f", received by {available_at}"
+    print(
+        f"Data quality, received {args.start} to {args.end} (UTC), "
+        f"store version {version}{received}"
+    )
     severities = [finding.severity for result in results for finding in result.findings]
     if not results:
         # Passing silently on an empty range would hide a recorder that stopped.

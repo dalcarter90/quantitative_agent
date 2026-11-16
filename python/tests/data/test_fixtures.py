@@ -401,7 +401,7 @@ def test_fixture_through_adapter_and_store_reads_back_identically(venue, tmp_pat
     files = list((tmp_path / "store").rglob("*.parquet"))
     assert 3 < len(files) < 60  # batched, not one file per message
 
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         read_back = {
             TRADES: session.trades(venue, INSTRUMENT, 0, INT64_MAX),
             BOOK_EVENTS: session.book_events(venue, INSTRUMENT, 0, INT64_MAX),
@@ -433,7 +433,7 @@ def test_normalizing_the_same_raw_log_again_corrects_rather_than_duplicates(tmp_
     assert second.rows == first.rows
     assert len(list((tmp_path / "store").rglob("*.parquet"))) == 2 * files_after_first
 
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         for name, count in first.rows.items():
             (visible,) = session.sql(f"SELECT count(*) AS n FROM {name}").to_pylist()
             assert visible["n"] == count, name
@@ -523,5 +523,5 @@ def test_command_line_load_into_a_store(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "rows: book_events 18605, instruments 1, stream_events 15, trades 254" in output
     assert "checksum mismatches: 0" in output
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         assert session.sql("SELECT count(*) AS n FROM trades").to_pylist() == [{"n": 254}]

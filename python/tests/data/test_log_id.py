@@ -152,7 +152,7 @@ def test_two_logs_with_the_same_receive_times_and_numbers_do_not_collide(tmp_pat
     store.append(dataset, "kraken", "ETH-USD", first)
     store.append(dataset, "kraken", "ETH-USD", second)
     recv_ts = first.column("recv_ts")[0].as_py()
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         rows = session.sql(f"SELECT log_id, seq, recv_ts FROM {name} ORDER BY log_id").to_pylist()
     assert rows == [{"log_id": a, "seq": 0, "recv_ts": recv_ts},
                     {"log_id": b, "seq": 0, "recv_ts": recv_ts}]  # fmt: skip
@@ -166,7 +166,7 @@ def test_two_logs_with_the_same_trade_keep_one_row(tmp_path):
     b = "20231114T130000.000000000Z-bbbbbbbbbbbb"
     store.append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=a))
     store.append(TRADES, "kraken", "ETH-USD", trade_table(("t1", T0, 100), log_id=b, seq=7))
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         rows = session.trades("kraken", "ETH-USD", 0, INT64_MAX).to_pylist()
     assert [(r["log_id"], r["seq"], r["trade_id"]) for r in rows] == [(b, 7, "t1")]
 
@@ -176,7 +176,7 @@ def test_normalizing_a_log_again_keeps_its_id_so_rows_are_corrections(tmp_path):
     store = AppendOnlyStore(tmp_path / "store")
     ingest(path, store)
     ingest(path, store)
-    with PITSession(tmp_path / "store", as_of=INT64_MAX) as session:
+    with PITSession(tmp_path / "store", available_at=INT64_MAX) as session:
         (row,) = session.sql(
             "SELECT count(*) AS n, count(DISTINCT log_id) AS logs FROM book_events"
         ).to_pylist()

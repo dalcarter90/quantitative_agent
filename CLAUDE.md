@@ -12,8 +12,9 @@ A quantitative trading agent, built in phases. Five layers:
    as `quantagent._core`.
 2. **Python data core** (`python/src/quantagent/data/`, built in Phase 1):
    append-only bitemporal storage (event, receipt and knowledge time) queried
-   only through `PITSession(as_of=...)`, plus a reference order book
-   reconstructor (Phase 2) that the C++ book is verified against.
+   only through `PITSession(available_at=...)`, which shows the rows received
+   by that time at one version of the store (ADR 0017), plus a reference
+   order book reconstructor (Phase 2) that the C++ book is verified against.
 3. **Signal layer**: order flow imbalance, technicals, regime detection, one
    blended model, validated walk-forward with purged CV and real costs.
 4. **Risk/portfolio**: sizing, exposure limits, drawdown guard that pauses
@@ -52,7 +53,10 @@ Most of this is not built yet. Read these before changing anything:
 9. **Research reads data only through `PITSession`.** Signal and agent code
    must not open store files or query the database directly. Do not add a
    way around the session's restrictions (raw file access, DDL,
-   multi-statement SQL, unfiltered tables, a mutable `as_of`).
+   multi-statement SQL, unfiltered tables, uncommitted batches, or any way
+   for research code to move a session's `available_at`). Only a
+   `ReplayCursor` moves it, forward, and the cursor belongs to the backtest
+   harness: research code is handed the session, never the cursor (ADR 0017).
 10. **The data store is append-only.** Corrections are new rows with a later
     knowledge time. Do not add update or delete operations to the store.
 
@@ -176,6 +180,11 @@ Things that commonly go wrong:
   pybind11 comes from pip, not vcpkg (ADR 0002).
 - **Release and Debug share one `.pyd` path.** The last configuration built
   is the one Python imports.
+- **`StoreVersionError` when opening a store**: it was written by an earlier
+  version of the code (before commit markers, ADR 0017, or another schema).
+  Rebuild it from the raw logs into a new directory with the adapters command
+  above. `PITSession(..., as_of=...)` is a `TypeError` for the same reason:
+  pass `available_at`, and `version` for a knowledge cutoff.
 - A `linux` preset exists but has not been verified. Treat Linux support as
   untested until a phase verifies it.
 

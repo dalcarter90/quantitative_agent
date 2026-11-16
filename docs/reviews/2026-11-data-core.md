@@ -38,6 +38,15 @@ for the reason given here and is reported as `XFAIL`. The marker is strict:
 when a finding is fixed its test passes, the suite fails on the unexpected
 pass, and the marker is removed in the same change.
 
+**Update, 2026-11-15 (Phase 3e, ADR 0017).** R01, R02, R03 and R09 are fixed
+and their tests are unmarked. The tests of R03 and R09 had to change shape,
+not just parameters; ADR 0017's "Review" section says why. X1 and X2 are
+corrected in the documents, R10 is narrower but open, and D4's first half
+(a session per decision time) is answered by the replay cursor. Everything
+else stands. The findings below are left as they were written: where they
+say `as_of`, a session now has `available_at` (receipt time) and `version`
+(what `as_of` was).
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |

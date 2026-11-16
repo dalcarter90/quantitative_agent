@@ -19,17 +19,18 @@ confirms it.
 | [0003](0003-build-system.md) | CMake presets + vcpkg manifest | Accepted |
 | [0004](0004-queue-design.md) | In-house bounded SPSC ring buffer | Accepted |
 | [0005](0005-price-and-time-representation.md) | int64 mantissa with per-instrument exponent; int64 ns timestamps | Accepted, amended by 0008, 0011 and 0012 |
-| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted, amended by 0009, 0010, 0012, 0013 and 0015 |
+| [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted, amended by 0009, 0010, 0012, 0013, 0015 and 0017 |
 | [0007](0007-agent-tool-permissions.md) | Allow-listed tool server, structurally enforced | Accepted |
-| [0008](0008-event-ts-without-venue-timestamp.md) | `event_ts` holds `recv_ts` when the venue gives no timestamp; `event_ts_source` records which | Accepted, amended by 0012 |
+| [0008](0008-event-ts-without-venue-timestamp.md) | `event_ts` holds `recv_ts` when the venue gives no timestamp; `event_ts_source` records which | Accepted, amended by 0012 and 0017 |
 | [0009](0009-venue-neutral-book-events.md) | Kraken as second venue; book events keyed by raw record, with optional per-venue integrity columns | Accepted, amended by 0010, 0013 and 0014 |
 | [0010](0010-stream-events.md) | `stream_events`: integrity events for every venue, written by the adapters, read through `PITSession` | Accepted, amended by 0011, 0013, 0014, 0015 and 0016 |
-| [0011](0011-synchronized-recording-clock.md) | The recording clock must be synchronized; the recorder measures it, refuses above 250 ms unless overridden, and stores the measurement | Accepted |
+| [0011](0011-synchronized-recording-clock.md) | The recording clock must be synchronized; the recorder measures it, refuses above 250 ms unless overridden, and stores the measurement | Accepted, amended by 0017 |
 | [0012](0012-replay-order-and-monotonic-receive-time.md) | Replay order within a raw log is `seq`; records gain a monotonic receive stamp; logs merge by it; clock steps are recorded and checked | Accepted, amended by 0013 (its open point settled) |
 | [0013](0013-stored-rows-name-their-raw-log.md) | Every stored row names its raw log (`log_id`); keys and order use `(log_id, seq)`, never `recv_ts` | Accepted; implementation choices confirmed; amended by 0015 |
 | [0014](0014-coinbase-check-snapshots-by-stream-batch.md) | Coinbase check snapshots are judged by stream batch: exact on a batch time; between batches, exact except on the next batch's levels | Accepted; implementation choices confirmed; amended by 0015 |
-| [0015](0015-owner-review-of-0013-and-0014.md) | Owner review of 0013 and 0014: `PITSession` refuses files of another schema version; a trade repeated with a different price, quantity or side is an ERROR; a session with no compared check snapshot is a WARNING | Accepted, amended by 0016 |
+| [0015](0015-owner-review-of-0013-and-0014.md) | Owner review of 0013 and 0014: `PITSession` refuses files of another schema version; a trade repeated with a different price, quantity or side is an ERROR; a session with no compared check snapshot is a WARNING | Accepted, amended by 0016 and 0017 |
 | [0016](0016-keep-the-first-observation-of-a-repeated-trade.md) | An identical repeat of a trade is dropped and recorded as a `TRADE_REPEAT` event, so the store keeps the first observation; confirms 0015's reading of "no check snapshot compared" | Accepted |
+| [0017](0017-time-model-two-cutoffs-and-committed-batches.md) | The time model: a session has two cutoffs (`available_at` on receipt time, `version` on knowledge time) and `as_of` is retired; a load is one batch, readable only once its commit marker is written; time windows and date partitions are receipt time; a replay cursor advances one session | Accepted; implementation choices confirmed |
 
 ## Template
 

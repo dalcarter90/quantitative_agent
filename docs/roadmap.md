@@ -35,6 +35,7 @@ before making it.
 | 3b | Coinbase check snapshots judged by stream batch (ADR 0014) | Done |
 | 3c | Owner review of ADRs 0013 and 0014 (ADR 0015) | Done |
 | 3d | Keep the first observation of a repeated trade (ADR 0016) | Done |
+| 3e | The time model: two cutoffs, committed batches, receipt-time windows (ADR 0017) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -106,13 +107,17 @@ sessions, in order.
 
 **Notes for the next phases:**
 
-- **Layout.** `<root>/<dataset>/venue=<v>/instrument=<i>/date=<YYYY-MM-DD>/part-<knowledge_ts, 20 digits>.parquet`.
+- **Layout.** *Changed in Phase 3e (ADR 0017): files are
+  `part-<knowledge_ts>-<number>.parquet`, `date` is the UTC date of `recv_ts`,
+  and each batch has a commit marker under `_batches/`. As first built:*
+  `<root>/<dataset>/venue=<v>/instrument=<i>/date=<YYYY-MM-DD>/part-<knowledge_ts, 20 digits>.parquet`.
   `date` is the UTC date of `event_ts`. Venue, instrument and date exist only
   as directory names, not as columns in the files. A test confirms DuckDB
   reads this with `hive_partitioning = true` and types the timestamps and
   mantissas as `BIGINT`.
-- **Knowledge time.** One append is one batch with one `knowledge_ts`, shared
-  by every file it writes. It is strictly greater than any issued before,
+- **Knowledge time.** *(Phase 3e: a batch can now hold several tables, and
+  a raw log is loaded as one batch.)* One append is one batch with one
+  `knowledge_ts`, shared by every file it writes. It is strictly greater than any issued before,
   including by earlier processes (recovered from file names when the store
   is opened).
 - **Keys (for 1b's "latest version of each record").** A row's identity is
@@ -189,6 +194,9 @@ sessions, in order.
 
 - `session.py`: `PITSession(root, *, as_of)` with `trades`, `book_events`,
   `instruments`, `instrument`, `sql`, `close` and the read-only `as_of`.
+  *(Phase 3e, ADR 0017: `as_of` is retired. A session takes `available_at`,
+  a cutoff on receipt time, and `version`, the knowledge cutoff `as_of` was.
+  Where the notes below say `as_of`, read `version`.)*
   Results are `pyarrow` tables (or an `InstrumentMeta`), never database
   objects. Errors: `QueryRejected` (not allowed, not run) and `QueryError`
   (allowed, failed while running).
@@ -232,7 +240,10 @@ validated tree.
   `as_of` later than the store's latest knowledge time is not repeatable:
   the same `as_of` can return more rows once more data is appended. Backtests
   always use a past `as_of`. The agent tool server must cap `as_of` at the
-  current time, as the architecture already requires.
+  current time, as the architecture already requires. *(Settled in Phase 3e:
+  a version later than the latest committed batch is refused, so every
+  version a session can hold is repeatable; and a backtest's time is
+  `available_at`, not a knowledge cutoff.)*
 - **`instrument(venue, instrument, at=...)`** defaults `at` to `as_of`. It
   compares `at` with `event_ts`, and `as_of` with `knowledge_ts`.
 - **Cost.** Opening a session lists every data file in the store. A range
@@ -1218,6 +1229,125 @@ Added by the owner after Phase 3c (ADR 0016), before Phase 4.
 - **A trade seen first in a trade-history snapshot and later live keeps the
   backfilled observation.** No recording shows this.
 
+### Phase 3e: The time model (done)
+
+Added by the owner after the 2026-11 adversarial review
+(`docs/reviews/2026-11-data-core.md`), before Phase 4. It fixes the review's
+findings R01, R02, R03 and R09 (ADR 0017).
+
+- [x] `PITSession` takes two cutoffs. `available_at`, required: a simulated
+      time T; only rows with `recv_ts <= T` are visible. `version`, optional:
+      a knowledge cutoff, default the latest committed batch; among the rows
+      available at T, the version chosen is the latest with
+      `knowledge_ts <= version`. Order within a log is still `(log_id, seq)`.
+- [x] `as_of` is retired, not redefined: passing it raises an error naming
+      the replacements. Every caller was updated explicitly.
+- [x] A replay cursor, so a backtest opens one session and advances T
+      instead of opening a session per decision time.
+- [x] Every ingest is one batch with one `knowledge_ts` across all datasets,
+      and becomes readable only once fully written (a commit marker per
+      batch). Sessions ignore uncommitted batches.
+- [x] Time windows select every dataset by receipt time, so a window means
+      one thing. Quality date ranges are receipt dates. Files are partitioned
+      by the UTC date of `recv_ts`. Event-time filtering stays possible on
+      the column.
+- [x] Stores without commit markers are refused with a "rebuild from the raw
+      logs" message.
+- [x] Every existing look-ahead protection is kept, and each of the three
+      layers covers the new cutoff and uncommitted batches.
+- [x] Property tests: no row with `recv_ts > T` is ever visible at T, and no
+      uncommitted batch is ever visible.
+- [x] The R01, R02, R03 and R09 review tests pass with their `xfail` markers
+      removed.
+- [x] `data/normalized` rebuilt; row counts and check-snapshot results match
+      the previous store.
+
+**What was built:**
+
+- `store.py`: store layout 2. `AppendOnlyStore.batch()` returns a `Batch`
+  (`append`, `commit`, `abandon`; a context manager that commits on success
+  and abandons on an exception); `append` is a batch of one table. Files are
+  `part-<knowledge_ts>-<number>.parquet` under the UTC date of `recv_ts`. The
+  commit marker `_batches/batch-<knowledge_ts>.json` is published last, by
+  hard link. Knowledge times start at 1. A batch refuses to commit behind a
+  later committed one. `StoreVersionError` lives here now.
+- `session.py`: `PITSession(root, *, available_at, version=None)`;
+  `ReplayCursor(root, *, start, end, version=None)` with `session`,
+  `available_at`, `end`, `advance` and `close`. Sessions read the commit
+  markers, open only committed files, and refuse a `version` later than the
+  latest committed batch. Range methods bound `recv_ts`.
+- `adapters/base.py`: `ingest` loads a log as one batch.
+- `quality.py`: ranges are receipt time; `--available-at` and `--version`
+  replace `--as-of`, which is refused; the report names the version it read.
+  The `clock_offset_exceeded` message no longer says `knowledge_ts` is off
+  (review, X2).
+- `book.py`: `--available-at` and `--version` on both commands.
+- ADR 0017; architecture sections 1, 2, 3.2, 4.3, 6.2, 7 and 8.1;
+  `docs/data-core.md` sections 1 and 3 to 8; CLAUDE.md (safety rule 9 and
+  the description of the data core).
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,337 Python tests,
+  16 expected failures (the review findings still open).
+- New and rewritten tests, written before the code: `test_store.py` (batches,
+  markers, receipt-date partitions, a store from before markers);
+  `test_session.py` (both cutoffs, `as_of` retired, versions, receipt-time
+  windows, uncommitted batches); `test_session_cursor.py`;
+  `test_session_property.py`; `test_session_sql.py` (the engine's limits for
+  the new cutoff and for uncommitted files); `test_session_versions.py`
+  (stores without markers, damaged markers).
+- Property tests (`test_session_property.py`), over random histories of
+  batches with corrections, some never committed, on three receipt days:
+  every read path of a session, for all four datasets, returns exactly the
+  latest version of each record among the committed rows inside both
+  cutoffs; and a cursor advanced through random times reads what a new
+  session at each time reads. Run under five seeds.
+- **The property test found a defect in the new code before it was merged:**
+  a first load that dies before committing left data files and no marker
+  directory, and a session took the store for one written before commit
+  markers. The marker directory is now created before the first data file.
+- The R01, R02, R03 and R09 review tests pass unmarked. R01 and R02 changed
+  only in the session's parameters. **R03 and R09 had to change shape**,
+  because the fix makes the situation each set up impossible (ADR 0017,
+  Review item 9). Run as-is against main they fail on the parameter name;
+  with the names translated to main's `as_of` they fail for the R03 and R09
+  findings; and the breakage pass caught both.
+- The 16 review tests still marked `xfail(strict=True)` (R04 to R08, R10,
+  R11) each still fail for the reason the review gives.
+- Breakage pass: 25 deliberate breakages of the new code (both view filters, the order of filtering and version choice, each half of the engine's file limit, uncommitted files, the version ceiling, receipt-time ranges, the `as_of` refusal, five in the cursor, the marker checks, the receipt-date partition, the commit-order check, abandoning, empty batches, one knowledge time per batch, knowledge times from 1, reserving dead batches' times, `ingest` as one batch, and the quality ranges): all 25 caught.
+- `data/normalized` rebuilt from the two one-hour logs (the old store is kept
+  as `data/normalized-before-adr0017`): the same row counts as before in all four datasets on both venues (319,421 / 4,569 / 2 / 35 and 871,546 / 18,372 / 1 / 35), the same price and quantity sums, stream event kinds and receipt-time ranges, 6 of 6 check snapshots exact on each venue with the same snapshots, never crossed, and the same quality report (two INFO `clock_not_recorded`, identical statistics). It is now 23 data files in two batches instead of 46 files. Loading took 13 s and 24 s
+- The replay cursor on the rebuilt store: 200 decision steps one second apart, each reading the last second of Coinbase trades, took 22 ms per step (10 ms of it `advance`) against 50 ms with a new session per step, and read identical rows
+
+**Notes for the next phases:**
+
+- **Phase 7** opens one `ReplayCursor` per replay and hands its session to
+  the strategy; its criteria say so. The cursor removes the cost of opening
+  a session per decision. The cost of a range query, which resolves versions
+  over everything the session can see before filtering on the window, is
+  unchanged (review, D4).
+- **Still open from the review:** R04 (a correction cannot remove a row), R05
+  (a value the schema refuses stops a load; the load is now abandoned whole
+  instead of left half-written), R06, R07, R08, R10, R11, the design findings
+  D1 to D7 and the test findings T1 to T3. D1 to D3 should be settled before
+  code is written against `MarketEvent` in Phase 4.
+- **R10 is narrower but open.** A trade seen live and resent by a later log is
+  seen as its live observation by a session whose `available_at` is before
+  the resend. After it, the store still shows the later observation.
+- **ADR 0017's "Review" section** lists ten choices made while building
+  this. The owner confirmed all ten on 2026-11-15, including refusing a
+  `version` later than the latest committed batch rather than clamping it,
+  and the reshaped R03 and R09 tests.
+- **A load that dies leaves its files** without a commit marker. Sessions
+  ignore them and nothing deletes them; a store that has seen many failed
+  loads carries dead files.
+- **Venue-time queries** (`WHERE event_ts ...` in `sql`) scan every partition
+  the session can see, because the date partition is now the receipt date.
+- **Every store from before this phase is refused.** On the owner's machine
+  `data/normalized` was rebuilt; `data/normalized-before-adr0013` and
+  `data/normalized-before-adr0017` are refused with the rebuild message.
+
 ### Phase 4: C++ order book, verified
 
 - [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
@@ -1288,9 +1418,13 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 - [ ] Determinism test: two runs over the same log give byte-identical
       journals. Run in CI.
 - [ ] Python binding: run a replay with a Python callback on the decision
-      clock; the callback receives a `PITSession` whose `as_of` is simulated
-      time.
-- [ ] A test proves the callback cannot see data after simulated time.
+      clock. The engine opens one `ReplayCursor` over the replay and advances
+      it to simulated time before each call; the callback receives the
+      cursor's session, whose `available_at` is simulated time. *(Amended in
+      Phase 3e, ADR 0017: was "a `PITSession` whose `as_of` is simulated
+      time", which would have been an empty session.)*
+- [ ] A test proves the callback cannot see data after simulated time, and
+      cannot move the cursor.
 - [ ] Replay speed recorded (events per second) as baseline.
 
 ### Phase 8: Simulated exchange and cost model
@@ -1363,13 +1497,16 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       multi-level), spread, microprice, realized volatility, and a small set
       of bar technicals. Each feature declares its inputs and lookback.
 - [ ] `PITSession.bars(venue, instrument, freq, start, end)`: OHLCV bars
-      computed on demand from the trades visible at `as_of`, with integer
+      computed on demand from the trades visible to the session, with integer
       prices and quantities. Intervals are half-open and aligned to the
-      epoch. A bar whose interval has not ended by `as_of` is not returned.
-      Tested on hand-computed bars, on an interval with no trades, and for
-      look-ahead: a trade that arrives late changes its bar only for
-      sessions opened at or after the trade's knowledge time. The bar
-      technicals above read bars only through this method.
+      epoch. A bar whose interval has not ended by `available_at` is not
+      returned. Tested on hand-computed bars, on an interval with no trades,
+      and for look-ahead: a trade that arrives late changes its bar only for
+      sessions whose `available_at` is at or after the trade's receipt time.
+      The bar technicals above read bars only through this method. *(Amended
+      in Phase 3e, ADR 0017: `as_of` and "knowledge time" became
+      `available_at` and receipt time. Whether a bar's interval is venue time
+      or receipt time is for this phase to decide.)*
 - [ ] Features read data only through `PITSession`. Import-lint test added
       that fails if signal code imports storage internals, the raw log or
       the adapters, or reaches into private attributes of the data package.

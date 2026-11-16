@@ -3,9 +3,9 @@
 The Python data core (`python/src/quantagent/data/`) captures public market
 data, normalizes it into an append-only bitemporal store, serves it only
 through a point-in-time session, and checks its quality. This document
-describes what is built. The decisions behind it are ADRs 0005, 0006, 0008,
-0009 and 0010; the architecture's section 3.2 explains how it fits the rest
-of the system.
+describes what is built. The decisions behind it are ADRs 0005, 0006 and 0008
+to 0017; the architecture's section 3.2 explains how it fits the rest of the
+system.
 
 ```
 venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
@@ -15,7 +15,7 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
                                            ▼
                              AppendOnlyStore (Parquet)
                                            │
-                                 PITSession(as_of=...) ──▶ research, quality checks
+                          PITSession(available_at=...) ──▶ research, quality checks
 ```
 
 | Module | Role |
@@ -46,10 +46,21 @@ venue ──WebSocket/REST──▶ recorder ──▶ raw log (.qaraw.zst)
 | `event_ts_source` | `"venue"` or `"receipt"`: where `event_ts` came from, decided by the kind of message | The adapter |
 | `recv_ts` | When our process received the bytes (wall clock) | The recorder |
 | `recv_mono_ns` | The monotonic counter at the same moment; raw log records only, not stored rows (ADR 0012) | The recorder |
-| `knowledge_ts` | When the row became available in the store | The store, at write time |
+| `knowledge_ts` | Which load of the store the row belongs to: its version. Every row of one load has the same one | The store, when the load begins |
 
-`recv_ts` and `knowledge_ts` are only as good as the recording machine's
-clock. See section 7.
+Each of the three has one job (ADR 0017):
+
+- **Venue time** (`event_ts`) is what the venue says. It is never a cutoff, a
+  window or a partition; it is a column to filter and sort on.
+- **Receipt time** (`recv_ts`) decides what a session may see
+  (`available_at`), and is what every time window and the store's date
+  partition are on.
+- **Knowledge time** (`knowledge_ts`) decides which version of the store a
+  session reads (`version`). A raw log is loaded after it was recorded, so a
+  row's knowledge time is hours or days after its receipt time.
+
+`recv_ts` is only as good as the recording machine's clock, and
+`knowledge_ts` as the loading machine's. See section 7.
 
 ## 2. Datasets
 
@@ -102,16 +113,28 @@ bools and numeric strings that pyarrow would silently convert.
 
 ```
 <root>/<dataset>/venue=<venue>/instrument=<instrument>/date=<YYYY-MM-DD>/
-    part-<knowledge_ts, 20 digits>.parquet
+    part-<knowledge_ts, 20 digits>-<number, 6 digits>.parquet
+<root>/_batches/batch-<knowledge_ts, 20 digits>.json        one commit marker per batch
 ```
 
-- `date` is the UTC date of `event_ts`.
-- `AppendOnlyStore(root).append(dataset, venue, instrument, table)` is the only
-  write operation. One call is one batch with one `knowledge_ts`, strictly
-  greater than any the store has issued, including in earlier processes.
-- Existing files are never opened for writing, renamed or removed. Files are
-  written under a temporary name and published by hard link, which cannot
-  replace a file; a failed multi-partition append publishes nothing.
+- `date` is the UTC date of `recv_ts`: the day we received the row (ADR 0017).
+- **A write is a batch.** `AppendOnlyStore(root).batch()` opens one; every
+  table appended to it, in every dataset, gets the same `knowledge_ts`, read
+  from the clock when the batch opens and strictly greater than any issued
+  before (including in earlier processes, and by batches that were never
+  committed). `append(dataset, venue, instrument, table)` is a batch of one
+  table. A raw log is loaded as one batch.
+- **A batch is readable only once it is committed.** Its data files are
+  written first. Its commit marker (JSON: the layout number, the knowledge
+  time, every file of the batch, row counts) is published last, in one step.
+  A data file that no marker names is not part of the store: sessions ignore
+  it. That is what a load that is still running, failed or died looks like.
+- A batch that fails is abandoned and its files are removed; nothing of it
+  was ever readable. A load that dies leaves files without a marker, which
+  are ignored and never deleted automatically.
+- Existing files are never opened for writing, renamed or removed. A data
+  file is created under its final name and the create fails if the name is
+  taken; a marker is published by hard link, which cannot replace a file.
 - A **correction** is a new row with the same key and a later `knowledge_ts`.
   Because book events, stream events and instrument versions are keyed by the
   raw record they came from, and a log keeps its `log_id`, normalizing a raw
@@ -121,43 +144,69 @@ bools and numeric strings that pyarrow would silently convert.
   after another, in the order they began, each in the order its records
   arrived. Logs are not interleaved in the store; merging logs by arrival is
   done on raw logs (`logorder.merge_logs`, section 5).
-- **Schema versions** are written into every file (`qa.dataset`,
-  `qa.schema_version`). `PITSession` checks every file it opens and refuses
-  one of another dataset, version or set of columns with a
-  `StoreVersionError` saying to rebuild the store from the raw logs (ADR
-  0015). A store written before ADR 0013 is refused this way. To rebuild,
-  load each raw log into a new directory with
+- **Versions of the store.** Every committed batch is a version, named by its
+  knowledge time. Batches become readable in knowledge-time order, so a
+  version, once it can be read, never gains a batch. Knowledge times start at
+  1; version 0 is the empty store.
+- **Schema and layout versions.** Every file records its dataset and schema
+  version (`qa.dataset`, `qa.schema_version`), and every marker the store
+  layout (2). `PITSession` checks every file it opens and refuses one of
+  another dataset, version or set of columns with a `StoreVersionError` saying
+  to rebuild the store from the raw logs (ADR 0015). A store written before
+  commit markers (ADR 0017) or before ADR 0013 is refused this way, by the
+  session and by the writer. To rebuild, load each raw log into a new
+  directory with
   `python -m quantagent.data.adapters <log> --store <new store>`.
-- Limits: one writer per store root (assumed, not locked); hard links need
-  NTFS or ext4; venue and instrument names are restricted to
-  `A-Z a-z 0-9 . _ -`.
+- Limits: one writer per store root (assumed, not locked; a batch refuses to
+  commit behind a later committed one); hard links need NTFS or ext4; venue
+  and instrument names are restricted to `A-Z a-z 0-9 . _ -`.
 
 ## 4. `PITSession`
 
 ```python
-with PITSession(store_root, as_of=t) as s:
-    s.trades(venue, instrument, start, end)         # start <= event_ts < end
+with PITSession(store_root, available_at=t, version=None) as s:
+    s.trades(venue, instrument, start, end)         # start <= recv_ts < end
     s.book_events(venue, instrument, start, end)
     s.stream_events(venue, instrument, start, end)
-    s.instruments(venue, instrument)                # every metadata version known at t
+    s.instruments(venue, instrument)                # every metadata version received by t
     s.instrument(venue, instrument, at=u)           # the version in effect at u (default t)
     s.sql("SELECT ... FROM trades JOIN ...")        # one SELECT over the four views
 ```
 
-Every method returns the latest version of each record among the rows with
-`knowledge_ts <= as_of`, as a pyarrow table (or an `InstrumentMeta`). Range
-methods return rows in `(log_id, seq)` order (section 3); `instruments` by
-`event_ts`, then `(log_id, seq)`. The views are `trades`, `book_events`,
-`instruments` and `stream_events`, each with `venue`, `instrument`, `date` and
-then the stored columns.
+A session has two cutoffs (ADR 0017):
 
-Opening a session reads the footer of every file it will open and refuses the
-store if any was written with another schema (section 3); that costs about
-0.3 ms per file.
+| Cutoff | Meaning |
+|--------|---------|
+| `available_at`, required, no default | A simulated time. Only rows with `recv_ts <= available_at` are visible |
+| `version`, optional | A knowledge cutoff. Among the rows available, each record's latest version with `knowledge_ts <= version` is returned. Defaults to the latest committed batch |
 
-Look-ahead is blocked in three independent layers:
+- Both cutoffs apply before a version is chosen. If a record was observed
+  twice, a session whose `available_at` is before the second observation
+  arrived sees the first.
+- A `version` later than the latest committed batch is refused with a
+  `ValueError`: a batch committed later could fall inside it, so it would not
+  read the same twice. `session.version` says which version is in force.
+- `as_of` was retired. It was a knowledge cutoff, which is what `version` is
+  now. Passing it raises a `TypeError` naming both replacements.
+- Only committed batches exist for a session (section 3).
 
-1. **Views** filtered to `knowledge_ts <= as_of`. Nothing else is queryable.
+Every method returns a pyarrow table (or an `InstrumentMeta`). Range methods
+take a half-open window on **receipt time**, `start <= recv_ts < end`, for
+every dataset, and return rows in `(log_id, seq)` order (section 3);
+`instruments` by `event_ts`, then `(log_id, seq)`. The views are `trades`,
+`book_events`, `instruments` and `stream_events`, each with `venue`,
+`instrument`, `date` and then the stored columns. To select by venue time,
+filter `event_ts` in `sql`.
+
+Opening a session reads every commit marker and the footer of every file it
+will open, and refuses the store if any was written with another layout or
+schema (section 3); that costs about 0.3 ms per file.
+
+Look-ahead is blocked in three independent layers, each covering both
+cutoffs and uncommitted batches:
+
+1. **Views** filtered to `recv_ts <= available_at` and
+   `knowledge_ts <= version`. Nothing else is queryable.
 2. **Statement validation** (`sqlguard`): `sql` accepts exactly one SELECT.
    DuckDB parses the query, the parse tree is checked against an allow-list of
    node kinds, tables, functions and types, and the session executes that same
@@ -166,14 +215,33 @@ Look-ahead is blocked in three independent layers:
    that read settings, the clock or random state, and bare `current_date` and
    similar names.
 3. **Engine lockdown**: each session has its own DuckDB instance that may open
-   only the files written at or before `as_of`, cannot write, attach or load
-   anything, and cannot be reconfigured.
+   only the files of committed batches at or before its version whose date
+   partition is on or before the day of `available_at`. It cannot write,
+   attach or load anything, and cannot be reconfigured.
 
-Other properties: `as_of` is a required keyword and cannot be changed; a
-session is a snapshot of the files present when it opened; it cannot be
-copied, pickled or subclassed; errors have store paths removed; it is not
-thread-safe. DuckDB is pinned to 2.0.x because the validator depends on its
-parse tree (CLAUDE.md has the upgrade rule).
+Other properties: `available_at` is a required keyword and neither cutoff can
+be changed; a session is a snapshot of the batches committed when it opened;
+it cannot be copied, pickled or subclassed; errors have store paths removed;
+it is not thread-safe. DuckDB is pinned to 2.0.x because the validator depends
+on its parse tree (CLAUDE.md has the upgrade rule).
+
+### Replay cursor
+
+A backtest moves through time, and opening a session per decision is slow. A
+`ReplayCursor` opens the store once:
+
+```python
+with ReplayCursor(store_root, start=t0, end=t1, version=None) as cursor:
+    session = cursor.session      # a PITSession; hand this to the strategy
+    cursor.advance(now)           # t0 <= now <= t1, never backwards
+```
+
+After `advance(now)` the session reads exactly what
+`PITSession(store_root, available_at=now, version=...)` would. The cursor
+belongs to the harness. The session it hands out has no method that moves
+time and no reference to the cursor, so code that is given the session cannot
+look ahead. The cursor's engine may open files received up to the day of
+`end` and no later; its version is fixed when it opens.
 
 ## 5. Capture and adapters
 
@@ -221,7 +289,8 @@ disconnect, rest, stop).
 ### Adapters
 
 `adapters.normalize(records)`, the streaming `Normalizer`, and
-`adapters.ingest(path, store)`, which appends in batches of pending rows.
+`adapters.ingest(path, store)`, which loads a log as one batch (section 3):
+one knowledge time for all of it, readable when the whole log is written.
 `python -m quantagent.data.adapters <log>` checks a log without writing; with
 `--store <dir>` it loads it. Every raw record ends as `data`, `ignored` (a
 known kind of message with no market data) or `rejected` (with a reason), and
@@ -257,19 +326,27 @@ trade.
 
 The report counts trades seen again, conflicts and identical repeats dropped.
 The raw log keeps every observation. Logs loaded in separate runs are not
-compared with each other; for those the store keeps the later observation.
+compared with each other; for those the store keeps the later observation. A
+session whose `available_at` is before the later observation arrived still
+sees the earlier one.
 
 ## 6. Quality checks
 
 ```
 python -m quantagent.data.quality --store data/normalized \
     --start 2026-11-11 --end 2026-11-11 [--venue V] [--instrument I] \
-    [--as-of NS] [--fail-on error|warning|info] [--config quality.json]
+    [--available-at NS] [--version NS] [--fail-on error|warning|info] \
+    [--config quality.json]
 ```
 
-The report runs every check on every venue and instrument with data in the
-date range (UTC, both days inclusive), as known at `--as-of` (default: now),
-and prints each check's findings with what it examined. It exits 1 if any
+The report runs every check on every venue and instrument with data
+**received** in the date range (UTC, both days inclusive), and prints each
+check's findings with what it examined. The range is receipt time, like every
+window (ADR 0017): the data received on those days, with the integrity events
+noticed on them. By default it reads everything received, at the latest
+committed version; `--available-at` and `--version` set the session's two
+cutoffs (section 4), and the report says which version it read. `--as-of` was
+retired and is refused. It exits 1 if any
 finding is at or above `--fail-on` (default `error`). A range with no data is
 reported as a `no_data` warning, so a recorder that stopped does not pass
 silently.
@@ -326,8 +403,10 @@ What the checks cannot see:
 
 ## 7. Clock accuracy
 
-`recv_ts` and `knowledge_ts` come from the recording machine's wall clock, so
-they assume that clock is synchronized to NTP (ADR 0011).
+`recv_ts` comes from the recording machine's wall clock, so it assumes that
+clock is synchronized to NTP (ADR 0011). `knowledge_ts` comes from the clock
+of the machine that loads the store; it orders versions and is not compared
+with market times.
 
 **What the recorder does.** Before contacting a venue it measures its offset
 (`clock.measure_offset`): three SNTP samples from each of four servers run by
@@ -351,11 +430,11 @@ its Windows Time service stopped. Their clock was **about 1.4 s ahead**:
   event log shows the clock stepped back by 1.241 s (it had drifted in
   between).
 
-So their `recv_ts` and `knowledge_ts` are about 1.4 s late, and the ~1.48 s
-median lag the quality report shows for them is mostly this offset; the true
-network and processing delay was roughly 40 to 90 ms. There is no look-ahead
-(data appears known later than it was), but lag and latency figures from this
-data are wrong by the offset. The timestamps are left as recorded, and these
+So their `recv_ts` is about 1.4 s late, and the ~1.48 s median lag the quality
+report shows for them is mostly this offset; the true network and processing
+delay was roughly 40 to 90 ms. There is no look-ahead (data appears received
+later than it was, so a session sees it later), but lag and latency figures
+from this data are wrong by the offset. The timestamps are left as recorded, and these
 sessions report `clock_not_recorded`.
 
 ## 8. Reference order book
@@ -368,6 +447,9 @@ against (roadmap Phase 2). It favors being obviously correct over speed.
 python -m quantagent.data.book verify --store data/normalized --venue kraken --instrument BTC-USD
 python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE
 ```
+
+Both take `--available-at` and `--version` (section 4) and default to
+everything received at the latest committed version.
 
 - Snapshots replace the book; updates apply level by level in `level_index`
   order, and quantity 0 removes a level. Kraken books are cut to the
@@ -401,6 +483,10 @@ python -m quantagent.data.book golden --store ... --venue ... --instrument ... -
   the order its records arrived, from its own snapshot, whatever the wall
   clock did (ADR 0013). A clock step is reported by the `recording_clock`
   check, not by the reconstructor.
+- **Windows.** Book rows and stream events read with the same `start` and
+  `end` cover the same raw records, because both ranges are receipt time
+  (ADR 0017). A window that holds a book message also holds every integrity
+  event noticed up to it.
 - **What it cannot see:** a lost Kraken update that does not touch the ten
   best levels before it is overwritten, and a repeated Kraken update (the
   quantities are absolute, so the book does not change).
