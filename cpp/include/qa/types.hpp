@@ -121,4 +121,16 @@ struct InstrumentMeta {
   Qty lot_size;     // mantissa at qty_exp
 };
 
+// The largest exponent the store's schema allows (ADR 0019): 10^18 fits int64.
+inline constexpr int kMaxExponent = 18;
+
+// The store's rule for an instrument's scales (ADR 0019; ADR 0022): each
+// exponent 0 to kMaxExponent, each precision 0 to its exponent.
+[[nodiscard]] constexpr bool scales_fit(const InstrumentMeta& meta) noexcept {
+  return meta.price_exp >= 0 && meta.price_exp <= kMaxExponent && meta.qty_exp >= 0 &&
+         meta.qty_exp <= kMaxExponent && meta.price_precision >= 0 &&
+         meta.price_precision <= meta.price_exp && meta.qty_precision >= 0 &&
+         meta.qty_precision <= meta.qty_exp;
+}
+
 }  // namespace qa

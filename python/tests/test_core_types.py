@@ -409,7 +409,7 @@ def test_order_request_and_execution_report_round_trip():
 
 
 def test_from_bytes_refuses_unknown_enum_values():
-    for kind in (8, 9, 255):  # SnapshotEnd (7) is the last kind
+    for kind in (9, 10, 255):  # InstrumentUpdate (8) is the last kind (ADR 0022)
         raw = bytearray(_core.MarketEvent().to_bytes())
         raw[78] = kind
         with pytest.raises(ValueError, match="kind"):
@@ -451,6 +451,118 @@ def test_from_bytes_refuses_the_unassigned_flag_bit():
     raw[80] = 0xFF
     with pytest.raises(ValueError, match="flag"):
         _core.MarketEvent.from_bytes(bytes(raw))
+
+
+# --- instrument updates (ADR 0022) ---------------------------------------------------------
+
+
+def instrument_update(**fields):
+    """An InstrumentUpdate for Kraken BTC-USD, stamped like any event of a record."""
+    event = _core.MarketEvent.instrument_update(meta())
+    event.recv_ts = _core.Timestamp(1_794_366_407_006_069_000)
+    event.event_ts = event.recv_ts
+    event.seq = 7
+    event.source = 3
+    event.flags = _core.MarketEvent.EVENT_TS_FROM_RECEIPT
+    for name, value in fields.items():
+        setattr(event, name, value)
+    return event
+
+
+def test_an_instrument_update_is_the_ninth_kind_and_carries_a_whole_instrument_meta():
+    assert int(_core.EventKind.InstrumentUpdate) == 8
+    event = instrument_update()
+    assert event.kind == _core.EventKind.InstrumentUpdate
+    assert event.instrument.value == 7
+    # The tick size is a price and the lot size a quantity, at the instrument's exponents.
+    assert (event.price.value, event.qty.value) == (10_000_000, 1)
+    # The four scales in level_index, a byte each from the lowest, in the order
+    # of InstrumentMeta's bytes 4 to 7: price_exp, qty_exp, price_precision, qty_precision.
+    assert event.level_index == 8 | 8 << 8 | 1 << 16 | 8 << 24
+    raw = event.to_bytes()
+    assert raw[72:76] == bytes([8, 8, 1, 8])
+    assert raw[78] == 8 and raw[81] == 0
+    assert raw[82:84] == bytes(2)  # no reserved byte is used
+    assert (event.side, event.reason) == (_core.Side.Unknown, _core.StreamReason.NoReason)
+    assert (event.venue_seq, event.trade_id, event.checksum, event.depth) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"price_exp": 0, "qty_exp": 0, "price_precision": 0, "qty_precision": 0},
+     {"price_exp": 18, "qty_exp": 18, "price_precision": 18, "qty_precision": 0},
+     {"price_exp": 2, "qty_exp": 5, "price_precision": 1, "qty_precision": 3,
+      "tick": 2**63 - 1, "lot": 1}],
+)  # fmt: skip
+def test_an_instrument_update_round_trips_its_metadata_through_its_bytes(fields):
+    sent = meta(**fields)
+    event = instrument_update()
+    made = _core.MarketEvent.instrument_update(sent)
+    event.price, event.qty, event.level_index = made.price, made.qty, made.level_index
+    copy = _core.MarketEvent.from_bytes(event.to_bytes())
+    assert copy.to_bytes() == event.to_bytes()
+    assert (copy.seq, copy.source) == (7, 3)
+    got = copy.instrument_meta()
+    assert (got.id.value, got.price_exp, got.qty_exp, got.price_precision, got.qty_precision,
+            got.tick_size.value, got.lot_size.value) == (
+        sent.id.value, sent.price_exp, sent.qty_exp, sent.price_precision, sent.qty_precision,
+        sent.tick_size.value, sent.lot_size.value)  # fmt: skip
+
+
+def test_only_an_instrument_update_has_instrument_metadata():
+    for kind in (_core.EventKind.BookDelta, _core.EventKind.SnapshotBegin, _core.EventKind.Trade):
+        event = full_market_event()
+        event.kind = kind
+        with pytest.raises(ValueError, match="InstrumentUpdate"):
+            event.instrument_meta()
+    with pytest.raises(TypeError):
+        _core.MarketEvent.instrument_update(7)
+
+
+def _scales(price_exp, qty_exp, price_precision, qty_precision):
+    return bytes(v & 0xFF for v in (price_exp, qty_exp, price_precision, qty_precision))
+
+
+@pytest.mark.parametrize(
+    "scales",
+    [_scales(19, 8, 1, 8), _scales(8, 19, 1, 8), _scales(8, 8, 9, 8), _scales(8, 8, 1, 9),
+     _scales(-1, 8, 0, 8), _scales(8, 8, -1, 8), _scales(8, 8, 1, -1), _scales(127, 8, 1, 8)],
+)  # fmt: skip
+def test_from_bytes_refuses_an_instrument_update_whose_scales_do_not_fit(scales):
+    """As the InstrumentMeta binding and the store's schema do: an exponent is 0
+    to 18 and a precision 0 to its exponent."""
+    raw = bytearray(instrument_update().to_bytes())
+    raw[72:76] = scales
+    with pytest.raises(ValueError, match="exponent|precision"):
+        _core.MarketEvent.from_bytes(bytes(raw))
+    with pytest.raises(ValueError, match="exponent|precision"):
+        event = instrument_update()
+        event.level_index = int.from_bytes(scales, "little")
+        event.instrument_meta()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"side": _core.Side.Buy}, {"venue_seq": 1}, {"trade_id": 1}, {"checksum": 1}, {"depth": 25},
+     {"flags": _core.MarketEvent.LAST_IN_MESSAGE}, {"flags": _core.MarketEvent.HAS_VENUE_SEQ},
+     {"flags": _core.MarketEvent.HAS_CHECKSUM}, {"flags": _core.MarketEvent.HAS_DEPTH},
+     {"flags": _core.MarketEvent.HAS_TRADE_ID}],
+)  # fmt: skip
+def test_from_bytes_refuses_an_instrument_update_carrying_anything_else(fields):
+    with pytest.raises(ValueError, match="instrument update"):
+        _core.MarketEvent.from_bytes(instrument_update(**fields).to_bytes())
+
+
+def test_from_bytes_accepts_an_instrument_updates_own_flags_and_refuses_a_reason():
+    flags = _core.MarketEvent.EVENT_TS_FROM_RECEIPT | _core.MarketEvent.HAS_MONO
+    for value in (0, _core.MarketEvent.HAS_MONO, flags):
+        event = instrument_update(flags=value, recv_mono=_core.MonoTimestamp(5))
+        assert _core.MarketEvent.from_bytes(event.to_bytes()).flags == value
+    with pytest.raises(ValueError, match="reason"):
+        _core.MarketEvent.from_bytes(
+            instrument_update(reason=_core.StreamReason.Connect).to_bytes())  # fmt: skip
+    # It carries values, so it is not one of the control events that may carry none.
+    assert instrument_update().price.value != 0
 
 
 # --- clocks ----------------------------------------------------------------------------------

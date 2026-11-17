@@ -40,7 +40,7 @@ before making it.
 | 3g | Fixed exponents, per-severity limits, the data core spec (ADR 0019) | Done |
 | 3h | Stream control events, a resuming reference book, the snapshot queue policy (ADR 0020) | Done |
 | 4a | The MarketEvent converter, D7, T3 (ADR 0021) | Done |
-| 4b | C++ order book, verified | Not started |
+| 4b | C++ order book, verified (ADR 0022) | Done |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
 | 7 | Deterministic replay engine | Not started |
@@ -1860,9 +1860,27 @@ under the part that meets it.
   levels (both sides); a book that allocates nothing after startup needs a
   capacity per side, and a rule for a message that would exceed it.
 
-### Phase 4b: C++ order book, verified
+### Phase 4b: C++ order book, verified (done)
 
-- [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
+Owner decisions before the book's code (2026-11-17, ADR 0022):
+
+- [x] ADR 0021's nine Review items confirmed; Phase 7's criteria note that the
+      converter must handle trades before the replay engine needs them.
+- [x] Precision changes travel in the stream: a new `MarketEvent` kind,
+      `InstrumentUpdate`, emitted by the converter at the record where the
+      change arrives; its layout uses fields the kind does not otherwise use
+      and no reserved byte. A test with a mid-session precision change matches
+      the reference book.
+- [x] Book capacity fixed per side, configured per instrument at startup
+      (65,536 by default; a cut book sized from its depth); nothing allocated
+      after startup; a message that would exceed it marks the book stale with
+      its own reason and a counter, recovering at the next snapshot that
+      fits; tested with a deliberately small capacity.
+- [x] The borderline slow tests stay unmarked.
+
+The phase's criteria:
+
+- [x] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
       truncation to a subscribed depth, and a stale flag. A snapshot is
       framed (`SnapshotBegin`, levels, `SnapshotEnd`) and takes effect at its
       end; an update at its `kLastInMessage` level. The book goes stale on a
@@ -1873,26 +1891,26 @@ under the part that meets it.
       complete snapshot that passes its check recovers it. *(Amended in
       Phase 3h, ADR 0020: was "a stale flag on an integrity failure (a
       sequence gap on Coinbase, a checksum mismatch on Kraken)".)*
-- [ ] Driven in tests from Python through the bindings, with events
+- [x] Driven in tests from Python through the bindings, with events
       normalized by the Phase 1c adapters (C++ feed handlers come in
       Phase 6) and converted by the Phase 4a converter
       (`quantagent.marketevents`, ADR 0021). *(Amended in Phase 4a: the
       converter is built there; this half drives the book with it.)*
-- [ ] Matches the Python reference reconstructor: after every step of the
+- [x] Matches the Python reference reconstructor: after every step of the
       Phase 2 golden files (every message, stale and reset row), the C++
       book's stale flag and top-of-book and top-20 depth equal the row, for
       both venues, with zero differences. *(Amended in Phase 3h: was "after
       every event"; the files now have a row per step.)*
-- [ ] Matches exchange snapshots under ADR 0014's rule, as the reference
+- [x] Matches exchange snapshots under ADR 0014's rule, as the reference
       does: over the Phase 1c fixtures the book equals every
       `CHECK_SNAPSHOT` on every level (both are timed on a stream batch),
       and on the between-batches fixture it differs only on the next
       batch's levels. Kraken's checksum is computed and validated after
       every message. *(Amended in Phase 3b: the comparison point and the
       Coinbase exemption follow ADR 0014.)*
-- [ ] Both comparisons run as tests in `scripts/check.ps1` on the committed
+- [x] Both comparisons run as tests in `scripts/check.ps1` on the committed
       fixtures.
-- [ ] Gap handling tested: on the integrity cases of
+- [x] Gap handling tested: on the integrity cases of
       `golden/integrity-points.json` (the Phase 2 gap fixtures: a message
       removed, duplicated or swapped, each with a later snapshot to recover
       at), the book goes stale and recovers at exactly the listed points, and
@@ -1902,10 +1920,132 @@ under the part that meets it.
       the same event where the reference reconstructor raises, and it
       recovers on the next snapshot"; resume mode goes stale exactly there,
       and the fixtures had no next snapshot.)*
-- [ ] Zero heap allocations in steady state, asserted by a test that counts
+- [x] Zero heap allocations in steady state, asserted by a test that counts
       `operator new` calls after warm-up.
-- [ ] Benchmark for apply-delta and top-of-book recorded in the PR as the
+- [x] Benchmark for apply-delta and top-of-book recorded in the PR as the
       baseline (numbers and machine).
+
+**What was built:**
+
+- `cpp/include/qa/order_book.hpp`, `cpp/src/order_book.cpp`: `OrderBook`
+  (`apply`, `is_stale`, `has_book`, `stale_reason`, `stale_count`, `top`,
+  `best_bid`, `best_ask`, `size`, `quantity_at`, `checksum`, `instrument`),
+  `BookCheck`, `StaleReason`, `BookEffect`, `BookResult`,
+  `capacity_for_depth`.
+- `cpp/include/qa/book_side.hpp`: `BookSide`, one side's levels best first in
+  a ring buffer allocated once; `BookLevel`.
+- `cpp/include/qa/crc32.hpp`: zlib's CRC-32, table driven, `constexpr`.
+- `cpp/include/qa/events.hpp`: `EventKind::InstrumentUpdate` (8),
+  `MarketEvent::kInstrumentUpdateFlags`, `set_instrument_meta`,
+  `instrument_meta`; `qa/types.hpp`: `kMaxExponent`, `scales_fit`.
+- Bindings: `OrderBook` and its enums; `MarketEvent.instrument_update(meta)`
+  and `event.instrument_meta()`; `from_bytes` accepts kind 8 under its rules.
+- `quantagent.marketevents.convert` emits an `instrument` group per stored
+  metadata version and refuses versions an event cannot carry.
+- Tests: `cpp/tests/test_order_book.cpp`, `test_book_side.cpp`,
+  `test_crc32.cpp`, new cases in `test_events.cpp`; `qa_alloc_tests`
+  (`test_order_book_alloc.cpp`, its own binary, counting `operator new`);
+  `cpp/tests/book_events.hpp` (hand-built events and synthetic streams);
+  `python/tests/data/test_order_book.py` and its helper `cppbook.py`; new
+  cases in `test_core_types.py` and `test_marketevents.py`.
+- `cpp/bench/bench_order_book.cpp`.
+- ADR 0022; ADR 0020 and 0021 statuses; architecture sections 3.1, 4.1 and
+  6.3; Phase 6's and Phase 7's criteria.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 77 C++ tests and 1,834 Python tests (20
+  and 1,724 before this phase). The Python suite took 9 min 39 s (11 min 1 s in
+  Phase 4a's last run); no test outside the `slow` mark took over 5 s.
+- Tests written first. The Python ones were seen failing for their reason
+  (no `BookEffect` in `_core`; no `InstrumentUpdate`; no `instrument`
+  groups: 36 failures and a collection error). The C++ ones were written
+  before the headers existed and first built with them.
+- **The golden files, after every step** (13,785 Kraken and 2,705 Coinbase
+  rows: every message, stale and reset step): the stale flag, the step's
+  reason and recovery, the top of book and the top 20 levels a side equal the
+  row, zero differences. Beyond the files, every level of both sides (38,000
+  on Coinbase) equals the reference book's after every step, and Kraken's
+  checksum computed by the C++ book equals the venue's after every message.
+- **The venues' snapshots, under ADR 0014:** both fixtures' check snapshots
+  equal the C++ book on every level (50 on Kraken, 38,532 on Coinbase); on the
+  between-batches fixture the 55 differing levels are all levels of the next
+  batch (93 levels), none outside it; the C++ comparison, written from the
+  rule, gives the reference's differences exactly.
+- **The integrity cases** (`integrity-points.json`): in all eight the C++
+  book goes stale, resets and recovers at exactly the committed points, with
+  the committed step and message counts, and its top 20 equals the reference's
+  resume-mode book after every step; each failure is counted under its
+  reason. The two cases with no stored events go stale by the book's own
+  Kraken checksum and Coinbase numbering.
+- **Random streams:** 400 generated streams per run (both venues, colliding
+  prices, zero and negative prices, planted checksum faults and number
+  repeats, stored stale and reset events at their own record or a message's,
+  check snapshots, Kraken precision changes): the C++ book equals the
+  reference after every step, in every level.
+- **A mid-session precision change** (Kraken from one decimal to two, the
+  update after it summed at two): the two books agree after every step with
+  every checksum verified; withholding the `InstrumentUpdate`, or moving it
+  one message earlier, makes the book stale at that message.
+- **Capacity:** a deliberately small capacity (3 a side) goes stale with
+  `CapacityExceeded` and its counter, stays stale through a snapshot that does
+  not fit, and recovers at one that does. With exactly its depth (25) the
+  Kraken book goes stale at the first update that briefly holds 26 levels,
+  recovers at the resnapshot (seq 12,492) and goes stale again; at 26 and at
+  `capacity_for_depth(25)` = 50 it never does.
+- **No allocation after construction** (`qa_alloc_tests`, counting every
+  form of `operator new`): zero over a Kraken-like stream (20,000 updates,
+  replayed four times with a gap, skipped updates, a recovery, a reset, an
+  instrument update and a broken frame), the same on a Coinbase-sized book
+  (38,532 levels), and over a capacity failure and its recovery; the counter
+  is shown to count, and the book's construction to allocate.
+- **Benchmark baseline** (AMD Ryzen 5 7600X3D, 12 threads at 4.09 GHz,
+  Windows, Release; synthetic streams, `cpp/bench/bench_order_book.cpp`):
+
+  | Benchmark | Time |
+  |-----------|------|
+  | Apply an update, Kraken-like (depth 25, checksum every message, ~2 levels) | 937 ns |
+  | Apply an update, Coinbase-sized book (38,532 levels; 1 in 10 levels anywhere in the book) | 447 ns |
+  | Apply an update, Coinbase-sized book, near the top only | 151 ns |
+  | Best bid and ask, Coinbase-sized book | 4.8 ns |
+  | Top 20 of both sides, Coinbase-sized book | 30 ns |
+  | Kraken's checksum alone (depth 25) | 0.82 µs |
+  | Apply a Coinbase-sized snapshot (38,532 levels) | 1.98 ms |
+
+- **Breakage pass:** 38 deliberate breakages: 31 in the book (the cut to
+  depth, both venues' checks and the numbering's restart, staleness and its
+  first reason, resets, recovery, skipping while stale, frames and their
+  counts and flags, interrupted messages, orphan levels, the instrument update
+  and its exponents, the checksum's side order, level count, digits and
+  quantity scale, levels of quantity 0, other instruments, the queries, the
+  counters, the capacity for a depth), 3 in the ring buffer, 3 in the
+  converter and 1 in `from_bytes`. The first run went through 31: 27 caught
+  by a test, 2 by the build's `static_assert`s, and 2 survived (a check
+  snapshot's frame accepting a stream snapshot's level, and `top()` showing a
+  book still being built); both got tests and are now caught. Claude Code
+  stopped that run during the 32nd because the machine was low on memory
+  (other applications), leaving that mutation in the source; it was restored
+  and every mutated site checked against the original. The remaining seven
+  ran afterwards, with the owner's go-ahead, and all were caught, the first
+  of them by one of the two new tests.
+- **Not verified:** the `local_data` and `network` tests were not run (nothing
+  they cover changed); the Debug configuration was not built; Linux is still
+  unbuilt.
+
+**Notes for the next phases:**
+
+- **Phase 5's allocation guard** can replace `qa_alloc_tests`' counting
+  `operator new`; the binary is kept apart so nothing else runs on it.
+- **Phase 6:** the handlers emit `InstrumentUpdate`s as the converter does
+  (criterion added). A handler must also deliver each message's events
+  contiguously: anything inside a message makes the book stale
+  (`IncompleteMessage`).
+- **Phase 9:** the stale-book check reads `OrderBook::is_stale()`; a stale
+  book shows no levels to price against.
+- **Kraken's checksum costs about 0.8 µs a message**, most of the time to
+  apply one (the divisions that turn mantissas into printed digits, and a
+  CRC byte by byte). The Kraken fixture has about 90 book messages a second
+  (13,782 in 150 s), so it is not worth optimizing yet.
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -1954,6 +2094,11 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       that does not fit the queue is dropped whole and the source gets a
       `StreamStale` (`QueueOverflow`) before anything else of it (tested
       with a stalled consumer).
+- [ ] *(Added in Phase 4b, ADR 0022.)* Handlers emit an `InstrumentUpdate`
+      for each metadata message of their instrument (Kraken's `instrument`
+      channel, Coinbase's product), at its record, before that record's
+      levels, as the converter does; a Kraken precision change reaches the
+      book there, and a test shows it.
 
 ### Phase 7: Deterministic replay engine
 
@@ -1978,6 +2123,10 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       `advance` only filters on receipt time. A one-hour replay at one
       decision a second, each reading a one-second book window, is measured
       and recorded as the baseline, and a budget is set from it.
+- [ ] *(Added in Phase 4b, ADR 0022: owner decision on ADR 0021's Review
+      item 7.)* `quantagent.marketevents.convert` handles trades (`Trade`
+      events on the stream source) before the replay engine needs them: it
+      is done before the engine's trade events are built or compared.
 
 ### Phase 7a: Recorder fidelity
 

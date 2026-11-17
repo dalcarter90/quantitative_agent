@@ -6,7 +6,9 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 namespace {
@@ -83,6 +85,25 @@ static_assert(static_cast<int>(qa::EventKind::StreamStale) == 4);
 static_assert(static_cast<int>(qa::EventKind::StreamReset) == 5);
 static_assert(static_cast<int>(qa::EventKind::SnapshotBegin) == 6);
 static_assert(static_cast<int>(qa::EventKind::SnapshotEnd) == 7);
+static_assert(static_cast<int>(qa::EventKind::InstrumentUpdate) == 8);  // ADR 0022
+static_assert(MarketEvent::kInstrumentUpdateFlags ==
+              (MarketEvent::kHasMono | MarketEvent::kEventTsFromReceipt));
+
+// An InstrumentUpdate carries a whole InstrumentMeta (ADR 0022), and packing
+// it is a constant expression.
+constexpr qa::InstrumentMeta kKraken{qa::InstrumentId(7u), 8, 8, 1, 8, qa::Price(10'000'000),
+                                     qa::Qty(1)};
+constexpr MarketEvent kKrakenUpdate = [] {
+  MarketEvent event{};
+  qa::set_instrument_meta(event, kKraken);
+  return event;
+}();
+static_assert(kKrakenUpdate.kind == qa::EventKind::InstrumentUpdate);
+static_assert(kKrakenUpdate.level_index == (8u | 8u << 8 | 1u << 16 | 8u << 24));
+static_assert(qa::instrument_meta(kKrakenUpdate).price_precision == 1);
+static_assert(!qa::is_stream_control(qa::EventKind::InstrumentUpdate));  // it carries values
+static_assert(qa::reason_fits(qa::EventKind::InstrumentUpdate, qa::StreamReason::NoReason));
+static_assert(!qa::reason_fits(qa::EventKind::InstrumentUpdate, qa::StreamReason::Connect));
 static_assert(sizeof(qa::StreamReason) == 1);
 static_assert(static_cast<int>(qa::StreamReason::NoReason) == 0);
 static_assert(static_cast<int>(qa::StreamReason::SequenceGap) == 1);
@@ -181,6 +202,57 @@ TEST(Events, AMarketEventCopiesByteForByte) {
   EXPECT_EQ(copy.price, qa::Price(734685));
   EXPECT_TRUE(copy.has(qa::MarketEvent::kHasChecksum));
   EXPECT_FALSE(copy.has(qa::MarketEvent::kHasVenueSeq));
+}
+
+TEST(Events, AnInstrumentUpdateCarriesEveryFieldOfInstrumentMeta) {
+  const qa::InstrumentMeta metas[] = {
+      kKraken,
+      {qa::InstrumentId(0xFFFF'FFFFu), 18, 0, 18, 0, qa::Price(std::numeric_limits<std::int64_t>::max()),
+       qa::Qty(std::numeric_limits<std::int64_t>::min())},
+      {qa::InstrumentId(3u), 2, 5, 1, 3, qa::Price(-1), qa::Qty(0)}};
+  for (const auto& meta : metas) {
+    MarketEvent event{};
+    event.seq = 41;
+    event.source = 2;
+    qa::set_instrument_meta(event, meta);
+    MarketEvent copy;
+    std::memcpy(&copy, &event, sizeof event);
+    const qa::InstrumentMeta back = qa::instrument_meta(copy);
+    EXPECT_EQ(std::memcmp(&back, &meta, sizeof meta), 0);
+    EXPECT_EQ(copy.price, meta.tick_size);
+    EXPECT_EQ(copy.qty, meta.lot_size);
+    EXPECT_EQ(copy.instrument, meta.id);
+    EXPECT_EQ((copy.seq), 41u);  // set_instrument_meta leaves the record's fields alone
+    EXPECT_EQ(copy.source, 2u);
+    EXPECT_TRUE(qa::scales_fit(back));
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&copy);
+    EXPECT_EQ(bytes[72], static_cast<unsigned char>(meta.price_exp));
+    EXPECT_EQ(bytes[75], static_cast<unsigned char>(meta.qty_precision));
+    EXPECT_EQ(bytes[82], 0u);  // no reserved byte is used
+    EXPECT_EQ(bytes[83], 0u);
+  }
+}
+
+TEST(Events, ScalesFitAsTheStoresSchemaAllows) {
+  EXPECT_TRUE(qa::scales_fit(kKraken));
+  qa::InstrumentMeta meta = kKraken;
+  meta.price_exp = 19;
+  EXPECT_FALSE(qa::scales_fit(meta));
+  meta = kKraken;
+  meta.qty_exp = -1;
+  EXPECT_FALSE(qa::scales_fit(meta));
+  meta = kKraken;
+  meta.price_precision = 9;  // above its exponent
+  EXPECT_FALSE(qa::scales_fit(meta));
+  meta = kKraken;
+  meta.qty_precision = -1;
+  EXPECT_FALSE(qa::scales_fit(meta));
+  meta = kKraken;
+  meta.price_exp = 0;
+  meta.price_precision = 0;
+  meta.qty_exp = 18;
+  meta.qty_precision = 18;
+  EXPECT_TRUE(qa::scales_fit(meta));
 }
 
 TEST(Events, FlagsAreDistinctBits) {

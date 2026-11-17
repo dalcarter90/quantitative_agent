@@ -1,18 +1,22 @@
 #include "qa/clock.hpp"
 #include "qa/events.hpp"
 #include "qa/notional.hpp"
+#include "qa/order_book.hpp"
 #include "qa/types.hpp"
 #include "qa/version.hpp"
 
 #include <pybind11/pybind11.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <type_traits>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -153,6 +157,28 @@ std::int8_t precision_from(py::handle value, std::int8_t exponent, const char* w
   return precision;
 }
 
+// ADR 0019, ADR 0022: the scales an InstrumentUpdate carries, as the store's
+// schema and the InstrumentMeta binding allow them.
+void require_scales(const qa::InstrumentMeta& meta, const char* whose) {
+  const auto exponent = [whose](std::int8_t value, const char* name) {
+    if (value < 0 || value > qa::kMaxExponent) {
+      throw py::value_error(std::string(whose) + " " + name + " " + std::to_string(value) +
+                            " is not an exponent: an exponent is 0 to 18");
+    }
+  };
+  const auto precision = [whose](std::int8_t value, std::int8_t of, const char* name) {
+    if (value < 0 || value > of) {
+      throw py::value_error(std::string(whose) + " " + name + " " + std::to_string(value) +
+                            " is not a precision of exponent " + std::to_string(of) +
+                            ": a precision is 0 to its exponent");
+    }
+  };
+  exponent(meta.price_exp, "price_exp");
+  exponent(meta.qty_exp, "qty_exp");
+  precision(meta.price_precision, meta.price_exp, "price_precision");
+  precision(meta.qty_precision, meta.qty_exp, "qty_precision");
+}
+
 // ADR 0020: what MarketEvent.from_bytes refuses beyond unknown enum values.
 void require_well_formed(const qa::MarketEvent& event) {
   if ((event.flags & ~qa::MarketEvent::kKnownFlags) != 0) {  // review D7
@@ -171,6 +197,28 @@ void require_well_formed(const qa::MarketEvent& event) {
     throw py::value_error(
         "a control event carries no price, quantity, side, trade id, checksum or depth");
   }
+  if (event.kind == qa::EventKind::InstrumentUpdate) {  // ADR 0022
+    require_scales(qa::instrument_meta(event), "an instrument update's");
+    if (event.side != qa::Side::Unknown || event.venue_seq != 0 || event.trade_id != 0 ||
+        event.checksum != 0 || event.depth != 0 ||
+        (event.flags & ~qa::MarketEvent::kInstrumentUpdateFlags) != 0) {
+      throw py::value_error(
+          "an instrument update carries no side, venue number, trade id, checksum or depth, "
+          "and no flag but HAS_MONO and EVENT_TS_FROM_RECEIPT");
+    }
+  }
+}
+
+template <class E>
+std::string enum_name(E value) {
+  return py::cast(value).attr("name").template cast<std::string>();
+}
+
+py::object level_or_none(const std::optional<qa::BookLevel>& level) {
+  if (!level) {
+    return py::none();
+  }
+  return py::make_tuple(level->price.mantissa(), level->qty.mantissa());
 }
 
 template <class Owner, class T>
@@ -226,7 +274,8 @@ PYBIND11_MODULE(_core, m) {
       .value("StreamStale", qa::EventKind::StreamStale)
       .value("StreamReset", qa::EventKind::StreamReset)
       .value("SnapshotBegin", qa::EventKind::SnapshotBegin)
-      .value("SnapshotEnd", qa::EventKind::SnapshotEnd);
+      .value("SnapshotEnd", qa::EventKind::SnapshotEnd)
+      .value("InstrumentUpdate", qa::EventKind::InstrumentUpdate);
   py::enum_<qa::StreamReason>(m, "StreamReason")
       .value("NoReason", qa::StreamReason::NoReason)
       .value("SequenceGap", qa::StreamReason::SequenceGap)
@@ -325,13 +374,35 @@ PYBIND11_MODULE(_core, m) {
       .def_static("from_bytes",
                   [](const py::bytes& raw) {
                     const auto value = from_bytes<MarketEvent>(raw);
-                    require_at_most(value.kind, qa::EventKind::SnapshotEnd, "kind");
+                    require_at_most(value.kind, qa::EventKind::InstrumentUpdate, "kind");
                     require_side(value.side);
                     require_at_most(value.reason, qa::StreamReason::Disconnect, "reason");
                     require_zero(value.reserved);
                     require_well_formed(value);
                     return value;
                   })
+      .def_static(
+          "instrument_update",
+          [](const qa::InstrumentMeta& meta) {
+            MarketEvent made{};
+            qa::set_instrument_meta(made, meta);
+            return made;
+          },
+          py::arg("meta"),
+          "An InstrumentUpdate carrying `meta` (ADR 0022); every other field is zero.")
+      .def(
+          "instrument_meta",
+          [](const MarketEvent& self) {
+            if (self.kind != qa::EventKind::InstrumentUpdate) {
+              throw py::value_error(
+                  "only an InstrumentUpdate carries instrument metadata, not kind " +
+                  std::to_string(static_cast<int>(self.kind)));
+            }
+            const qa::InstrumentMeta meta = qa::instrument_meta(self);
+            require_scales(meta, "the event's");
+            return meta;
+          },
+          "The InstrumentMeta an InstrumentUpdate carries (ADR 0022).")
       .def_static("size", [] { return sizeof(MarketEvent); })
       .def_static("layout", [] {
         return py::dict(py::arg("recv_ts") = py::make_tuple(offsetof(MarketEvent, recv_ts), 8),
@@ -454,6 +525,101 @@ PYBIND11_MODULE(_core, m) {
             py::make_tuple(offsetof(ExecutionReport, side), sizeof(ExecutionReport::side));
         return layout;
       });
+
+  // --- the order book (ADR 0022) ------------------------------------------------------------------
+  py::enum_<qa::BookCheck>(m, "BookCheck")
+      .value("KrakenChecksum", qa::BookCheck::KrakenChecksum)
+      .value("CoinbaseSequence", qa::BookCheck::CoinbaseSequence);
+  py::enum_<qa::StaleReason>(m, "StaleReason")
+      .value("NotStale", qa::StaleReason::NotStale)
+      .value("SequenceGap", qa::StaleReason::SequenceGap)
+      .value("SequenceRepeat", qa::StaleReason::SequenceRepeat)
+      .value("SequenceOutOfOrder", qa::StaleReason::SequenceOutOfOrder)
+      .value("ChecksumMismatch", qa::StaleReason::ChecksumMismatch)
+      .value("MessageRejected", qa::StaleReason::MessageRejected)
+      .value("DeltaBeforeSnapshot", qa::StaleReason::DeltaBeforeSnapshot)
+      .value("IncompleteMessage", qa::StaleReason::IncompleteMessage)
+      .value("CapacityExceeded", qa::StaleReason::CapacityExceeded)
+      .value("InvalidEvent", qa::StaleReason::InvalidEvent);
+  py::enum_<qa::BookEffect>(m, "BookEffect")
+      .value("Pending", qa::BookEffect::Pending)
+      .value("Applied", qa::BookEffect::Applied)
+      .value("Recovered", qa::BookEffect::Recovered)
+      .value("Skipped", qa::BookEffect::Skipped)
+      .value("WentStale", qa::BookEffect::WentStale)
+      .value("Reset", qa::BookEffect::Reset)
+      .value("Instrument", qa::BookEffect::Instrument)
+      .value("Ignored", qa::BookEffect::Ignored);
+  py::class_<qa::BookResult>(m, "BookResult", "What one event did to an OrderBook.")
+      .def_readonly("effect", &qa::BookResult::effect)
+      .def_readonly("reason", &qa::BookResult::reason)
+      .def("__eq__",
+           [](const qa::BookResult& self, py::handle other) -> py::object {
+             if (!py::isinstance<qa::BookResult>(other)) {
+               return not_implemented();
+             }
+             return py::bool_(self == other.cast<const qa::BookResult&>());
+           })
+      .def("__repr__", [](const qa::BookResult& self) {
+        return "BookResult(" + enum_name(self.effect) + ", " + enum_name(self.reason) + ")";
+      });
+
+  using qa::OrderBook;
+  py::class_<OrderBook> book(m, "OrderBook",
+                             "One instrument's L2 order book, given MarketEvents one at a time "
+                             "(ADR 0022). Prices and quantities are integer mantissas.");
+  book.def(py::init([](const qa::InstrumentMeta& instrument, qa::BookCheck check,
+                       py::handle capacity) {
+             return OrderBook(instrument, check, int_from<std::uint32_t>(capacity, "capacity"));
+           }),
+           py::arg("instrument"), py::arg("check"),
+           py::arg("capacity") = OrderBook::kDefaultCapacity)
+      .def("apply", &OrderBook::apply, py::arg("event"))
+      .def_property_readonly("is_stale", &OrderBook::is_stale)
+      .def_property_readonly("has_book", &OrderBook::has_book)
+      .def_property_readonly("stale_reason", &OrderBook::stale_reason)
+      .def_property_readonly("instrument",
+                             [](const OrderBook& self) { return self.instrument(); })
+      .def_property_readonly("check", &OrderBook::check)
+      .def_property_readonly("capacity", &OrderBook::capacity)
+      .def("stale_count", &OrderBook::stale_count, py::arg("reason"))
+      .def(
+          "top",
+          [](const OrderBook& self, qa::Side side, py::handle count) {
+            const auto wanted = int_from<std::uint32_t>(count, "count");
+            std::vector<qa::BookLevel> levels(std::min(wanted, self.size(side)));
+            const std::uint32_t found = self.top(side, levels);
+            py::list out;
+            for (std::uint32_t i = 0; i < found; ++i) {
+              out.append(py::make_tuple(levels[i].price.mantissa(), levels[i].qty.mantissa()));
+            }
+            return out;
+          },
+          py::arg("side"), py::arg("count"),
+          "The best `count` levels of one side, best first, as (price, quantity) mantissas.")
+      .def("best_bid", [](const OrderBook& self) { return level_or_none(self.best_bid()); })
+      .def("best_ask", [](const OrderBook& self) { return level_or_none(self.best_ask()); })
+      .def("size", &OrderBook::size, py::arg("side"))
+      .def(
+          "quantity_at",
+          [](const OrderBook& self, qa::Side side, py::handle price) -> py::object {
+            const auto qty =
+                self.quantity_at(side, qa::Price(int_from<std::int64_t>(price, "price")));
+            if (!qty) {
+              return py::none();
+            }
+            return py::int_(qty->mantissa());
+          },
+          py::arg("side"), py::arg("price"))
+      .def("checksum", &OrderBook::checksum)
+      .def_static(
+          "capacity_for_depth",
+          [](py::handle depth) {
+            return OrderBook::capacity_for_depth(int_from<std::uint16_t>(depth, "depth"));
+          },
+          py::arg("depth"));
+  book.attr("DEFAULT_CAPACITY") = OrderBook::kDefaultCapacity;
+  book.attr("MAX_CAPACITY") = OrderBook::kMaxCapacity;
 
   // --- clocks --------------------------------------------------------------------------------
   py::class_<qa::SystemClock>(m, "SystemClock")

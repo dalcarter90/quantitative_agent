@@ -74,7 +74,7 @@ thread.
 | Direction | Interface | Notes |
 |-----------|-----------|-------|
 | Python → C++ | `ReplayEngine(config).run(raw_log, strategy)` | Backtests. Runs the C++ core over a recorded log. `strategy` is called on decision-clock events (section 4.3). |
-| Python → C++ | `OrderBook`, `apply(event)`, `top(n)` | For verification against the Python reference reconstructor and for research. |
+| Python → C++ | `OrderBook(instrument, check, capacity)`, `apply(event)`, `top(side, n)`, `best_bid()`, `is_stale`, `stale_count(reason)` | For verification against the Python reference reconstructor and for research (ADR 0022). Prices and quantities come back as integer mantissas. |
 | Python → C++ | `Engine.submit_targets(TargetSet)` | Live/paper. Enqueues onto the control SPSC queue. Non-blocking. |
 | Python → C++ | `Engine.pause(scope, reason)`, `Engine.flatten(scope, reason)` | Risk-reducing commands only. There is no binding that raises a limit or resumes. |
 | C++ → Python | `Engine.snapshot()` | Positions, open orders, PnL, book tops, feature values, health counters. Read through a seqlock, never blocks the core. |
@@ -205,8 +205,11 @@ Tool calls only, listed exhaustively in section 8.
    order book: an update takes effect at its last level, a snapshot at its
    `SnapshotEnd`. Where the venue protects the book with a checksum instead of
    message numbers (Kraken), it is verified here, after the update, with the
-   instrument's precisions; a mismatch marks the book stale in the same way.
-   A stale book recovers at the next complete snapshot that passes the check.
+   precisions in force, which reach the book in the stream as
+   `InstrumentUpdate` events at the record where they change (ADR 0022); a
+   mismatch marks the book stale in the same way. A stale book recovers at the
+   next complete snapshot that passes the check. Each book's capacity is fixed
+   at startup; a level that does not fit marks it stale too.
 6. **Features.** Incremental features (order flow imbalance, spread,
    microprice, rolling volatility) update in place.
 7. **Order management.** The core compares current position and working
@@ -397,7 +400,8 @@ clock alone.
 layout, with no compiler padding (explicit zero `reserved` bytes), in the
 machine's byte order (little-endian on every supported platform).
 
-`MarketEvent`, 88 bytes, one per book level, trade or stream control event:
+`MarketEvent`, 88 bytes, one per book level, trade, stream control event or
+instrument update:
 
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
@@ -407,13 +411,13 @@ machine's byte order (little-endian on every supported platform).
 | 24 | 8 | `seq` | Raw record number: replay order within a log |
 | 32 | 8 | `venue_seq` | The venue's message number (flag `kHasVenueSeq`) |
 | 40 | 8 | `trade_id` | The venue's trade id, if numeric (flag `kHasTradeId`) |
-| 48 | 8 | `price` | Price mantissa |
-| 56 | 8 | `qty` | Quantity mantissa; 0 removes a book level |
+| 48 | 8 | `price` | Price mantissa; the tick size for `InstrumentUpdate` |
+| 56 | 8 | `qty` | Quantity mantissa; 0 removes a book level; the lot size for `InstrumentUpdate` |
 | 64 | 4 | `instrument` | `InstrumentId` |
 | 68 | 4 | `checksum` | The venue's book checksum after the message (flag `kHasChecksum`) |
-| 72 | 4 | `level_index` | Position of the level in its message; the level count for `SnapshotBegin` and `SnapshotEnd`; the stored stream event's `event_index` for `StreamStale` and `StreamReset` |
+| 72 | 4 | `level_index` | Position of the level in its message; the level count for `SnapshotBegin` and `SnapshotEnd`; the stored stream event's `event_index` for `StreamStale` and `StreamReset`; for `InstrumentUpdate` the four scales, a byte each from the lowest: `price_exp`, `qty_exp`, `price_precision`, `qty_precision` |
 | 76 | 2 | `depth` | Levels per side the venue keeps (flag `kHasDepth`) |
-| 78 | 1 | `kind` | `BookSnapshot = 0`, `BookDelta = 1`, `BookCheckSnapshot = 2` (as in the Python schema), `Trade = 3`; stream control (ADR 0020): `StreamStale = 4`, `StreamReset = 5`, `SnapshotBegin = 6`, `SnapshotEnd = 7` |
+| 78 | 1 | `kind` | `BookSnapshot = 0`, `BookDelta = 1`, `BookCheckSnapshot = 2` (as in the Python schema), `Trade = 3`; stream control (ADR 0020): `StreamStale = 4`, `StreamReset = 5`, `SnapshotBegin = 6`, `SnapshotEnd = 7`; `InstrumentUpdate = 8` (ADR 0022) |
 | 79 | 1 | `side` | `Side` |
 | 80 | 1 | `flags` | `kLastInMessage`, `kHasMono`, `kHasVenueSeq`, `kHasChecksum`, `kHasDepth`, `kHasTradeId`, `kEventTsFromReceipt` |
 | 81 | 1 | `reason` | `StreamReason`: for `StreamStale` `SequenceGap = 1`, `SequenceRepeat = 2`, `SequenceOutOfOrder = 3`, `ChecksumMismatch = 4`, `MessageRejected = 5`; for `StreamReset` `SessionStart = 6`, `Connect = 7`, `Disconnect = 8`; `NoReason = 0` for everything else |
@@ -433,20 +437,52 @@ Stream control (ADR 0020):
   with `kLastInMessage`) and `SnapshotEnd`, both frame events carrying n, with
   nothing between them; this applies to check snapshots too. An update takes
   effect at its `kLastInMessage` level, a snapshot at its `SnapshotEnd`.
+- **Instrument updates** (ADR 0022): an `InstrumentUpdate` carries one
+  version of the instrument's metadata, a whole `InstrumentMeta`, in fields
+  the kind has no other use for (above); `qa::set_instrument_meta` and
+  `qa::instrument_meta` pack and unpack it. It arrives at the record where
+  the version arrived, on the log's stream source, after that record's control
+  events and before its levels, so the book switches Kraken's checksum digits
+  at exactly that point. It is not a control event: it carries values. Its
+  `event_ts` is the version's (the receipt time, `kEventTsFromReceipt`, for
+  both venues) and it may carry only that flag and `kHasMono`.
 - `MarketEvent.from_bytes` refuses unknown kinds and reasons, a reason that
   does not fit its kind, a control event carrying a market value, a flag bit
-  outside `kKnownFlags`, and non-zero reserved bytes. The `InstrumentMeta`
-  binding refuses an exponent outside 0 to 18, and a precision outside 0 to
-  18 or above its exponent.
+  outside `kKnownFlags`, non-zero reserved bytes, and an `InstrumentUpdate`
+  whose scales the store could not hold or that carries a side, venue number,
+  trade id, checksum, depth or another flag. The `InstrumentMeta` binding
+  refuses an exponent outside 0 to 18, and a precision outside 0 to 18 or
+  above its exponent.
 - **From stored data:** `quantagent.marketevents.convert(book_events,
   stream_events, instruments, *, instrument, sources)` turns what a
   `PITSession` returns into these events, one group per step in the
-  reference book's order (message, check snapshot, stale, reset), with the
-  sources numbered by a `SourceMap` the caller can share (ADR 0021). It
-  refuses what an event cannot carry: a depth above 65,535, an exponent
-  outside 0 to 18 or not the instrument's fixed one, a message with no
-  metadata. The C++ book is driven with it in tests (Phase 4b), and the C++
-  feed handlers are compared with it (Phase 6).
+  reference book's order (message, check snapshot, stale, reset), plus one
+  `instrument` group per stored metadata version (ADR 0022), with the sources
+  numbered by a `SourceMap` the caller can share (ADR 0021). It refuses what
+  an event cannot carry: a depth above 65,535, an exponent outside 0 to 18 or
+  not the instrument's fixed one, a precision outside 0 to its exponent, a
+  message with no metadata. The C++ book is driven with it in tests (Phase
+  4b), and the C++ feed handlers are compared with it (Phase 6). It does not
+  convert trades yet; the replay engine needs them first (Phase 7).
+
+**Order book** (`qa/order_book.hpp`, `qa/book_side.hpp`; ADR 0022): one
+instrument's L2 book, built at startup from its `InstrumentMeta`, its venue's
+rule (`BookCheck::KrakenChecksum` or `CoinbaseSequence`) and a capacity per
+side (65,536 levels by default; `capacity_for_depth(d)`, twice the depth, for
+a venue that keeps a cut book). `apply(event)` takes one `MarketEvent` and
+returns a `BookResult` (a `BookEffect` and, when it went stale, a
+`StaleReason`); it never allocates, throws, locks or reads a clock. It follows
+the reference book's resume-mode rules (`docs/data-core-spec.md` section 11):
+an update takes effect at its last level, a snapshot at its frame's end, each
+then cut to its depth and checked; a stale book is emptied and takes no
+update, and only a complete stream snapshot that passes its check recovers
+it; a reset empties it. It goes stale with a `StaleReason`: 1 to 5 are the
+`StreamReason`s of the same number (from a `StreamStale` or its own check),
+and its own are `DeltaBeforeSnapshot` (64), `IncompleteMessage` (65, events
+missing or out of order), `CapacityExceeded` (66) and `InvalidEvent` (67), each
+counted (`stale_count`). Each side is a ring buffer of levels kept best first;
+the queries show nothing unless a snapshot has taken effect since the start,
+the last reset and the last failure (`has_book`).
 
 `OrderRequest`, 64 bytes (core to execution): `client_order_id` 0,
 `target_order_id` 8 (the order a cancel refers to), `price` 16, `qty` 24,
