@@ -2,7 +2,7 @@
 
 Status: Accepted (owner decisions, 2026-11-16); implementation choices awaiting the owner, see "Review". Restated in `docs/data-core-spec.md`
 Date: 2026-11-16
-Amends: 0005, 0008, 0010, 0011, 0015, 0016, 0018
+Amends: 0005, 0008, 0010, 0011, 0015, 0016, 0018 (its Review item 7, and its consequence on reading an incomplete load)
 
 ## Context
 
@@ -65,6 +65,12 @@ Asked while building it (2026-11-16), the owner also decided:
    the quantity exponent is fixed the same way as the price exponent.
 10. **The fixed exponents are an explicit table** (`adapters.FIXED_EXPONENTS`).
     Metadata for an instrument not in it is refused.
+11. **A log read from an incomplete load is visible in the quality report**
+    (added to this change on 2026-11-16). ADR 0018 reads a log with no
+    complete load from its latest incomplete load; every such log gets a
+    WARNING naming the log, the load, how many batches were committed and the
+    last receipt time read. A load that failed (an `InterleavedLogs`, a crash)
+    and one still being written are both reported.
 
 ## How it is built
 
@@ -159,6 +165,27 @@ Asked while building it (2026-11-16), the owner also decided:
   identical one is counted in the statistics (`repeated_across_logs`), not
   reported: both venues resend recent trades on every subscribe. Conflicts
   within one log are left to the normalizer's `TRADE_CONFLICT`.
+
+### Logs read from an incomplete load (decision 11)
+
+- `PITSession.loads()` returns a `LoadRead` per loaded log, in `log_id` order:
+  its `log_id`, the `load_id` read, whether that load is `complete` within the
+  session's version, and how many of its `batches` are committed within it. It
+  depends on the version alone, like the choice of load.
+- The quality check `loads` reports, for every log with rows received in the
+  range whose load is incomplete, `incomplete_load` (WARNING). The message
+  names the log, the load, the batches committed and the last receipt time
+  read (ns and UTC); the finding points at the last record read of the log, in
+  `seq` order, wherever it was received. Its statistics count the logs with
+  rows in the range and the incomplete ones.
+- The store cannot tell a load still being written from one whose writer
+  failed or died: both have committed batches and no last one. The finding
+  says it is one or the other.
+- A log read from a complete load is not reported, even while a reload of it
+  is in progress (that reload is not read). `ingest` writes a load as one
+  batch, so a failed or crashed ingest commits nothing and nothing of it is
+  read or reported; incomplete loads come from loaders that commit a log in
+  chunks (a live loader, or the `Load` API used by hand).
 
 ### The mutations (T1, T2)
 
@@ -271,6 +298,11 @@ data core is a new ADR plus an edit of the spec in the same change.
   verify Kraken's checksum; the roadmap says so.
 - **A quality report on an hour with many findings may now fail** where it
   passed before, if any finding was cut.
+- **ADR 0018's consequence "a session cannot tell such a log from one that
+  ended early, until the load completes"** no longer holds for the quality
+  report: `PITSession.loads()` says which logs are read from an incomplete
+  load, and the `loads` check reports each. Research code that wants to know
+  can ask the session too.
 - ADRs 0005 and 0008 to 0018 are marked superseded by the spec, 0006 in part.
 
 ## Review
@@ -327,3 +359,9 @@ Choices made while building it, for the owner to confirm:
     scripted Kraken sockets send an instrument snapshot first, and the
     recorder version they pin is 4. The golden files were regenerated (every
     price exactly the old one scaled, every other value unchanged).
+13. **Incomplete loads:** WARNING, as decided; the finding points at the
+    last record read (by `seq`) and names the greatest receipt time read, which
+    differ only if the wall clock stepped back; it is reported on every range
+    the log has rows in; `PITSession.loads()` is public. The session's public
+    surface in `test_session.py` and the checks run on the clean fixtures in
+    `test_quality.py` gain `loads`.

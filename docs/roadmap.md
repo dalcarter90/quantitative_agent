@@ -1531,6 +1531,10 @@ consolidates the data core's ADRs into one specification (ADR 0019).
       INFO or WARNING findings, and a truncated report exits nonzero.
 - [x] R08: a session's clock error is reported on every day the session spans.
 - [x] A quality check for trade conflicts between logs loaded in separate runs.
+- [x] Added by the owner during the PR: every log whose rows come from an
+      incomplete load is a WARNING in the quality report, naming the log, the
+      load, the batches committed and the last receipt time read; a load that
+      failed and one still being written are both reported.
 - [x] The three surviving mutations from the review get tests that catch them.
 - [x] Every open document/code disagreement the review lists is fixed.
 - [x] `docs/data-core-spec.md` written; ADRs 0005 and 0008 to 0018 marked
@@ -1562,6 +1566,8 @@ consolidates the data core's ADRs into one specification (ADR 0019).
   query split by severity, a truncated report exits 1; `recording_clock`
   finds sessions by the logs of the rows in the range; `stream_integrity`
   knows whether a log was connected before the range; `check_trade_observations`.
+- `session.py`: `PITSession.loads()` and `LoadRead`; `quality.py`:
+  `check_loads` (`incomplete_load`, WARNING).
 - `book.py`: `BookMessage` carries the metadata in force
   (`messages_from_table(table, instruments)`); Kraken verification uses it
   and refuses to run without it.
@@ -1573,8 +1579,18 @@ consolidates the data core's ADRs into one specification (ADR 0019).
 
 **Verified:**
 
-- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,526 Python tests, no
+- `scripts/check.ps1`: ALL GREEN, 17 C++ tests and 1,537 Python tests, no
   expected failures left (1,421 and 6 before this phase).
+- Incomplete loads (`test_incomplete_loads.py`, written first and seen failing):
+  a load still being written, over two and three batches, then finished; one
+  that failed on `InterleavedLogs` in its second batch; one whose writer died
+  with a batch written and not committed; a failed `ingest`, which commits
+  nothing; a complete load and a reload in progress, not reported;
+  `PITSession.loads()` at two versions; the finding in each range the log has
+  rows in and at an earlier `available_at`; the report (exit 0 at the default
+  `--fail-on`, 1 at `warning`). Breakage pass: 10 breakages, 9 caught; the
+  tenth (counting batches over every known batch instead of the chosen load's)
+  is equivalent, because batches are counted by the chosen load's id.
 - Tests written before the code, each seen failing first for its reason:
   `test_instruments.py` (fixed exponents and precisions, a Kraken precision
   change mid-session with its checksum, refused metadata, the schema, both
@@ -1632,7 +1648,7 @@ consolidates the data core's ADRs into one specification (ADR 0019).
   must carry them.
 - **A new instrument** needs an entry in `adapters.FIXED_EXPONENTS` before its
   logs load; recording it first is fine.
-- **ADR 0019's "Review" section** lists twelve choices made while building
+- **ADR 0019's "Review" section** lists thirteen choices made while building
   this, for the owner.
 - **Still open from the review:** D1 to D7 (D1 to D3 before Phase 4's code
   against `MarketEvent`), T3, and the minor notes other than the

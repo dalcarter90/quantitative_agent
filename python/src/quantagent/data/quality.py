@@ -986,6 +986,64 @@ def check_trade_observations(
     return scope.result()
 
 
+# --- logs read from an incomplete load ------------------------------------------------
+
+
+def _utc(nanoseconds: int) -> str:
+    seconds, rest = divmod(nanoseconds, _NS)
+    return f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%S}.{rest:09d}Z"
+
+
+def check_loads(
+    session: PITSession, venue: str, instrument: str, start: int, end: int, config: QualityConfig
+) -> CheckResult:
+    """Logs read from an incomplete load (ADR 0018; reported since ADR 0019).
+
+    A log with no complete load is read from its latest incomplete load: one
+    still being written, or one that failed or died before its last batch.
+    Either way the log may go on beyond what the session reads. Every such log
+    with rows received in the range is a WARNING (``incomplete_load``) naming
+    the log, the load, how many of its batches were committed and the last
+    receipt time read, and pointing at the last record read. A log read from a
+    complete load, even while a reload of it is in progress, is not reported.
+    """
+    scope = _Scope("loads", session, venue, instrument, start, end, config)
+    union = " UNION ALL ".join(f"SELECT log_id, seq, recv_ts FROM {view} WHERE {scope.where()}"
+                               for view in _DATA_VIEWS)  # fmt: skip
+    logs = [row["log_id"] for row in scope.rows(
+        f"SELECT DISTINCT log_id FROM ({union}) x ORDER BY log_id")]  # fmt: skip
+    incomplete = {read.log_id: read for read in session.loads() if not read.complete}
+    reported = [log_id for log_id in logs if log_id in incomplete]
+    if reported:
+        everywhere = " UNION ALL ".join(
+            f"SELECT log_id, seq, recv_ts FROM {view} WHERE venue = '{venue}' "
+            f"AND instrument = '{instrument}' AND log_id IN ({_quoted(reported)})"
+            for view in _DATA_VIEWS
+        )
+        # The last record read of each log (it is pointed at), and the latest
+        # receipt time read (it is named; the two differ only if the wall clock
+        # stepped back).
+        last = {row["log_id"]: row for row in scope.rows(
+            "SELECT log_id, max(seq) AS seq, arg_max(recv_ts, seq) AS recv_ts, "
+            f"max(recv_ts) AS latest FROM ({everywhere}) x GROUP BY log_id")}  # fmt: skip
+        for log_id in reported:
+            read, at = incomplete[log_id], last[log_id]
+            batches = f"{read.batches} batch{'es' if read.batches != 1 else ''}"
+            scope.add(
+                Severity.WARNING,
+                "incomplete_load",
+                "stream_events",
+                at,
+                f"log {log_id} is read from load {read.load_id}, which is incomplete: "
+                f"{batches} committed and no last batch, so the log may go on beyond what is "
+                "read (a load still being written, or one that failed or died before its "
+                f"last batch). Last receipt time read: {at['latest']} ({_utc(at['latest'])}) "
+                "(ADR 0018)",
+            )
+    scope.stats = {"logs": len(logs), "incomplete": len(reported)}
+    return scope.result()
+
+
 CHECKS: tuple[Check, ...] = (
     check_stream_integrity,
     check_independent_snapshots,
@@ -994,6 +1052,7 @@ CHECKS: tuple[Check, ...] = (
     check_crossed_books,
     check_outliers,
     check_trade_observations,
+    check_loads,
 )
 
 

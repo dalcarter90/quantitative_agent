@@ -103,7 +103,9 @@ python -m quantagent.data.quality --store data/normalized \
 
 Exit 0 clean, 1 on a finding at or above `--fail-on` or on any finding cut by
 `max_findings` (raise it in the config file), 2 if the store is refused. The
-checks and their thresholds are spec 10.
+checks and their thresholds are spec 10. An `incomplete_load` WARNING means a
+log is read from a load that has not completed: it is still being written, or
+its loader failed or died; finish it, or load the log again with `ingest`.
 
 ## 6. The reference book
 

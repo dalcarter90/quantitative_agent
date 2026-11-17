@@ -594,6 +594,7 @@ def test_public_surface_is_exactly_the_query_methods(history):
         "instrument",
         "instrument_for",  # ADR 0019
         "trade_observations",  # ADR 0019
+        "loads",  # ADR 0019: the load each log is read from
         "sql",
         "close",
     }

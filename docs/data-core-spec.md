@@ -470,6 +470,7 @@ with PITSession(root, available_at=t, version=None) as s:
     s.book_events(venue, instrument, start, end)
     s.stream_events(venue, instrument, start, end)
     s.trade_observations(venue, instrument, start, end)
+    s.loads()                                        # the load each log is read from
     s.instruments(venue, instrument)
     s.instrument(venue, instrument, at=u)            # in effect at time u (default t)
     s.instrument_for(venue, instrument, log_id=..., seq=...)   # in force for a row
@@ -514,6 +515,11 @@ replacements.
   `first_log_id`, `first_seq`, `first_recv_ts`, `first_price`, `first_qty`
   and `first_side`. It has no SQL view, so research counting trades reads
   `trades`.
+- **`loads()`** returns, per loaded log in `log_id` order, a `LoadRead`: the
+  `log_id`, the `load_id` read, whether it is `complete` within the version,
+  and how many of its `batches` are committed within it. A log with
+  `complete` false is read from an incomplete load and may go on beyond what
+  the session reads.
 - **`instruments`** returns every metadata version the session can see,
   ordered by `event_ts`, then `(log_id, seq)`.
 - **`instrument_for(..., log_id=, seq=)`** is the version a stored row was
@@ -618,11 +624,14 @@ YYYY-MM-DD [--venue V] [--instrument I] [--available-at NS] [--version NS]
 | `outliers` | Zero or negative trade price or quantity; zero or negative book price; negative book quantity | ERROR |
 | | `price_outlier` (more than `outlier_bps` from the lower median of the previous `outlier_window` trades in the range, in venue-time order, once `outlier_min_trades` precede it); `zero_quantity_in_snapshot` | WARNING |
 | `trade_observations` (every observation of a trade received in the range) | `trade_conflict_across_logs`: an observation from a log other than its trade's first observation's, with a different price, quantity or side, at the later observation | ERROR |
+| `loads` (every log with rows received in the range) | `incomplete_load`: the log is read from an incomplete load (still being written, or failed or died before its last batch). Names the log, the load, the batches committed and the last receipt time read; points at the last record read. Reported in every range the log has rows in; not for a log read from a complete load while a reload is in progress | WARNING |
 
 `trade_observations` counts identical observations in other logs
 (`repeated_across_logs`) without reporting them: both venues resend recent
 trades on every subscribe. Conflicts within one log are the normalizer's
-`TRADE_CONFLICT`.
+`TRADE_CONFLICT`. `ingest` writes a load as one batch, so a failed ingest
+commits nothing and is never an `incomplete_load`; that finding comes from
+loaders that commit a log in chunks.
 
 Thresholds are `QualityConfig`, loadable from a JSON object whose unknown
 names are an error: `min_lag_ns` −0.5 s, `max_lag_ns` 10 s, `max_backwards_ns`
@@ -721,7 +730,7 @@ everything received, latest version; exit 2 if the store is refused).
 | 0015 | Schema versions checked; conflicting trades are errors; uncompared sessions warn | 7, 8, 10 | Superseded |
 | 0016 | Identical repeats dropped; first observation kept | 7, 10 | Superseded |
 | 0017 | Two cutoffs, committed batches, receipt-time windows, replay cursor | 2, 8, 9 | Superseded |
-| 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9 | Superseded |
-| 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; this document | 2, 4, 7, 9, 10 | Restated here; its Review awaits the owner |
+| 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9, 10 | Superseded |
+| 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; its Review awaits the owner |
 
 ADRs 0001 to 0004 and 0007 are not about the data core.

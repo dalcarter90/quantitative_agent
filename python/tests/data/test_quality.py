@@ -27,6 +27,7 @@ from quantagent.data.quality import (
     check_clock_skew,
     check_crossed_books,
     check_independent_snapshots,
+    check_loads,
     check_outliers,
     check_recording_clock,
     check_stream_integrity,
@@ -54,7 +55,8 @@ ALL = (0, INT64_MAX)
 # the committed fixtures were recorded before the clock was measured, so it
 # reports that on them (and should).
 CHECKS = [check_stream_integrity, check_independent_snapshots, check_clock_skew,
-          check_crossed_books, check_outliers, check_trade_observations]  # fmt: skip
+          check_crossed_books, check_outliers, check_trade_observations,
+          check_loads]  # fmt: skip
 TRADES = ("trades", "kraken", INSTRUMENT)
 BOOK = ("book_events", "kraken", INSTRUMENT)
 EVENTS = ("stream_events", "kraken", INSTRUMENT)

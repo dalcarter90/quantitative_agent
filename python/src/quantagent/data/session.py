@@ -65,6 +65,7 @@ reads. A store written by another version of the code is refused with a
 import inspect
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -99,6 +100,7 @@ from quantagent.data.store import (
 
 __all__ = [
     "InstrumentMeta",
+    "LoadRead",
     "PITSession",
     "QueryError",
     "QueryRejected",
@@ -194,6 +196,23 @@ class _CommittedBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadRead:
+    """The load a session reads one log from (ADR 0018).
+
+    ``complete`` is false when the log has no complete load within the
+    session's version, so it is read from its latest incomplete load: one
+    still being written, or one that failed or died before its last batch.
+    The log may then go on beyond what the session reads. ``batches`` is how
+    many of the load's batches are committed within the version.
+    """
+
+    log_id: str
+    load_id: int
+    complete: bool
+    batches: int
+
+
+@dataclass(frozen=True, slots=True)
 class _Selection:
     """What a session at one version reads."""
 
@@ -202,6 +221,7 @@ class _Selection:
     # of these logs is read from its load.
     outside_loads: tuple[int, ...]  # knowledge times of the batches outside a load
     loaded_logs: tuple[str, ...]
+    loads: tuple[LoadRead, ...] = ()  # one per loaded log, in log order
 
 
 def _load_of(where: str, knowledge_ts: int, content: dict) -> _LoadOf | None:
@@ -259,10 +279,15 @@ def _select(batches: list[_CommittedBatch], version: int, horizon_day: int) -> _
     chosen = {log_id: complete.get(log_id, latest) for log_id, latest in started.items()}
     read = set(chosen.values())
     kept = [b for b in known if b.load is None or b.load.load_id in read]
+    batches = Counter(b.load.load_id for b in kept if b.load is not None)
     return _Selection(
         files=tuple(f for b in kept for f in b.files if f.day <= horizon_day),
         outside_loads=tuple(sorted(b.knowledge_ts for b in kept if b.load is None)),
         loaded_logs=tuple(sorted(chosen)),
+        loads=tuple(
+            LoadRead(log_id, load_id, complete.get(log_id) == load_id, batches[load_id])
+            for log_id, load_id in sorted(chosen.items())
+        ),
     )
 
 
@@ -551,6 +576,7 @@ def _open(
 
     object.__setattr__(session, "_available_at", available_at)
     object.__setattr__(session, "_version", version)
+    object.__setattr__(session, "_loads", selection.loads)
     object.__setattr__(session, "_con", con)
     object.__setattr__(session, "_redactions", (root_path.as_posix(), str(root_path)))
     return selection
@@ -565,7 +591,7 @@ class PITSession:
     moves through time uses a ``ReplayCursor``.
     """
 
-    __slots__ = ("_available_at", "_version", "_con", "_redactions")
+    __slots__ = ("_available_at", "_version", "_loads", "_con", "_redactions")
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "PITSession":
         if "as_of" in kwargs:
@@ -586,6 +612,14 @@ class PITSession:
     def version(self) -> int:
         """The knowledge cutoff in force: the committed batch this session reads up to."""
         return self._version
+
+    def loads(self) -> tuple[LoadRead, ...]:
+        """The load each loaded log is read from, at this session's version, in
+        ``log_id`` order (ADR 0018). A ``LoadRead`` with ``complete`` false is a
+        log read from an incomplete load, which the ``loads`` quality check
+        reports (ADR 0019). It depends on the version alone, not on
+        ``available_at``."""
+        return self._loads
 
     def trades(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
         """Trades received in ``start <= recv_ts < end``, latest known version of each.
