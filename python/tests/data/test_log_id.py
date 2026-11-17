@@ -173,7 +173,9 @@ def test_two_logs_with_the_same_trade_keep_one_row(tmp_path):
     assert [(r["log_id"], r["seq"], r["trade_id"]) for r in rows] == [(a, 0, "t1")]
 
 
-def test_normalizing_a_log_again_keeps_its_id_so_rows_are_corrections(tmp_path):
+def test_loading_a_log_again_unchanged_keeps_one_log_id_and_adds_no_rows(tmp_path):
+    """An identical reload. A reload that changes rows is tested in test_loads.py
+    (review T3: this test's old name promised that)."""
     path = fixture_path("kraken")
     store = AppendOnlyStore(tmp_path / "store")
     ingest(path, store)
