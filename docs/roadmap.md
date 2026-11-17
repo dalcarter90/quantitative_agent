@@ -1635,9 +1635,22 @@ consolidates the data core's ADRs into one specification (ADR 0019).
   earliest returns the session's version (128 ms and 192 ms on this store, as
   it reads all four views); `instrument_for` takes 6 ms.
 - Loading took 15.8 s and 28.6 s (14.9 s and 28.3 s in Phase 3f).
-- Not verified: the recorder against the venues (the `network` tests were not
-  run), so Kraken's live instrument snapshot arriving before the book and
-  trade subscriptions is tested only with scripted sockets.
+- **Against the venues (2026-11-17, before merging):** the `network` tests
+  passed (3: a real NTP measurement and a 6-second capture from each venue).
+  Then 60 seconds of each venue with recorder version 4, probes every 20 s,
+  into a scratch directory (not kept), loaded into a scratch store:
+  - Kraken's log has the instrument snapshot at seq 6, the book and trade
+    subscriptions at seq 7 and 8, and its first market message (a trade) at
+    seq 11: the snapshot precedes every book and trade message.
+  - Both loaded with no rejects, no sequence anomaly and no checksum mismatch
+    (Kraken 9,170 book rows, 123 trades; Coinbase 129,754 and 937).
+  - `book verify` passed on both: 2 of 2 check snapshots match on each (Kraken
+    2 exact; Coinbase 1 exact, 1 between batches), never crossed.
+  - The quality report exits 0 with one INFO finding (that Coinbase snapshot,
+    between batches). `loads` and `trade_observations` find nothing; the
+    clock was measured at +70 and +71 ms. Median lag was 0.154 s on Kraken and
+    0.599 s on Coinbase, well above the ~95 ms of the earlier synchronized
+    recordings; inside the band, not explained by this data.
 
 **Notes for the next phases:**
 
@@ -1649,7 +1662,7 @@ consolidates the data core's ADRs into one specification (ADR 0019).
 - **A new instrument** needs an entry in `adapters.FIXED_EXPONENTS` before its
   logs load; recording it first is fine.
 - **ADR 0019's "Review" section** lists thirteen choices made while building
-  this, for the owner.
+  this; the owner confirmed all thirteen on 2026-11-16.
 - **Still open from the review:** D1 to D7 (D1 to D3 before Phase 4's code
   against `MarketEvent`), T3, and the minor notes other than the
   duplicate-column one.

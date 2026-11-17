@@ -1,6 +1,6 @@
 # 0019: Fixed exponents, metadata in effect from a session's first row, limits per severity, and the data core spec
 
-Status: Accepted (owner decisions, 2026-11-16); implementation choices awaiting the owner, see "Review". Restated in `docs/data-core-spec.md`
+Status: Accepted (owner decisions, 2026-11-16; implementation choices confirmed by the owner 2026-11-16, see "Review"). Restated in `docs/data-core-spec.md`
 Date: 2026-11-16
 Amends: 0005, 0008, 0010, 0011, 0015, 0016, 0018 (its Review item 7, and its consequence on reading an incomplete load)
 
@@ -307,7 +307,7 @@ data core is a new ADR plus an edit of the spec in the same change.
 
 ## Review
 
-Choices made while building it, for the owner to confirm:
+Choices made while building it. **Confirmed by the owner, 2026-11-16: all thirteen, as written**, after the network tests and a 60-second recording of each venue with recorder version 4 (roadmap, Phase 3g):
 
 1. **The time lookup:** a log's first version is in effect from the log's
    first row, over all four views, counting trades as the session shows them

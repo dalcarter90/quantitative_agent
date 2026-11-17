@@ -731,6 +731,6 @@ everything received, latest version; exit 2 if the store is refused).
 | 0016 | Identical repeats dropped; first observation kept | 7, 10 | Superseded |
 | 0017 | Two cutoffs, committed batches, receipt-time windows, replay cursor | 2, 8, 9 | Superseded |
 | 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9, 10 | Superseded |
-| 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; its Review awaits the owner |
+| 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; implementation choices confirmed |
 
 ADRs 0001 to 0004 and 0007 are not about the data core.
