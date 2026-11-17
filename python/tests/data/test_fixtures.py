@@ -396,7 +396,7 @@ def canonical(table_rows, drop=("knowledge_ts",)):
     )
 
 
-@pytest.mark.parametrize("venue", VENUES)
+@pytest.mark.parametrize("venue", ["kraken", pytest.param("coinbase", marks=pytest.mark.slow)])
 def test_fixture_through_adapter_and_store_reads_back_identically(venue, tmp_path):
     path = fixture_path(venue)
     expected = normalize(read_raw_log(path))

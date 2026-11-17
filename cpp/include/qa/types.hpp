@@ -107,10 +107,16 @@ enum class Side : std::int8_t { Sell = -1, Unknown = 0, Buy = 1 };
 }
 
 // An instrument's representation, as in the store's `instruments` dataset.
+// The exponents are fixed per instrument; the precisions are the decimals the
+// venue prints, which can change, and are never above the exponents (ADR
+// 0019). Kraken's checksum is over the printed digits: a mantissa divided by
+// 10^(exp - precision). 24 bytes; the precisions fill what was padding.
 struct InstrumentMeta {
   InstrumentId id;
   std::int8_t price_exp = 0;
   std::int8_t qty_exp = 0;
+  std::int8_t price_precision = 0;
+  std::int8_t qty_precision = 0;
   Price tick_size;  // mantissa at price_exp
   Qty lot_size;     // mantissa at qty_exp
 };

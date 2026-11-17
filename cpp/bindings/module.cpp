@@ -132,6 +132,33 @@ void require_at_most(E value, E last, const char* what) {
   }
 }
 
+// ADR 0019: a precision is 0 to 18 and never above its exponent, as in the
+// store's schema.
+std::int8_t precision_from(py::handle value, std::int8_t exponent, const char* what) {
+  const auto precision = int_from<std::int8_t>(value, what);
+  if (precision < 0 || precision > 18 || precision > exponent) {
+    throw py::value_error(std::string(what) + " " + std::to_string(precision) +
+                          " must be 0 to 18 and at most its exponent " + std::to_string(exponent));
+  }
+  return precision;
+}
+
+// ADR 0020: what MarketEvent.from_bytes refuses beyond unknown enum values.
+void require_well_formed(const qa::MarketEvent& event) {
+  if (!qa::reason_fits(event.kind, event.reason)) {
+    throw py::value_error("reason " + std::to_string(static_cast<int>(event.reason)) +
+                          " does not fit kind " + std::to_string(static_cast<int>(event.kind)) +
+                          ": a stale or reset event needs its own kind of reason, and nothing "
+                          "else has one");
+  }
+  if (qa::is_stream_control(event.kind) &&
+      (event.price != qa::Price{} || event.qty != qa::Qty{} || event.side != qa::Side::Unknown ||
+       event.trade_id != 0 || event.checksum != 0 || event.depth != 0)) {
+    throw py::value_error(
+        "a control event carries no price, quantity, side, trade id, checksum or depth");
+  }
+}
+
 template <class Owner, class T>
 void int_property(py::class_<Owner>& cls, const char* name, T Owner::*member) {
   cls.def_property(
@@ -181,7 +208,21 @@ PYBIND11_MODULE(_core, m) {
       .value("BookSnapshot", qa::EventKind::BookSnapshot)
       .value("BookDelta", qa::EventKind::BookDelta)
       .value("BookCheckSnapshot", qa::EventKind::BookCheckSnapshot)
-      .value("Trade", qa::EventKind::Trade);
+      .value("Trade", qa::EventKind::Trade)
+      .value("StreamStale", qa::EventKind::StreamStale)
+      .value("StreamReset", qa::EventKind::StreamReset)
+      .value("SnapshotBegin", qa::EventKind::SnapshotBegin)
+      .value("SnapshotEnd", qa::EventKind::SnapshotEnd);
+  py::enum_<qa::StreamReason>(m, "StreamReason")
+      .value("NoReason", qa::StreamReason::NoReason)
+      .value("SequenceGap", qa::StreamReason::SequenceGap)
+      .value("SequenceRepeat", qa::StreamReason::SequenceRepeat)
+      .value("SequenceOutOfOrder", qa::StreamReason::SequenceOutOfOrder)
+      .value("ChecksumMismatch", qa::StreamReason::ChecksumMismatch)
+      .value("MessageRejected", qa::StreamReason::MessageRejected)
+      .value("SessionStart", qa::StreamReason::SessionStart)
+      .value("Connect", qa::StreamReason::Connect)
+      .value("Disconnect", qa::StreamReason::Disconnect);
   py::enum_<qa::RequestKind>(m, "RequestKind")
       .value("New", qa::RequestKind::New)
       .value("Cancel", qa::RequestKind::Cancel);
@@ -201,16 +242,26 @@ PYBIND11_MODULE(_core, m) {
 
   py::class_<qa::InstrumentMeta>(m, "InstrumentMeta")
       .def(py::init([](qa::InstrumentId id, py::handle price_exp, py::handle qty_exp,
-                       qa::Price tick_size, qa::Qty lot_size) {
-             return qa::InstrumentMeta{id, int_from<std::int8_t>(price_exp, "price_exp"),
-                                       int_from<std::int8_t>(qty_exp, "qty_exp"), tick_size,
-                                       lot_size};
+                       py::handle price_precision, py::handle qty_precision, qa::Price tick_size,
+                       qa::Qty lot_size) {
+             const auto price_exponent = int_from<std::int8_t>(price_exp, "price_exp");
+             const auto qty_exponent = int_from<std::int8_t>(qty_exp, "qty_exp");
+             return qa::InstrumentMeta{
+                 id,
+                 price_exponent,
+                 qty_exponent,
+                 precision_from(price_precision, price_exponent, "price_precision"),
+                 precision_from(qty_precision, qty_exponent, "qty_precision"),
+                 tick_size,
+                 lot_size};
            }),
-           py::arg("id"), py::arg("price_exp"), py::arg("qty_exp"), py::arg("tick_size"),
-           py::arg("lot_size"))
+           py::arg("id"), py::arg("price_exp"), py::arg("qty_exp"), py::arg("price_precision"),
+           py::arg("qty_precision"), py::arg("tick_size"), py::arg("lot_size"))
       .def_readonly("id", &qa::InstrumentMeta::id)
       .def_readonly("price_exp", &qa::InstrumentMeta::price_exp)
       .def_readonly("qty_exp", &qa::InstrumentMeta::qty_exp)
+      .def_readonly("price_precision", &qa::InstrumentMeta::price_precision)
+      .def_readonly("qty_precision", &qa::InstrumentMeta::qty_precision)
       .def_readonly("tick_size", &qa::InstrumentMeta::tick_size)
       .def_readonly("lot_size", &qa::InstrumentMeta::lot_size);
 
@@ -225,7 +276,8 @@ PYBIND11_MODULE(_core, m) {
 
   // --- messages ------------------------------------------------------------------------
   using qa::MarketEvent;
-  py::class_<MarketEvent> event(m, "MarketEvent", "One book level or trade (88 bytes).");
+  py::class_<MarketEvent> event(
+      m, "MarketEvent", "One book level, trade or stream control event (88 bytes, ADR 0020).");
   event.def(py::init<>())
       .def_readwrite("recv_ts", &MarketEvent::recv_ts)
       .def_readwrite("recv_mono", &MarketEvent::recv_mono)
@@ -235,6 +287,7 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("instrument", &MarketEvent::instrument)
       .def_readwrite("kind", &MarketEvent::kind)
       .def_readwrite("side", &MarketEvent::side)
+      .def_readwrite("reason", &MarketEvent::reason)
       .def("has", [](const MarketEvent& self, py::handle flag) {
         return self.has(int_from<std::uint8_t>(flag, "flag"));
       });
@@ -245,6 +298,7 @@ PYBIND11_MODULE(_core, m) {
   int_property(event, "level_index", &MarketEvent::level_index);
   int_property(event, "depth", &MarketEvent::depth);
   int_property(event, "flags", &MarketEvent::flags);
+  int_property(event, "source", &MarketEvent::source);
   event.attr("LAST_IN_MESSAGE") = MarketEvent::kLastInMessage;
   event.attr("HAS_MONO") = MarketEvent::kHasMono;
   event.attr("HAS_VENUE_SEQ") = MarketEvent::kHasVenueSeq;
@@ -256,9 +310,11 @@ PYBIND11_MODULE(_core, m) {
       .def_static("from_bytes",
                   [](const py::bytes& raw) {
                     const auto value = from_bytes<MarketEvent>(raw);
-                    require_at_most(value.kind, qa::EventKind::Trade, "kind");
+                    require_at_most(value.kind, qa::EventKind::SnapshotEnd, "kind");
                     require_side(value.side);
+                    require_at_most(value.reason, qa::StreamReason::Disconnect, "reason");
                     require_zero(value.reserved);
+                    require_well_formed(value);
                     return value;
                   })
       .def_static("size", [] { return sizeof(MarketEvent); })
@@ -286,7 +342,11 @@ PYBIND11_MODULE(_core, m) {
                         py::arg("side") = py::make_tuple(offsetof(MarketEvent, side),
                                                          sizeof(MarketEvent::side)),
                         py::arg("flags") = py::make_tuple(offsetof(MarketEvent, flags),
-                                                          sizeof(MarketEvent::flags)));
+                                                          sizeof(MarketEvent::flags)),
+                        py::arg("reason") = py::make_tuple(offsetof(MarketEvent, reason),
+                                                           sizeof(MarketEvent::reason)),
+                        py::arg("source") = py::make_tuple(offsetof(MarketEvent, source),
+                                                           sizeof(MarketEvent::source)));
       });
 
   using qa::OrderRequest;

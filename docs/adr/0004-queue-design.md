@@ -1,6 +1,6 @@
 # 0004: In-house bounded SPSC ring buffer
 
-Status: Accepted
+Status: Accepted, amended by 0020 (the full-queue policy for market data, for messages of many events: whole messages only, capacity from the largest snapshot, resyncs gated on room)
 Date: 2026-11-10
 
 ## Context

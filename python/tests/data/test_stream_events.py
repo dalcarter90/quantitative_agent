@@ -523,6 +523,7 @@ def test_a_lost_coinbase_message_is_found_as_one_gap_at_the_next_message(tmp_pat
     assert gaps[0]["connection"] == "ws"
 
 
+@pytest.mark.slow
 def test_a_lost_kraken_book_update_is_found_by_the_checksum(tmp_path):
     records = list(read_raw_log(fixture_path("kraken")))
     updates = [
@@ -581,7 +582,7 @@ def test_a_corrupted_kraken_checksum_is_reported_at_that_exact_record(tmp_path):
 # --- stored and read like every other dataset -----------------------------------------------
 
 
-@pytest.mark.parametrize("venue", VENUES)
+@pytest.mark.parametrize("venue", ["kraken", pytest.param("coinbase", marks=pytest.mark.slow)])
 def test_stream_events_go_through_the_store_and_come_back_through_pitsession(venue, tmp_path):
     expected = events_of(normalize(read_raw_log(fixture_path(venue))), venue)
     store = AppendOnlyStore(tmp_path / "store")

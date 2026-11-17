@@ -509,6 +509,7 @@ def test_r08_a_bad_recording_clock_is_reported_for_every_day_the_session_covers(
 # loss, replaying it raises.
 
 
+@pytest.mark.slow
 def test_r09_the_same_window_for_book_rows_and_events_still_finds_a_lost_message(tmp_path):
     records = records_of("coinbase")
     updates = stream_book_updates(records)

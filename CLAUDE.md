@@ -94,6 +94,25 @@ If a task seems to require breaking one of these, stop and ask the owner.
 - **Do not build ahead.** Implement only the current phase. No placeholder
   directories or stub classes for future phases.
 
+## Working efficiently
+
+- **While working, run only the tests for the code you are changing** (one
+  test file, or `-k`), usually with `--skip-slow`. Run the full
+  `scripts/check.ps1` once at the end, and again only if something changed
+  after that run. A phase is still done only when that final run prints
+  `ALL GREEN`.
+- **Breakage passes** (deliberate mutations of the code, to show the tests
+  catch them) are for changes to the store, the session, the reference book
+  or risk code. Not for documentation or test-only changes.
+- **Mark a test slower than about 5 s** with `@pytest.mark.slow` (or
+  `pytest.param(..., marks=pytest.mark.slow)` for one slow case of a
+  parametrized test). `check.ps1` runs every test, slow ones included;
+  `--skip-slow` leaves them out of a day-to-day run without changing what
+  else is excluded. A run without `--skip-slow` lists any unmarked test whose
+  call took longer, so the marks stay true. The setup of a fixture shared by
+  a module is not one test's cost: mark the tests only if every user of the
+  fixture is slow.
+
 ## One-time setup (Windows)
 
 Needed once per machine:
@@ -149,6 +168,9 @@ cd ..
 .venv\Scripts\python -m ruff check python
 .venv\Scripts\python -m ruff format python
 
+# Day to day: leave out tests marked slow (check.ps1 still runs them)
+.venv\Scripts\python -m pytest python --skip-slow
+
 # Tests that talk to the venues are excluded by default. To run them:
 .venv\Scripts\python -m pytest python -m network
 
@@ -157,6 +179,7 @@ cd ..
 .venv\Scripts\python -m quantagent.data.adapters data\raw\kraken\BTC-USD\<file>.qaraw.zst --store data\normalized
 
 # Rebuild an order book from the store and verify it against the venue's rules
+# (add --resume to report every stale period and recovery instead of stopping, ADR 0020)
 .venv\Scripts\python -m quantagent.data.book verify --store data\normalized --venue kraken --instrument BTC-USD
 
 # Tests over the one-hour recordings in data\raw (not in git; excluded by default)
@@ -244,7 +267,10 @@ and `.env` are git-ignored.
   components also get a benchmark in `cpp/bench/`; record baseline numbers in
   the PR.
 - Tests must be deterministic: no sleeps for synchronization, no network, no
-  wall-clock assertions.
+  wall-clock assertions. The one exception is a test of `SystemClock`
+  itself, which may compare its reading with the system clock read just
+  before and after (owner-approved, ADR 0020): that is the only way to show
+  it reads the right clocks. Nothing else may.
 
 ## Python conventions
 

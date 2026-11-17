@@ -20,6 +20,7 @@ an oracle computed in plain Python:
 import tempfile
 from pathlib import Path
 
+import pytest
 from _builders import LOG
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -191,6 +192,7 @@ def _versions(history, fraction):
     return committed, None if fraction is None else int(latest * fraction)
 
 
+@pytest.mark.slow
 @settings(max_examples=80, deadline=None)
 @given(
     spec=st.lists(steps(), min_size=1, max_size=7),
@@ -210,6 +212,7 @@ def test_a_session_reads_each_log_from_its_latest_complete_load(
             _check_session(session, expected, available_at, session.version, committed, window)
 
 
+@pytest.mark.slow
 @settings(max_examples=30, deadline=None)
 @given(
     spec=st.lists(steps(), min_size=1, max_size=6),

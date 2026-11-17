@@ -9,7 +9,7 @@
 // layouts are fixed by static_asserts in cpp/tests/test_events.cpp and
 // documented in docs/architecture.md section 6.3; change all three together.
 //
-// MarketEvent, 88 bytes, one per book level or trade:
+// MarketEvent, 88 bytes, one per book level, trade, or stream control event:
 //
 //   offset size field        meaning
 //        0    8 recv_ts      wall-clock receive time (Timestamp)
@@ -22,12 +22,27 @@
 //       56    8 qty          Qty mantissa; 0 removes a book level
 //       64    4 instrument   InstrumentId
 //       68    4 checksum     the venue's book checksum after the message; kHasChecksum
-//       72    4 level_index  position of this level in its message
+//       72    4 level_index  position of this level in its message; for SnapshotBegin
+//                            and SnapshotEnd the number of levels; for StreamStale and
+//                            StreamReset the stored stream event's event_index
 //       76    2 depth        levels per side the venue keeps; kHasDepth
 //       78    1 kind         EventKind
 //       79    1 side         Side
 //       80    1 flags        the k* bits below
-//       81    7 reserved     zero
+//       81    1 reason       StreamReason: why a StreamStale or StreamReset (ADR 0020)
+//       82    2 reserved     zero
+//       84    4 source       the stream the event belongs to (ADR 0020)
+//
+// A source is one connection of one raw log: (log_id, "ws") or (log_id,
+// "probe"). The harness (or a feed handler) numbers them and keeps the mapping
+// outside the event. (source, seq) names the raw record; events of one record
+// are contiguous, its control events before its levels.
+//
+// When a book message takes effect: an update's levels together, at the level
+// flagged kLastInMessage; a snapshot's at its SnapshotEnd. A snapshot is
+// SnapshotBegin, its levels (level_index 0 to n-1, the last flagged
+// kLastInMessage), then SnapshotEnd, all with one source and seq and nothing
+// else between them.
 
 #include "qa/types.hpp"
 
@@ -37,11 +52,52 @@ namespace qa {
 
 // The book kinds use the same numbers as the Python schema's BookEventKind.
 enum class EventKind : std::uint8_t {
-  BookSnapshot = 0,
-  BookDelta = 1,
-  BookCheckSnapshot = 2,
+  BookSnapshot = 0,       // a level of a snapshot of the stream's book
+  BookDelta = 1,          // a level of an update; qty 0 removes the level
+  BookCheckSnapshot = 2,  // a level of an independent snapshot (probe), not the stream
   Trade = 3,
+  // Stream control and framing (ADR 0020). They carry no price, quantity, side,
+  // trade id, checksum or depth.
+  StreamStale = 4,    // the source's book cannot be trusted until its next snapshot
+  StreamReset = 5,    // a new session or connection: the book is gone until a snapshot
+  SnapshotBegin = 6,  // a snapshot's levels follow; level_index is how many
+  SnapshotEnd = 7,    // they are complete; level_index is how many
 };
+
+// Why a StreamStale (1 to 5) or a StreamReset (6 to 8). Each is a stored stream
+// event kind (docs/data-core-spec.md section 6); the Python reference book
+// names them in snake case (book.STALE_REASONS, book.RESET_REASONS).
+enum class StreamReason : std::uint8_t {
+  NoReason = 0,
+  SequenceGap = 1,
+  SequenceRepeat = 2,
+  SequenceOutOfOrder = 3,
+  ChecksumMismatch = 4,
+  MessageRejected = 5,
+  SessionStart = 6,
+  Connect = 7,
+  Disconnect = 8,
+};
+
+[[nodiscard]] constexpr bool is_stream_control(EventKind kind) noexcept {
+  return kind == EventKind::StreamStale || kind == EventKind::StreamReset ||
+         kind == EventKind::SnapshotBegin || kind == EventKind::SnapshotEnd;
+}
+
+// A StreamStale says why with a stale reason, a StreamReset with a reset
+// reason; every other kind has none.
+[[nodiscard]] constexpr bool reason_fits(EventKind kind, StreamReason reason) noexcept {
+  const auto value = static_cast<unsigned>(reason);
+  if (kind == EventKind::StreamStale) {
+    return value >= static_cast<unsigned>(StreamReason::SequenceGap) &&
+           value <= static_cast<unsigned>(StreamReason::MessageRejected);
+  }
+  if (kind == EventKind::StreamReset) {
+    return value >= static_cast<unsigned>(StreamReason::SessionStart) &&
+           value <= static_cast<unsigned>(StreamReason::Disconnect);
+  }
+  return reason == StreamReason::NoReason;
+}
 
 struct MarketEvent {
   static constexpr std::uint8_t kLastInMessage = 1u << 0;  // the message's last level
@@ -67,7 +123,9 @@ struct MarketEvent {
   EventKind kind = EventKind::BookSnapshot;
   Side side = Side::Unknown;
   std::uint8_t flags = 0;
-  std::uint8_t reserved[7] = {};
+  StreamReason reason = StreamReason::NoReason;
+  std::uint8_t reserved[2] = {};
+  std::uint32_t source = 0;
 
   [[nodiscard]] constexpr bool has(std::uint8_t flag) const noexcept {
     return (flags & flag) != 0;

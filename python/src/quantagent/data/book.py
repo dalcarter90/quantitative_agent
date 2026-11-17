@@ -2,12 +2,23 @@
 
 A simple, deliberately unoptimized L2 book that serves as the oracle for the
 C++ order book (Phase 4). It rebuilds each venue's book from the stored book
-events, enforces that venue's integrity rule, and raises on any failure: it
-never skips, repairs or continues past one.
+events and enforces that venue's integrity rule. It never skips, repairs or
+continues past a failure silently. In **strict** mode, the default, it raises
+at the first one. In **resume** mode (ADR 0020) it marks the book stale at
+that step and goes on: updates are not applied to a stale book, and the next
+stream snapshot that passes the venue's check recovers it. A reset (a new
+session or connection) empties the book and neither causes nor ends
+staleness.
+
+``trace`` yields every step the C++ book is given, in order: each stream
+message, each stored stream event that makes the book stale
+(``STALE_REASONS``), and each that resets it (``RESET_REASONS``), with the
+book's state after it. A record's stored events come before its message.
 
     python -m quantagent.data.book verify --store data/normalized \
-        --venue kraken --instrument BTC-USD
-    python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE
+        --venue kraken --instrument BTC-USD [--resume]
+    python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE \
+        [--resume]
 
 Venue rules, as the venues document them:
 
@@ -50,6 +61,7 @@ as a CHECK_SNAPSHOT_COMPARED stream event; tests show the two agree.
 """
 
 import argparse
+import dataclasses
 import sys
 import zlib
 from bisect import bisect_left, bisect_right, insort
@@ -315,27 +327,77 @@ _SEQUENCE_KINDS = {
     StreamEventKind.SEQUENCE_REPEAT: "repeat",
     StreamEventKind.SEQUENCE_OUT_OF_ORDER: "out_of_order",
 }
-_RESETS = {StreamEventKind.SESSION_START, StreamEventKind.CONNECT, StreamEventKind.DISCONNECT}
+# The stored stream events (on the stream connection, or of the session) the
+# book acts on, and the reason a step records for each (ADR 0020). The names
+# are the C++ StreamReason values in snake case; a test checks they agree.
+STALE_REASONS: dict[StreamEventKind, str] = {
+    StreamEventKind.SEQUENCE_GAP: "sequence_gap",
+    StreamEventKind.SEQUENCE_REPEAT: "sequence_repeat",
+    StreamEventKind.SEQUENCE_OUT_OF_ORDER: "sequence_out_of_order",
+    StreamEventKind.CHECKSUM_MISMATCH: "checksum_mismatch",
+    StreamEventKind.MESSAGE_REJECTED: "message_rejected",
+}
+RESET_REASONS: dict[StreamEventKind, str] = {
+    StreamEventKind.SESSION_START: "session_start",
+    StreamEventKind.CONNECT: "connect",
+    StreamEventKind.DISCONNECT: "disconnect",
+}
+# A message the book itself finds broken: Kraken's checksum, Coinbase's book
+# numbers not increasing, or an update with no book to apply it to.
+DELTA_BEFORE_SNAPSHOT = "delta_before_snapshot"
+MODES = ("strict", "resume")
 _VENUES = ("kraken", "coinbase")
 # Venues whose book stream comes in batches, each with one venue time, so that
 # an independent snapshot can be taken between two of them (ADR 0014).
 _TIMED_BATCHES = frozenset({"coinbase"})
 
 
+@dataclass(frozen=True, slots=True)
+class Step:
+    """One thing the book was given, and its state after it (ADR 0020).
+
+    ``step`` is ``"message"`` (a stream message: ``message`` is set),
+    ``"stale"`` (a stored stream event saying the stream broke) or ``"reset"``
+    (a new session or connection). ``reason`` says why a stale or reset step
+    happened, or why a message made the book stale (None if it did not; a
+    message skipped because the book was already stale has none). ``stale``
+    is the state after the step; ``recovered`` marks the snapshot that ended a
+    stale period. ``error`` is what strict mode raises at this step.
+    """
+
+    log_id: str
+    seq: int
+    recv_ts: int
+    step: str
+    message: BookMessage | None = None
+    reason: str | None = None
+    stale: bool = False
+    recovered: bool = False
+    error: BookIntegrityError | None = field(default=None, compare=False)
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return (self.log_id, self.seq)
+
+
 class _Replayer:
     """Applies stream messages and stored events in (log_id, seq) order."""
 
-    def __init__(self, venue: str, events: Iterable[dict[str, Any]], verify: bool):
+    def __init__(self, venue: str, events: Iterable[dict[str, Any]], verify: bool, mode: str):
         if venue not in _VENUES:
             raise ValueError(f"no book rule for venue {venue!r}")
-        self.venue, self.verify = venue, verify
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
+        self.venue, self.verify, self.resume = venue, verify, mode == "resume"
         relevant = [e for e in events if e["connection"] in (_STREAM, None)]
         self._events = sorted(relevant, key=lambda e: (e["log_id"], e["seq"], e["event_index"]))
         self._next_event = 0
+        # Invariant: a stale book is None. None and not stale: no snapshot yet.
         self.book: ReferenceBook | None = None
+        self.stale = False
         self._last_venue_seq: int | None = None
 
-    def _events_until(self, key: tuple[str, int] | None) -> None:
+    def _events_until(self, key: tuple[str, int] | None) -> Iterator[Step]:
         """Handle every stored event at or before ``key``. Events at a message's
         own record come first: a reconnect or gap there concerns that message."""
         while self._next_event < len(self._events):
@@ -343,42 +405,68 @@ class _Replayer:
             if key is not None and (event["log_id"], event["seq"]) > key:
                 return
             self._next_event += 1
-            self._event(event)
+            step = self._event(event)
+            if step is not None:
+                yield step
 
-    def _event(self, event: dict[str, Any]) -> None:
+    def _event(self, event: dict[str, Any]) -> Step | None:
         kind = StreamEventKind(event["kind"])
         at = (event["log_id"], event["seq"], event["recv_ts"])
-        if kind in _RESETS:
+        if kind in RESET_REASONS:
             # A new session or connection starts a new stream: a snapshot must come first.
             self.book, self._last_venue_seq = None, None
-        elif kind in _SEQUENCE_KINDS:
-            raise SequenceBreak(
+            return Step(*at, "reset", reason=RESET_REASONS[kind], stale=self.stale)
+        if kind in _SEQUENCE_KINDS:
+            error: BookIntegrityError = SequenceBreak(
                 at, _SEQUENCE_KINDS[kind], event["expected"], event["observed"], "stream_event"
             )
         elif kind == StreamEventKind.CHECKSUM_MISMATCH:
-            raise ChecksumMismatch(at, event["expected"], event["observed"], "stream_event")
+            error = ChecksumMismatch(at, event["expected"], event["observed"], "stream_event")
         elif kind == StreamEventKind.MESSAGE_REJECTED:
-            raise StreamFault(at, f"a stream message was rejected: {event['detail']}")
+            error = StreamFault(at, f"a stream message was rejected: {event['detail']}")
+        else:
+            return None
+        return self._fail(Step(*at, "stale", reason=STALE_REASONS[kind], error=error))
 
-    def message(self, message: BookMessage) -> ReferenceBook:
-        self._events_until(message.key)
+    def _fail(self, step: Step) -> Step:
+        """Strict: raise. Resume: the book is stale from this step on."""
+        if not self.resume:
+            raise step.error
+        self.book, self._last_venue_seq, self.stale = None, None, True
+        return dataclasses.replace(step, stale=True)
+
+    def steps(self, message: BookMessage) -> Iterator[Step]:
+        """The steps up to and including ``message``."""
+        yield from self._events_until(message.key)
+        yield self._message(message)
+
+    def _message(self, message: BookMessage) -> Step:
+        at = message.at
+        was_stale = self.stale
         if message.kind == BookEventKind.SNAPSHOT:
             self.book = ReferenceBook()
             self.book.replace(message.levels)
             self._last_venue_seq = None
         elif message.kind == BookEventKind.DELTA:
+            if self.stale:  # nothing is applied to a stale book
+                return Step(*at, "message", message, stale=True)
             if self.book is None:
-                raise DeltaBeforeSnapshot(message.at, "a book update arrived before any snapshot")
+                error = DeltaBeforeSnapshot(at, "a book update arrived before any snapshot")
+                return self._fail(Step(*at, "message", message, DELTA_BEFORE_SNAPSHOT, error=error))
             self.book.apply(message.levels)
         else:
             raise ValueError("check snapshots are not part of the stream")
         if message.depth is not None:
             self.book.truncate(message.depth)
         if self.verify:
-            self._verify(message)
-        return self.book
+            failure = self._verify(message)
+            if failure is not None:
+                reason, error = failure
+                return self._fail(Step(*at, "message", message, reason, error=error))
+        self.stale = False
+        return Step(*at, "message", message, recovered=was_stale)
 
-    def _verify(self, message: BookMessage) -> None:
+    def _verify(self, message: BookMessage) -> tuple[str, BookIntegrityError] | None:
         if self.venue == "kraken":
             if message.checksum is None:
                 raise ValueError(f"Kraken message seq {message.seq} has no checksum to verify")
@@ -393,7 +481,8 @@ class _Replayer:
                         10 ** (message.qty_exp - message.qty_precision))  # fmt: skip
             computed = kraken_checksum(self.book, divisors)
             if computed != message.checksum:
-                raise ChecksumMismatch(message.at, message.checksum, computed, "computed")
+                error = ChecksumMismatch(message.at, message.checksum, computed, "computed")
+                return STALE_REASONS[StreamEventKind.CHECKSUM_MISMATCH], error
         else:
             number = message.venue_seq_last
             if number is None:
@@ -401,11 +490,14 @@ class _Replayer:
             last = self._last_venue_seq
             if last is not None and number <= last:
                 kind = "repeat" if number == last else "out_of_order"
-                raise SequenceBreak(message.at, kind, last + 1, number, "computed")
+                return f"sequence_{kind}", SequenceBreak(
+                    message.at, kind, last + 1, number, "computed"
+                )
             self._last_venue_seq = number
+        return None
 
-    def finish(self) -> None:
-        self._events_until(None)
+    def finish(self) -> Iterator[Step]:
+        yield from self._events_until(None)
 
 
 def _stream(messages: Iterable[BookMessage]) -> list[BookMessage]:
@@ -414,27 +506,51 @@ def _stream(messages: Iterable[BookMessage]) -> list[BookMessage]:
     )
 
 
+def trace(
+    venue: str,
+    messages: Iterable[BookMessage],
+    events: Iterable[dict[str, Any]] = (),
+    *,
+    verify: bool = True,
+    mode: str = "strict",
+) -> Iterator[tuple[Step, ReferenceBook | None]]:
+    """Every step the book is given, with the book after it (None unless the
+    book can be read: stale, or no snapshot since the start or a reset).
+
+    ``events`` are the instrument's ``stream_events`` rows; a stored sequence
+    break, checksum mismatch or rejected message on the stream is a failure,
+    and a session start, connect or disconnect a reset (the next message must
+    be a snapshot). With ``verify`` the venue's rule is also checked from the
+    book itself. ``mode="strict"`` raises at the first failure, after yielding
+    the steps before it; ``mode="resume"`` yields it as a stale step and goes
+    on. Check snapshots are not steps: they are not part of the stream.
+
+    The yielded book is the live object: it changes as replay continues.
+    """
+    replayer = _Replayer(venue, events, verify, mode)
+    for message in _stream(messages):
+        for step in replayer.steps(message):
+            yield step, replayer.book
+    for step in replayer.finish():
+        yield step, replayer.book
+
+
 def replay(
     venue: str,
     messages: Iterable[BookMessage],
     events: Iterable[dict[str, Any]] = (),
     *,
     verify: bool = True,
-) -> Iterator[tuple[BookMessage, ReferenceBook]]:
+    mode: str = "strict",
+) -> Iterator[tuple[BookMessage, ReferenceBook | None]]:
     """Rebuild the book message by message; yield it after each stream message.
 
-    ``events`` are the instrument's ``stream_events`` rows. A stored sequence
-    break, checksum mismatch or rejected message on the stream raises; a new
-    session or connection means the next message must be a snapshot. With
-    ``verify`` the venue's rule is also checked from the book itself.
-    Check snapshots are skipped: they are not part of the stream.
-
-    The yielded book is the live object: it changes as replay continues.
+    ``trace`` without the stale and reset steps. In strict mode the book is
+    never None (a failure raises first); in resume mode it is None while stale.
     """
-    replayer = _Replayer(venue, events, verify)
-    for message in _stream(messages):
-        yield message, replayer.message(message)
-    replayer.finish()
+    for step, book in trace(venue, messages, events, verify=verify, mode=mode):
+        if step.message is not None:
+            yield step.message, book
 
 
 Difference = tuple[int, int, int | None, int | None]
@@ -553,10 +669,16 @@ def _compare(
 
 
 def verify_check_snapshots(
-    venue: str, messages: Sequence[BookMessage], events: Iterable[dict[str, Any]] = ()
+    venue: str,
+    messages: Sequence[BookMessage],
+    events: Iterable[dict[str, Any]] = (),
+    *,
+    mode: str = "strict",
 ) -> list[CheckResult]:
     """Compare every check snapshot with the book rebuilt from the stream, under
-    ADR 0014's rule. Raises on any integrity failure, like ``replay``.
+    ADR 0014's rule. In strict mode, raises on any integrity failure, like
+    ``replay``; in resume mode a snapshot whose A finds the book stale is not
+    compared (``stream_unreliable``, the Coinbase adapter's reason for it).
 
     The stream a snapshot is compared with is the connection that was current
     at the snapshot's record: the stream messages of its log between the last
@@ -569,7 +691,7 @@ def verify_check_snapshots(
     resets = sorted(
         (e["log_id"], e["seq"])
         for e in events
-        if e["kind"] in _RESETS and e["connection"] in (_STREAM, None)
+        if e["kind"] in RESET_REASONS and e["connection"] in (_STREAM, None)
     )
 
     def connection(key: tuple[str, int]) -> tuple[str, int]:
@@ -599,12 +721,18 @@ def verify_check_snapshots(
             continue
         planned.setdefault(members[a_index].key, []).append((check, b, a_index + 1))
 
-    replayer = _Replayer(venue, events, verify=True)
+    replayer = _Replayer(venue, events, verify=True, mode=mode)
     for message in stream:
-        book = replayer.message(message)
+        for _ in replayer.steps(message):
+            pass
+        book = replayer.book
         for check, b, applied in planned.pop(message.key, ()):
-            results[check.key] = _compare(venue, check, book, message, b, applied)
-    replayer.finish()
+            if book is None:  # only in resume mode: the stream broke since its last snapshot
+                results[check.key] = _not_compared(check, "stream_unreliable")
+            else:
+                results[check.key] = _compare(venue, check, book, message, b, applied)
+    for _ in replayer.finish():
+        pass
     return [results[check.key] for check in checks]
 
 
@@ -614,7 +742,11 @@ def verify_check_snapshots(
 def golden_schema(levels: int = GOLDEN_LEVELS) -> pa.Schema:
     fields = [pa.field("log_id", pa.string(), nullable=False),
               pa.field("seq", pa.uint64(), nullable=False),
-              pa.field("recv_ts", pa.int64(), nullable=False)]  # fmt: skip
+              pa.field("recv_ts", pa.int64(), nullable=False),
+              pa.field("step", pa.string(), nullable=False),
+              pa.field("reason", pa.string()),
+              pa.field("stale", pa.bool_(), nullable=False),
+              pa.field("recovered", pa.bool_(), nullable=False)]  # fmt: skip
     for rank in range(levels):
         for side in ("bid", "ask"):
             fields.append(pa.field(f"{side}_price_{rank:02d}", pa.int64()))
@@ -628,21 +760,23 @@ def golden_table(
     events: Iterable[dict[str, Any]] = (),
     *,
     levels: int = GOLDEN_LEVELS,
+    mode: str = "strict",
 ) -> pa.Table:
-    """The book's best ``levels`` per side after every stream message.
+    """The book's best ``levels`` per side after every step (``trace``).
 
-    One row per stream message: ``log_id`` and ``seq`` name the raw record,
-    then for each rank, best first, the bid's price and quantity and the ask's
-    price and quantity (mantissas; null where the book has fewer levels).
+    One row per step: ``log_id`` and ``seq`` name the raw record, ``step``,
+    ``reason``, ``stale`` and ``recovered`` are the step's (ADR 0020), then for
+    each rank, best first, the bid's price and quantity and the ask's price
+    and quantity (mantissas; null where the book has fewer levels, and every
+    level null when the book cannot be read: stale, or no snapshot yet).
     """
     schema = golden_schema(levels)
     columns: dict[str, list] = {name: [] for name in schema.names}
-    for message, book in replay(venue, messages, events):
-        columns["log_id"].append(message.log_id)
-        columns["seq"].append(message.seq)
-        columns["recv_ts"].append(message.recv_ts)
+    for step, book in trace(venue, messages, events, mode=mode):
+        for name in ("log_id", "seq", "recv_ts", "step", "reason", "stale", "recovered"):
+            columns[name].append(getattr(step, name))
         for side, name in ((Side.BUY, "bid"), (Side.SELL, "ask")):
-            top = book.top(side, levels)
+            top = book.top(side, levels) if book is not None else []
             for rank in range(levels):
                 price, qty = top[rank] if rank < len(top) else (None, None)
                 columns[f"{name}_price_{rank:02d}"].append(price)
@@ -663,16 +797,49 @@ def _load(args: argparse.Namespace) -> tuple[list[BookMessage], list[dict[str, A
     return messages, events
 
 
+def _mode(args: argparse.Namespace) -> str:
+    return "resume" if args.resume else "strict"
+
+
+def _stale_periods(steps: Sequence[Step]) -> tuple[int, int, int]:
+    """Print each stale period and its recovery; return (periods, recovered,
+    stream messages not applied)."""
+    periods = recovered = 0
+    stale = False
+    for step in steps:
+        if step.stale and not stale:
+            periods += 1
+            print(f"  stale from seq {step.seq}: {step.reason} ({step.error})")
+        elif step.recovered:
+            recovered += 1
+            print(f"  recovered at seq {step.seq} (log {step.log_id})")
+        stale = step.stale
+    if stale:
+        print("  still stale at the end")
+    skipped = sum(s.stale for s in steps if s.step == "message")
+    return periods, recovered, skipped
+
+
 def _verify_command(args: argparse.Namespace) -> int:
     messages, events = _load(args)
     stream = len(_stream(messages))
+    mode = _mode(args)
     print(f"{args.venue}/{args.instrument}: {stream} stream messages, {len(events)} stream events")
     try:
-        results = verify_check_snapshots(args.venue, messages, events)
-        crossed = sum(book.is_crossed() for _, book in replay(args.venue, messages, events))
+        results = verify_check_snapshots(args.venue, messages, events, mode=mode)
+        steps, crossed = [], 0
+        for step, book in trace(args.venue, messages, events, mode=mode):
+            steps.append(step)
+            crossed += step.message is not None and book is not None and book.is_crossed()
     except BookIntegrityError as error:
         print(f"FAILED: {error}")
         return 1
+    periods = 0
+    if mode == "resume":
+        periods, recovered, skipped = _stale_periods(steps)
+        plural = "" if periods == 1 else "s"
+        print(f"{periods} stale period{plural}, {recovered} recovered; "
+              f"{skipped} stream messages not applied")  # fmt: skip
     counts = {name: sum(r.result == name for r in results)
               for name in ("exact", "explained", "mismatch", "not_compared")}  # fmt: skip
     matched = counts["exact"] + counts["explained"]
@@ -688,14 +855,18 @@ def _verify_command(args: argparse.Namespace) -> int:
         elif result.result == "not_compared":
             print(f"  snapshot seq {result.snapshot.seq}: not compared ({result.not_compared})")
     print("never crossed" if crossed == 0 else f"crossed after {crossed} messages")
-    ok = counts["mismatch"] == 0 and crossed == 0
+    ok = counts["mismatch"] == 0 and crossed == 0 and periods == 0
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 
 
 def _golden_command(args: argparse.Namespace) -> int:
     messages, events = _load(args)
-    table = golden_table(args.venue, messages, events)
+    try:
+        table = golden_table(args.venue, messages, events, mode=_mode(args))
+    except BookIntegrityError as error:
+        print(f"FAILED: {error} (--resume writes the stale and recovered points instead)")
+        return 1
     pq.write_table(table, args.out, compression="zstd", compression_level=19)
     print(f"wrote {args.out}: {table.num_rows} rows")
     return 0
@@ -724,6 +895,12 @@ def main(argv: list[str] | None = None) -> int:
             "--version",
             type=int,
             help="knowledge time, ns: the store as of that committed batch (default: the latest)",
+        )
+        command.add_argument(
+            "--resume",
+            action="store_true",
+            help="on an integrity failure mark the book stale and go on, recovering at the next "
+            "snapshot (ADR 0020); the default is strict: stop at the first failure",
         )
         command.add_argument("--as-of", help=argparse.SUPPRESS)  # retired; refused below
         if name == "golden":

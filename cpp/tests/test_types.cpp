@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -79,6 +80,17 @@ static_assert(!std::is_constructible_v<InstrumentId, bool>);
 static_assert(!std::is_constructible_v<InstrumentId, double>);
 static_assert(!std::is_convertible_v<std::uint32_t, InstrumentId>);
 static_assert(std::is_trivially_copyable_v<InstrumentMeta>);
+// ADR 0020: the venue's precisions (ADR 0019) fill what was padding, so the
+// struct keeps its size and has no hidden bytes.
+static_assert(sizeof(InstrumentMeta) == 24 && alignof(InstrumentMeta) == 8);
+static_assert(offsetof(InstrumentMeta, id) == 0);
+static_assert(offsetof(InstrumentMeta, price_exp) == 4);
+static_assert(offsetof(InstrumentMeta, qty_exp) == 5);
+static_assert(offsetof(InstrumentMeta, price_precision) == 6);
+static_assert(offsetof(InstrumentMeta, qty_precision) == 7);
+static_assert(offsetof(InstrumentMeta, tick_size) == 8);
+static_assert(offsetof(InstrumentMeta, lot_size) == 16);
+static_assert(std::has_unique_object_representations_v<InstrumentMeta>);
 
 // Side uses the same numbers as the Python schema.
 static_assert(static_cast<int>(Side::Sell) == -1);
@@ -107,12 +119,16 @@ TEST(Types, ComparisonsOrderByMantissa) {
 }
 
 TEST(Types, InstrumentIdAndMetadata) {
-  constexpr InstrumentMeta kraken{InstrumentId(7u), 1, 8, Price(1), Qty(1)};
+  // Kraken BTC-USD: fixed exponents 8 and 8, printed at 1 and 8 decimals, a
+  // tick of 0.1 and a lot of one satoshi (ADR 0019).
+  constexpr InstrumentMeta kraken{InstrumentId(7u), 8, 8, 1, 8, Price(10'000'000), Qty(1)};
   EXPECT_EQ(kraken.id, InstrumentId(7u));
   EXPECT_EQ(kraken.id.value(), 7u);
-  EXPECT_EQ(kraken.price_exp, 1);
+  EXPECT_EQ(kraken.price_exp, 8);
   EXPECT_EQ(kraken.qty_exp, 8);
-  EXPECT_EQ(kraken.tick_size, Price(1));
+  EXPECT_EQ(kraken.price_precision, 1);
+  EXPECT_EQ(kraken.qty_precision, 8);
+  EXPECT_EQ(kraken.tick_size, Price(10'000'000));
   EXPECT_EQ(kraken.lot_size, Qty(1));
 }
 

@@ -39,6 +39,7 @@ addopts = "-ra --strict-markers -m 'not network and not local_data'"
 markers = [
     "network: needs internet access to a venue; excluded from the default run",
     "local_data: needs the recordings under data/ (not in git); excluded from the default run",
+    "slow: takes more than about 5 s; run by default and by check.ps1, left out with --skip-slow",
 ]
 
 [tool.ruff]

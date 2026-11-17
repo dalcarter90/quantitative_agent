@@ -23,7 +23,7 @@ data core is a new ADR and an edit of the spec, in the same change.
 | [0001](0001-repo-layout.md) | Monorepo with `cpp/` and `python/` | Accepted |
 | [0002](0002-bindings-library.md) | pybind11, installed from pip | Accepted |
 | [0003](0003-build-system.md) | CMake presets + vcpkg manifest | Accepted |
-| [0004](0004-queue-design.md) | In-house bounded SPSC ring buffer | Accepted |
+| [0004](0004-queue-design.md) | In-house bounded SPSC ring buffer | Accepted, amended by 0020 |
 | [0005](0005-price-and-time-representation.md) | int64 mantissa with per-instrument exponent; int64 ns timestamps | Accepted, amended by 0008, 0011, 0012 and 0019; superseded by the spec |
 | [0006](0006-storage-format.md) | Raw binary log + Parquet/DuckDB normalized store | Accepted, amended by 0009, 0010, 0012, 0013, 0015, 0017 and 0018; raw-log and store tiers superseded by the spec |
 | [0007](0007-agent-tool-permissions.md) | Allow-listed tool server, structurally enforced | Accepted |
@@ -39,6 +39,7 @@ data core is a new ADR and an edit of the spec, in the same change.
 | [0017](0017-time-model-two-cutoffs-and-committed-batches.md) | The time model: a session has two cutoffs (`available_at` on receipt time, `version` on knowledge time) and `as_of` is retired; a load is one batch, readable only once its commit marker is written; time windows and date partitions are receipt time; a replay cursor advances one session | Accepted; implementation choices confirmed; amended by 0018; superseded by the spec |
 | [0018](0018-loads-one-observation-per-trade-and-refused-input.md) | Every ingest of a raw log is a load, and a session reads each log from its latest complete load (or, if it has none, its latest incomplete load); loads are the only production write path; trades are keyed by raw record and shown once, as their first observation in `(log_id, seq)` order; a value the schema refuses is a rejected message; a normalizer fed interleaved logs raises | Accepted; implementation choices decided by the owner; amended by 0019; superseded by the spec |
 | [0019](0019-fixed-exponents-per-severity-limits-and-the-data-core-spec.md) | Each instrument has one fixed price and quantity exponent (`FIXED_EXPONENTS`), with the venue's precision stored beside it; metadata is in effect from a session's first row; quality findings are limited per severity and a truncated report fails; a session's clock is judged on every day it spans; conflicts between logs and logs read from an incomplete load are quality findings; `docs/data-core-spec.md` restates the data core | Accepted; implementation choices confirmed; restated in the spec |
+| [0020](0020-stream-control-events-resuming-book-and-snapshot-queue-policy.md) | `MarketEvent` gains stream control kinds (stale, reset, snapshot begin and end) with a reason and a source id; the C++ `InstrumentMeta` gains the venue's precisions; the reference book gains a resume mode, and the golden files the stale and recovered points; a large snapshot crosses a bounded queue whole or not at all, with resyncs gated on room (built in Phase 5); recommendations for D4 to D7 and T3, confirmed with their phases; the recorder reconnects its stream every 15 to 30 minutes instead of resubscribing on a gap | Accepted; implementation choices confirmed; restated in the spec (sections 6, 11, 12) |
 
 ## Template
 
