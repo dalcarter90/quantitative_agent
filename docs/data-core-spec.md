@@ -1,6 +1,6 @@
 # Data core specification
 
-Status: current as of ADR 0019 (2026-11-16).
+Status: current as of ADR 0020 (2026-11-16).
 
 This is the one description of the data core
 (`python/src/quantagent/data/`) as it is: what it stores, what each time and
@@ -283,6 +283,16 @@ that are better than the price: 0 is the best bid or ask. Events noticed before
 any `start` record have no instrument to be stored under and stay in the
 normalization report only. A clean session produces a handful of events; a
 broken one one per fault, not one per message.
+
+**What the books act on** (ADR 0020). Of these, eight concern an order book,
+when they are on the stream connection (`ws`) or of the session (connection
+null): `SEQUENCE_GAP`, `SEQUENCE_REPEAT`, `SEQUENCE_OUT_OF_ORDER`,
+`CHECKSUM_MISMATCH` and `MESSAGE_REJECTED` make the book **stale**;
+`SESSION_START`, `CONNECT` and `DISCONNECT` **reset** it (the next book message
+must be a snapshot). The reference book reads them from the store (section
+11); the C++ book gets them as `StreamStale` and `StreamReset` events whose
+`StreamReason` has the same name (architecture section 6.3). Nothing else in
+this table concerns a book.
 
 ## 7. Adapters
 
@@ -650,25 +660,37 @@ events and stream events. It is the oracle for the C++ book (Phase 4) and
 favors being obviously correct over speed.
 
 `python -m quantagent.data.book verify|golden --store DIR --venue V
---instrument I [--available-at NS] [--version NS] [--out FILE]` (default:
-everything received, latest version; exit 2 if the store is refused).
+--instrument I [--available-at NS] [--version NS] [--resume] [--out FILE]`
+(default: everything received, latest version, strict; exit 2 if the store is
+refused).
 
 - `messages_from_table(book_events, instruments)` groups rows into
   `BookMessage`s in `(log_id, seq)` order, refusing a message whose
   `level_index` is not 0 to n-1 or whose levels disagree on the header, and
   gives each the metadata in force for its record (exponents and precisions).
-- `replay(venue, messages, events, verify=True)` yields the book after every
-  stream message. A snapshot replaces the book; an update applies its levels in
+- `trace(venue, messages, events, verify=True, mode="strict")` yields every
+  **step** with the book after it (None when it cannot be read): each stream
+  message, each stored event that makes the book stale and each that resets it
+  (section 6), a record's stored events before its message. A `Step` names its
+  record and says `step` (`message`, `stale`, `reset`), `reason`, `stale` (after
+  the step), `recovered` and `error`. `replay(..., mode=)` yields only the
+  message steps. A snapshot replaces the book; an update applies its levels in
   `level_index` order; quantity 0 removes a level; Kraken books are cut to
-  `depth` per side after every message. Check snapshots are skipped.
-- **It raises; it never skips, repairs or continues.** `DeltaBeforeSnapshot`,
-  `ChecksumMismatch` (expected, computed), `SequenceBreak` (kind, expected,
-  received), `StreamFault` (a rejected stream message), each naming the raw
-  record and whether its own check (`computed`) or a stored event
-  (`stream_event`) found it. A stored `SEQUENCE_*`, `CHECKSUM_MISMATCH` or
-  `MESSAGE_REJECTED` on the stream raises; a `SESSION_START`, `CONNECT` or
-  `DISCONNECT` means the next message must be a snapshot. Events on the probe
-  connection do not concern the stream.
+  `depth` per side after every message. Check snapshots are not steps.
+- **Integrity failures:** `DeltaBeforeSnapshot`, `ChecksumMismatch` (expected,
+  computed), `SequenceBreak` (kind, expected, received), `StreamFault` (a
+  rejected stream message), each naming the raw record and whether its own
+  check (`computed`) or a stored event (`stream_event`) found it. Events on the
+  probe connection do not concern the stream.
+- **Strict mode** (the default, for `verify` too) raises at the first failure;
+  it never skips, repairs or continues. **Resume mode** (ADR 0020) records it
+  as a stale step and goes on, never silently: a stale book is discarded and no
+  update is applied to it; the next stream snapshot that passes the venue's
+  check makes it fresh again (`recovered`); one that fails leaves it stale. A
+  reset empties the book and neither causes nor ends staleness; an update with
+  no book is stale (`delta_before_snapshot`). Resume mode goes stale exactly at
+  the step where strict mode raises, with the same error. Errors that are not
+  integrity failures (a message with nothing to verify it by) raise in both.
 - **Verification, per venue.** Kraken: the checksum after every message,
   computed independently of the adapter, over the mantissas scaled to the
   precision in force; a Kraken message without metadata cannot be verified
@@ -680,12 +702,22 @@ everything received, latest version; exit 2 if the store is refused).
   snapshot's depth, under the rule of section 7 (Coinbase's between-batches
   exemption; Kraken exact on every level). `CheckResult.result` is `exact`,
   `explained`, `mismatch` or `not_compared`; `summary()` gives the facts of
-  the adapter's event, and tests show the two agree.
+  the adapter's event, and tests show the two agree. In resume mode a snapshot
+  whose stream book is stale at A is not compared (`stream_unreliable`, the
+  adapter's reason).
+- **The command line:** `verify` exits 1 on an integrity failure, a mismatched
+  check snapshot or a crossed book; with `--resume` it reports every stale
+  period, its recovery and the stream messages not applied, and exits 1 if the
+  book was ever stale. `golden` fails on an integrity failure unless
+  `--resume`.
 - **Windows:** book rows and stream events read with one window cover the same
   raw records, since both are receipt time.
 - **Golden files** (`python/tests/fixtures/golden/`): the top 20 levels per
-  side after every stream message of each fixture, at the fixed exponents;
-  their README gives the format.
+  side after every step of each fixture, at the fixed exponents, with each
+  step's `step`, `reason`, `stale` and `recovered`; and
+  `integrity-points.json`, the stale, reset and recovered points of eight
+  damaged copies of the fixtures in resume mode. Their README gives the
+  formats.
 - **What it cannot see:** a lost Kraken update that does not reach the ten
   best levels before it is overwritten, and a repeated Kraken update.
 
@@ -707,11 +739,14 @@ everything received, latest version; exit 2 if the store is refused).
   probes share its event loop and link (review, D5).
 - **The clock is measured at session start only;** the `clock_skew` band was
   calibrated on data with a 1.4 s clock error (review, D6).
-- **Open for Phase 4 and 5** (review, D1 to D3): `MarketEvent` carries no
-  control kinds (gap, reset, rejected) and no source log; the reference book
-  cannot resume after a failure; one event per level meets "a full queue
-  means stale and resync"; the C++ `InstrumentMeta` has no precisions, which
-  Kraken's checksum needs.
+- **Recorded data recovers only at a new snapshot.** The recorder never
+  resubscribes, so after a lost message the rest of that connection is stale
+  in resume mode, until a reconnect or the next session (ADR 0020, open
+  question).
+- **Settled by ADR 0020** (review, D1 to D3): `MarketEvent` has control kinds
+  and a source; the C++ `InstrumentMeta` has the precisions; the reference book
+  resumes; the policy for a large snapshot against a bounded queue is decided
+  and is built in Phase 5. D4 to D7 have recommendations there, not decisions.
 - The Linux preset and the `__int128` path are unbuilt.
 
 ## Appendix A: where each ADR's decisions are now
@@ -732,5 +767,7 @@ everything received, latest version; exit 2 if the store is refused).
 | 0017 | Two cutoffs, committed batches, receipt-time windows, replay cursor | 2, 8, 9 | Superseded |
 | 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9, 10 | Superseded |
 | 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; implementation choices confirmed |
+| 0020 | The stream events a book acts on; the reference book's resume mode, steps and golden points (and, outside the data core, `MarketEvent`'s control kinds and the queue policy) | 6, 11, 12 | Restated here; implementation choices awaiting the owner |
 
-ADRs 0001 to 0004 and 0007 are not about the data core.
+ADRs 0001 to 0004 and 0007 are not about the data core. ADR 0020 is in part:
+its `MarketEvent` and queue decisions are in architecture sections 5 and 6.3.

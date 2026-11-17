@@ -191,16 +191,22 @@ Tool calls only, listed exhaustively in section 8.
 2. **Capture.** The raw bytes, `recv_ts` and sequence number are pushed to the
    capture queue. The journal thread appends them to the raw log. This log is
    the source of truth for replay and for the data core.
-3. **Normalize.** The feed thread parses the message into a fixed-size
-   `MarketEvent` (book snapshot/delta, trade) with integer prices and
-   quantities, and checks the venue's message numbering where it has one
-   (Coinbase numbers every message on a connection). A gap marks the book
-   stale and triggers a resync; a stale book produces no orders.
-4. **Hand off.** The event goes onto that feed's SPSC queue to the core thread.
-5. **Book update.** The core thread applies the event to the instrument's
-   order book. Where the venue protects the book with a checksum instead of
-   message numbers (Kraken), it is verified here, after the update; a
-   mismatch marks the book stale in the same way.
+3. **Normalize.** The feed thread parses the message into fixed-size
+   `MarketEvent`s (book levels, a snapshot framed by `SnapshotBegin` and
+   `SnapshotEnd`, trades) with integer prices and quantities, each naming its
+   source (the connection), and checks the venue's message numbering where it
+   has one (Coinbase numbers every message on a connection). A gap, a
+   rejected message or a new connection becomes a control event
+   (`StreamStale`, `StreamReset`; ADR 0020) and triggers a resync; a stale
+   book produces no orders.
+4. **Hand off.** The message's events go onto that feed's SPSC queue to the
+   core thread, all of them or none (section 5).
+5. **Book update.** The core thread applies the events to the instrument's
+   order book: an update takes effect at its last level, a snapshot at its
+   `SnapshotEnd`. Where the venue protects the book with a checksum instead of
+   message numbers (Kraken), it is verified here, after the update, with the
+   instrument's precisions; a mismatch marks the book stale in the same way.
+   A stale book recovers at the next complete snapshot that passes the check.
 6. **Features.** Incremental features (order flow imbalance, spread,
    microprice, rolling volatility) update in place.
 7. **Order management.** The core compares current position and working
@@ -272,10 +278,16 @@ Rules:
   single-producer single-consumer ring buffer of fixed-size trivially copyable
   messages (ADR 0004). The core merges its inputs in a fixed, deterministic
   order.
-- **Backpressure is explicit.** A full market-data queue marks the affected
-  book stale and forces a resync; data is never dropped silently. A full order
-  queue rejects the order. A full journal queue trips the kill switch, because
-  the system does not trade without an audit trail.
+- **Backpressure is explicit.** A market-data message crosses its queue whole
+  or not at all: the feed pushes its events only when there is room for all of
+  them, and each feed's queue holds at least twice the largest snapshot it may
+  carry (a Coinbase book is about 38,000 levels). A message that does not fit
+  is dropped whole, the source is marked stale (a `StreamStale` ahead of
+  anything else of it), and the feed resyncs only once a whole snapshot has
+  room, with a growing backoff, so a resync's own snapshot cannot loop (ADR
+  0020; built in Phase 5). Data is never dropped silently. A full order queue
+  rejects the order. A full journal queue trips the kill switch, because the
+  system does not trade without an audit trail.
 - **No allocation on the hot path.** Feed (after parse buffers are set up),
   core and execution threads allocate nothing after startup. Books, order
   pools and queues are sized and allocated at startup. This is enforced by a
@@ -360,7 +372,11 @@ Built in roadmap Phase 3 (`cpp/include/qa/`). The layouts below are fixed by
 **Value types** (`qa/types.hpp`): `Price` and `Qty` (int64 mantissas),
 `Timestamp` (wall clock, ns since the Unix epoch), `MonoTimestamp` (the
 monotonic counter, ADR 0012), `InstrumentId` (uint32), `Side` (`Sell = -1`,
-`Unknown = 0`, `Buy = 1`, as in the Python schema) and `InstrumentMeta`. Each is
+`Unknown = 0`, `Buy = 1`, as in the Python schema) and `InstrumentMeta` (24
+bytes: `id` 0, `price_exp` 4, `qty_exp` 5, `price_precision` 6,
+`qty_precision` 7, `tick_size` 8, `lot_size` 16; the precisions are the
+venue's printed decimals, at most the exponents, which Kraken's checksum
+needs; ADRs 0019 and 0020). Each is
 constructed explicitly from an integer, never converts implicitly, cannot be
 built from or turned into floating point or bool, and does not mix with the
 others: a `Price` cannot be compared with, added to or multiplied by a `Qty`.
@@ -381,7 +397,7 @@ clock alone.
 layout, with no compiler padding (explicit zero `reserved` bytes), in the
 machine's byte order (little-endian on every supported platform).
 
-`MarketEvent`, 88 bytes, one per book level or trade:
+`MarketEvent`, 88 bytes, one per book level, trade or stream control event:
 
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
@@ -395,12 +411,31 @@ machine's byte order (little-endian on every supported platform).
 | 56 | 8 | `qty` | Quantity mantissa; 0 removes a book level |
 | 64 | 4 | `instrument` | `InstrumentId` |
 | 68 | 4 | `checksum` | The venue's book checksum after the message (flag `kHasChecksum`) |
-| 72 | 4 | `level_index` | Position of the level in its message |
+| 72 | 4 | `level_index` | Position of the level in its message; the level count for `SnapshotBegin` and `SnapshotEnd`; the stored stream event's `event_index` for `StreamStale` and `StreamReset` |
 | 76 | 2 | `depth` | Levels per side the venue keeps (flag `kHasDepth`) |
-| 78 | 1 | `kind` | `BookSnapshot = 0`, `BookDelta = 1`, `BookCheckSnapshot = 2` (as in the Python schema), `Trade = 3` |
+| 78 | 1 | `kind` | `BookSnapshot = 0`, `BookDelta = 1`, `BookCheckSnapshot = 2` (as in the Python schema), `Trade = 3`; stream control (ADR 0020): `StreamStale = 4`, `StreamReset = 5`, `SnapshotBegin = 6`, `SnapshotEnd = 7` |
 | 79 | 1 | `side` | `Side` |
 | 80 | 1 | `flags` | `kLastInMessage`, `kHasMono`, `kHasVenueSeq`, `kHasChecksum`, `kHasDepth`, `kHasTradeId`, `kEventTsFromReceipt` |
-| 81 | 7 | `reserved` | Zero |
+| 81 | 1 | `reason` | `StreamReason`: for `StreamStale` `SequenceGap = 1`, `SequenceRepeat = 2`, `SequenceOutOfOrder = 3`, `ChecksumMismatch = 4`, `MessageRejected = 5`; for `StreamReset` `SessionStart = 6`, `Connect = 7`, `Disconnect = 8`; `NoReason = 0` for everything else |
+| 82 | 2 | `reserved` | Zero |
+| 84 | 4 | `source` | The stream the event belongs to: one connection of one raw log, `(log_id, "ws")` or `(log_id, "probe")`, numbered by the harness or feed handler, which keeps the mapping |
+
+Stream control (ADR 0020):
+
+- `StreamStale`: the source's book cannot be trusted until its next snapshot.
+  `StreamReset`: a new session or connection; the book is gone until a
+  snapshot. Each stands for a stored stream event of the same name
+  (`docs/data-core-spec.md` section 6) and carries no price, quantity, side,
+  trade id, checksum or depth; a gap may carry the venue number received.
+- `(source, seq)` names the raw record. A record's events are contiguous, its
+  control events before its levels.
+- A snapshot is `SnapshotBegin`, its levels (`level_index` 0 to n-1, the last
+  with `kLastInMessage`) and `SnapshotEnd`, both frame events carrying n, with
+  nothing between them; this applies to check snapshots too. An update takes
+  effect at its `kLastInMessage` level, a snapshot at its `SnapshotEnd`.
+- `MarketEvent.from_bytes` refuses unknown kinds and reasons, a reason that
+  does not fit its kind, a control event carrying a market value, and
+  non-zero reserved bytes.
 
 `OrderRequest`, 64 bytes (core to execution): `client_order_id` 0,
 `target_order_id` 8 (the order a cancel refers to), `price` 16, `qty` 24,

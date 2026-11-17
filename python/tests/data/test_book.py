@@ -9,6 +9,7 @@ import zlib
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute)
 import pyarrow.parquet as pq
 import pytest
 from _builders import INT64_MAX, LOG
@@ -652,15 +653,23 @@ def test_golden_file_matches_a_fresh_replay(venue):
 @pytest.mark.parametrize("venue", ["kraken", "coinbase"])
 def test_golden_file_has_one_row_per_stream_message_with_the_top_of_book(venue):
     messages, events = from_records(list(read_raw_log(fixture_path(venue))), venue)
-    table = golden_table(venue, messages, events)
+    full = golden_table(venue, messages, events)
+    # ADR 0020: a row per step the C++ book is given; on a clean fixture the
+    # steps are the stream messages and the stream's resets.
+    assert set(full.column("step").to_pylist()) == {"message", "reset"}
+    assert not any(full.column("stale").to_pylist()) and not any(
+        full.column("recovered").to_pylist()
+    )
+    table = full.filter(pa.compute.equal(full.column("step"), "message"))
+    assert table.column("reason").null_count == table.num_rows
     states = [(m, book.best_bid(), book.best_ask(), book.top(BUY, 20), book.top(SELL, 20))
               for m, book in replay(venue, messages, events)]  # fmt: skip
     assert table.num_rows == len(states)
     assert GOLDEN_LEVELS == 20
     names = table.schema.names
-    assert names[:3] == ["log_id", "seq", "recv_ts"]
-    assert names[3:7] == ["bid_price_00", "bid_qty_00", "ask_price_00", "ask_qty_00"]
-    assert len(names) == 3 + 4 * GOLDEN_LEVELS
+    assert names[:7] == ["log_id", "seq", "recv_ts", "step", "reason", "stale", "recovered"]
+    assert names[7:11] == ["bid_price_00", "bid_qty_00", "ask_price_00", "ask_qty_00"]
+    assert len(names) == 7 + 4 * GOLDEN_LEVELS
     columns = table.to_pydict()
     for index in (0, 1, len(states) // 2, len(states) - 1):
         message, bid, ask, bids, asks = states[index]
@@ -683,14 +692,32 @@ def test_golden_file_has_one_row_per_stream_message_with_the_top_of_book(venue):
             assert (got_bid, got_ask) == (want_bid, want_ask)
 
 
+@pytest.mark.parametrize("venue", ["kraken", "coinbase"])
+def test_golden_reset_rows_are_the_streams_stored_resets_with_no_book(venue):
+    messages, events = from_records(list(read_raw_log(fixture_path(venue))), venue)
+    rows = golden_table(venue, messages, events).to_pylist()
+    resets = [r for r in rows if r["step"] == "reset"]
+    stored = [(e["seq"], e["kind"]) for e in events
+              if e["kind"] in (K.SESSION_START, K.CONNECT, K.DISCONNECT)
+              and e["connection"] in ("ws", None)]  # fmt: skip
+    names = {K.SESSION_START: "session_start", K.CONNECT: "connect", K.DISCONNECT: "disconnect"}
+    assert [(r["seq"], r["reason"]) for r in resets] == [(s, names[k]) for s, k in stored]
+    assert all(r["bid_price_00"] is None and r["ask_qty_19"] is None for r in resets)
+    # Rows come in (log_id, seq) order; a reset comes before its record's own message.
+    assert [(r["log_id"], r["seq"]) for r in rows] == sorted((r["log_id"], r["seq"]) for r in rows)
+
+
 def test_golden_files_are_small_and_documented():
     readme = (GOLDEN / "README.md").read_text(encoding="utf-8")
     for venue in ("kraken", "coinbase"):
         path = GOLDEN / f"{venue}-{INSTRUMENT}.top{GOLDEN_LEVELS}.parquet"
         assert path.stat().st_size < 3_000_000
         assert path.name in readme
-    for text in ("recv_ts", "bid_price_00", "price mantissa", "python -m quantagent.data.book"):
+    for text in ("recv_ts", "bid_price_00", "price mantissa", "python -m quantagent.data.book",
+                 "`step`", "`stale`", "`recovered`", "integrity-points.json", "integrity.py",
+                 "ADR 0020"):  # fmt: skip
         assert text in readme, text
+    assert (GOLDEN / "integrity-points.json").stat().st_size < 100_000
 
 
 # --- reading through PITSession, and the command line ----------------------------------------

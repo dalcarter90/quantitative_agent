@@ -157,6 +157,7 @@ cd ..
 .venv\Scripts\python -m quantagent.data.adapters data\raw\kraken\BTC-USD\<file>.qaraw.zst --store data\normalized
 
 # Rebuild an order book from the store and verify it against the venue's rules
+# (add --resume to report every stale period and recovery instead of stopping, ADR 0020)
 .venv\Scripts\python -m quantagent.data.book verify --store data\normalized --venue kraken --instrument BTC-USD
 
 # Tests over the one-hour recordings in data\raw (not in git; excluded by default)

@@ -1,0 +1,412 @@
+{
+ "format": 1,
+ "cases": [
+  {
+   "name": "kraken-removed",
+   "venue": "kraken",
+   "fixture": "raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-164f377e87e8",
+   "damage": [
+    [
+     "resnapshot",
+     12492
+    ],
+    [
+     "removed",
+     265
+    ]
+   ],
+   "stored_events": true,
+   "steps": 13786,
+   "messages": 13782,
+   "stale_messages": 12009,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 1,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 265,
+     "step": "stale",
+     "reason": "checksum_mismatch",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 12491,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    },
+    {
+     "seq": 14036,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  },
+  {
+   "name": "kraken-removed-own-check",
+   "venue": "kraken",
+   "fixture": "raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-164f377e87e8",
+   "damage": [
+    [
+     "resnapshot",
+     12492
+    ],
+    [
+     "removed",
+     265
+    ]
+   ],
+   "stored_events": false,
+   "steps": 13782,
+   "messages": 13782,
+   "stale_messages": 12009,
+   "points": [
+    {
+     "seq": 265,
+     "step": "message",
+     "reason": "checksum_mismatch",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 12491,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    }
+   ]
+  },
+  {
+   "name": "kraken-swapped",
+   "venue": "kraken",
+   "fixture": "raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-164f377e87e8",
+   "damage": [
+    [
+     "resnapshot",
+     12492
+    ],
+    [
+     "swapped",
+     265
+    ]
+   ],
+   "stored_events": true,
+   "steps": 13787,
+   "messages": 13783,
+   "stale_messages": 12010,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 1,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 265,
+     "step": "stale",
+     "reason": "checksum_mismatch",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 12492,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    },
+    {
+     "seq": 14037,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  },
+  {
+   "name": "kraken-duplicated",
+   "venue": "kraken",
+   "fixture": "raw/kraken/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-164f377e87e8",
+   "damage": [
+    [
+     "resnapshot",
+     12492
+    ],
+    [
+     "duplicated",
+     315
+    ]
+   ],
+   "stored_events": true,
+   "steps": 13787,
+   "messages": 13784,
+   "stale_messages": 0,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 1,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 14038,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  },
+  {
+   "name": "coinbase-removed",
+   "venue": "coinbase",
+   "fixture": "raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-6fd8ece9ac35",
+   "damage": [
+    [
+     "resnapshot",
+     2488
+    ],
+    [
+     "removed",
+     630
+    ]
+   ],
+   "stored_events": true,
+   "steps": 2706,
+   "messages": 2702,
+   "stale_messages": 1513,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 3,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 630,
+     "step": "stale",
+     "reason": "sequence_gap",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 2487,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    },
+    {
+     "seq": 3320,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  },
+  {
+   "name": "coinbase-duplicated",
+   "venue": "coinbase",
+   "fixture": "raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-6fd8ece9ac35",
+   "damage": [
+    [
+     "resnapshot",
+     2488
+    ],
+    [
+     "duplicated",
+     630
+    ]
+   ],
+   "stored_events": true,
+   "steps": 2708,
+   "messages": 2704,
+   "stale_messages": 1514,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 3,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 631,
+     "step": "stale",
+     "reason": "sequence_repeat",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 2489,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    },
+    {
+     "seq": 3322,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  },
+  {
+   "name": "coinbase-duplicated-own-check",
+   "venue": "coinbase",
+   "fixture": "raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-6fd8ece9ac35",
+   "damage": [
+    [
+     "resnapshot",
+     2488
+    ],
+    [
+     "duplicated",
+     630
+    ]
+   ],
+   "stored_events": false,
+   "steps": 2704,
+   "messages": 2704,
+   "stale_messages": 1514,
+   "points": [
+    {
+     "seq": 631,
+     "step": "message",
+     "reason": "sequence_repeat",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 2489,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    }
+   ]
+  },
+  {
+   "name": "coinbase-swapped",
+   "venue": "coinbase",
+   "fixture": "raw/coinbase/BTC-USD/20261111T030647970222Z.qaraw.zst",
+   "log_id": "20261111T030647.970222600Z-6fd8ece9ac35",
+   "damage": [
+    [
+     "resnapshot",
+     2488
+    ],
+    [
+     "swapped",
+     630
+    ]
+   ],
+   "stored_events": true,
+   "steps": 2708,
+   "messages": 2703,
+   "stale_messages": 1514,
+   "points": [
+    {
+     "seq": 0,
+     "step": "reset",
+     "reason": "session_start",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 3,
+     "step": "reset",
+     "reason": "connect",
+     "stale": false,
+     "recovered": false
+    },
+    {
+     "seq": 630,
+     "step": "stale",
+     "reason": "sequence_gap",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 631,
+     "step": "stale",
+     "reason": "sequence_out_of_order",
+     "stale": true,
+     "recovered": false
+    },
+    {
+     "seq": 2488,
+     "step": "message",
+     "reason": null,
+     "stale": false,
+     "recovered": true
+    },
+    {
+     "seq": 3321,
+     "step": "reset",
+     "reason": "disconnect",
+     "stale": false,
+     "recovered": false
+    }
+   ]
+  }
+ ]
+}

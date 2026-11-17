@@ -41,6 +41,10 @@ static_assert(offsetof(MarketEvent, depth) == 76);
 static_assert(offsetof(MarketEvent, kind) == 78);
 static_assert(offsetof(MarketEvent, side) == 79);
 static_assert(offsetof(MarketEvent, flags) == 80);
+// ADR 0020: two of the seven bytes that were reserved, so no offset moved.
+static_assert(offsetof(MarketEvent, reason) == 81 && sizeof(MarketEvent::reason) == 1);
+static_assert(offsetof(MarketEvent, reserved) == 82 && sizeof(MarketEvent::reserved) == 2);
+static_assert(offsetof(MarketEvent, source) == 84 && sizeof(MarketEvent::source) == 4);
 
 static_assert(sizeof(OrderRequest) == 64 && alignof(OrderRequest) == 8);
 static_assert(offsetof(OrderRequest, client_order_id) == 0);
@@ -74,6 +78,81 @@ static_assert(static_cast<int>(qa::EventKind::BookSnapshot) == 0);
 static_assert(static_cast<int>(qa::EventKind::BookDelta) == 1);
 static_assert(static_cast<int>(qa::EventKind::BookCheckSnapshot) == 2);
 static_assert(static_cast<int>(qa::EventKind::Trade) == 3);
+// Stream control and snapshot framing (ADR 0020).
+static_assert(static_cast<int>(qa::EventKind::StreamStale) == 4);
+static_assert(static_cast<int>(qa::EventKind::StreamReset) == 5);
+static_assert(static_cast<int>(qa::EventKind::SnapshotBegin) == 6);
+static_assert(static_cast<int>(qa::EventKind::SnapshotEnd) == 7);
+static_assert(sizeof(qa::StreamReason) == 1);
+static_assert(static_cast<int>(qa::StreamReason::NoReason) == 0);
+static_assert(static_cast<int>(qa::StreamReason::SequenceGap) == 1);
+static_assert(static_cast<int>(qa::StreamReason::SequenceRepeat) == 2);
+static_assert(static_cast<int>(qa::StreamReason::SequenceOutOfOrder) == 3);
+static_assert(static_cast<int>(qa::StreamReason::ChecksumMismatch) == 4);
+static_assert(static_cast<int>(qa::StreamReason::MessageRejected) == 5);
+static_assert(static_cast<int>(qa::StreamReason::SessionStart) == 6);
+static_assert(static_cast<int>(qa::StreamReason::Connect) == 7);
+static_assert(static_cast<int>(qa::StreamReason::Disconnect) == 8);
+
+TEST(Events, OnlyStreamControlKindsAreControl) {
+  using qa::EventKind;
+  EXPECT_FALSE(qa::is_stream_control(EventKind::BookSnapshot));
+  EXPECT_FALSE(qa::is_stream_control(EventKind::BookDelta));
+  EXPECT_FALSE(qa::is_stream_control(EventKind::BookCheckSnapshot));
+  EXPECT_FALSE(qa::is_stream_control(EventKind::Trade));
+  EXPECT_TRUE(qa::is_stream_control(EventKind::StreamStale));
+  EXPECT_TRUE(qa::is_stream_control(EventKind::StreamReset));
+  EXPECT_TRUE(qa::is_stream_control(EventKind::SnapshotBegin));
+  EXPECT_TRUE(qa::is_stream_control(EventKind::SnapshotEnd));
+}
+
+TEST(Events, AReasonFitsOnlyItsKind) {
+  using qa::EventKind;
+  using qa::StreamReason;
+  const StreamReason stale[] = {StreamReason::SequenceGap, StreamReason::SequenceRepeat,
+                                StreamReason::SequenceOutOfOrder, StreamReason::ChecksumMismatch,
+                                StreamReason::MessageRejected};
+  const StreamReason reset[] = {StreamReason::SessionStart, StreamReason::Connect,
+                                StreamReason::Disconnect};
+  const EventKind others[] = {EventKind::BookSnapshot,  EventKind::BookDelta,
+                              EventKind::BookCheckSnapshot, EventKind::Trade,
+                              EventKind::SnapshotBegin, EventKind::SnapshotEnd};
+  for (const StreamReason reason : stale) {
+    EXPECT_TRUE(qa::reason_fits(EventKind::StreamStale, reason));
+    EXPECT_FALSE(qa::reason_fits(EventKind::StreamReset, reason));
+  }
+  for (const StreamReason reason : reset) {
+    EXPECT_TRUE(qa::reason_fits(EventKind::StreamReset, reason));
+    EXPECT_FALSE(qa::reason_fits(EventKind::StreamStale, reason));
+  }
+  // A control event must say why; nothing else may.
+  EXPECT_FALSE(qa::reason_fits(EventKind::StreamStale, StreamReason::NoReason));
+  EXPECT_FALSE(qa::reason_fits(EventKind::StreamReset, StreamReason::NoReason));
+  for (const EventKind kind : others) {
+    EXPECT_TRUE(qa::reason_fits(kind, StreamReason::NoReason));
+    EXPECT_FALSE(qa::reason_fits(kind, StreamReason::SequenceGap));
+    EXPECT_FALSE(qa::reason_fits(kind, StreamReason::Connect));
+  }
+  EXPECT_FALSE(qa::reason_fits(EventKind::StreamStale, static_cast<StreamReason>(9)));
+  EXPECT_FALSE(qa::reason_fits(EventKind::StreamReset, static_cast<StreamReason>(9)));
+}
+
+TEST(Events, AControlEventNamesItsSource) {
+  MarketEvent event{};
+  event.kind = qa::EventKind::StreamStale;
+  event.reason = qa::StreamReason::SequenceGap;
+  event.source = 0xFFFF'FFFFu;
+  event.seq = 1790;
+  MarketEvent copy;
+  std::memcpy(&copy, &event, sizeof event);
+  EXPECT_EQ(copy.reason, qa::StreamReason::SequenceGap);
+  EXPECT_EQ(copy.source, 0xFFFF'FFFFu);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&copy);
+  EXPECT_EQ(bytes[81], 1u);
+  EXPECT_EQ(bytes[82], 0u);
+  EXPECT_EQ(bytes[83], 0u);
+  EXPECT_EQ(bytes[84], 0xFFu);
+}
 
 TEST(Events, DefaultConstructedMessagesAreAllZeroBytes) {
   const MarketEvent event{};

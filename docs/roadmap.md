@@ -38,6 +38,7 @@ before making it.
 | 3e | The time model: two cutoffs, committed batches, receipt-time windows (ADR 0017) | Done |
 | 3f | Loads, one observation per trade, refused input (ADR 0018) | Done |
 | 3g | Fixed exponents, per-severity limits, the data core spec (ADR 0019) | Done |
+| 3h | Stream control events, a resuming reference book, the snapshot queue policy (ADR 0020) | Done |
 | 4 | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
@@ -737,7 +738,9 @@ optimization.
   compare after every message with the golden files. The stale flag must be
   set exactly where `replay` raises on the damaged fixtures from
   `damage.py`. For Kraken, use removals the tests show are caught; the table
-  above lists what each venue's rule cannot see.
+  above lists what each venue's rule cannot see. *(Phase 3h, ADR 0020: the
+  comparison is per step, and the stale and recovered points are in
+  `golden/integrity-points.json`.)*
 - **Stored events are needed for Coinbase.** Without them, a lost Coinbase
   message is invisible to the reconstructor (heartbeats and trades share the
   numbering). Always pass the instrument's `stream_events` to `replay`.
@@ -1658,26 +1661,135 @@ consolidates the data core's ADRs into one specification (ADR 0019).
   `InstrumentMeta` has no precisions, and the C++ book needs them to verify
   Kraken's checksum (digits are the mantissa divided by
   `10 ** (price_exp - price_precision)`); the Python converter Phase 4 writes
-  must carry them.
+  must carry them. *Settled in Phase 3h (ADR 0020): `InstrumentMeta` has
+  them.*
 - **A new instrument** needs an entry in `adapters.FIXED_EXPONENTS` before its
   logs load; recording it first is fine.
 - **ADR 0019's "Review" section** lists thirteen choices made while building
   this; the owner confirmed all thirteen on 2026-11-16.
 - **Still open from the review:** D1 to D7 (D1 to D3 before Phase 4's code
   against `MarketEvent`), T3, and the minor notes other than the
-  duplicate-column one.
+  duplicate-column one. *D1 to D3 settled in Phase 3h (ADR 0020); D4 to D7
+  and T3 have recommendations there.*
+
+### Phase 3h: Stream control events, a resuming reference book, the snapshot queue policy (done)
+
+Added by the owner after Phase 3g, before Phase 4. It settles the review's
+design findings D1 to D3 (ADR 0020) and records recommendations for D4 to D7
+and T3.
+
+- [x] D1: `MarketEvent` gains control kinds (stream stale: a gap, a checksum
+      mismatch or a rejected message; connection or session reset; snapshot
+      begin and end framing) and a compact numeric source id the harness
+      maps from `log_id` and connection. Layout, `static_assert`s, bindings
+      and tests updated; no offset moved.
+- [x] The C++ `InstrumentMeta` gains `price_precision` and `qty_precision`.
+- [x] D2: the reference book gains a resume mode: on an integrity failure it
+      marks the book stale and continues, and recovers at the next snapshot.
+      Strict mode stays the default, for `verify` too. The golden files gain
+      the stale and recovered points.
+- [x] D3: the policy for a large snapshot against a bounded queue, framed by
+      the begin and end events, recorded in ADR 0020 with the Phase 5
+      acceptance criteria it implies (added below).
+- [x] D4 to D7 and T3 listed in ADR 0020 with a recommendation and a phase
+      each; none implemented.
+- [x] Tests written first; spec, architecture, roadmap (Phase 4's and 5's
+      criteria) and ADRs updated.
+
+**What was built:**
+
+- `cpp/include/qa/events.hpp`: `EventKind` 4 to 7 (`StreamStale`,
+  `StreamReset`, `SnapshotBegin`, `SnapshotEnd`); `StreamReason` (byte 81);
+  `source` (`uint32`, byte 84); bytes 82 and 83 still reserved;
+  `is_stream_control` and `reason_fits`; the framing and visibility rules in
+  the header comment.
+- `cpp/include/qa/types.hpp`: `InstrumentMeta` with the precisions in what was
+  padding (still 24 bytes, now without hidden bytes).
+- Bindings: the new kinds, `StreamReason`, `MarketEvent.reason` and
+  `.source`, the layout; `from_bytes` refuses unknown kinds and reasons, a
+  reason that does not fit its kind and a control event with a market value;
+  `InstrumentMeta(id, price_exp, qty_exp, price_precision, qty_precision,
+  tick_size, lot_size)`, refusing a precision outside 0 to 18 or above its
+  exponent.
+- `book.py`: `trace` and `Step`; `mode="strict"|"resume"` on `trace`,
+  `replay`, `verify_check_snapshots` and `golden_table`; `STALE_REASONS`,
+  `RESET_REASONS`; `verify --resume`, `golden --resume`; strict `golden`
+  fails cleanly. The golden format gains `step`, `reason`, `stale` and
+  `recovered`, and a row per reset.
+- Tests: `damage.resnapshot` (a stream heartbeat replaced by a snapshot of the
+  true book); `integrity.py` (eight damaged cases and the writer of
+  `golden/integrity-points.json`); `test_book_resume.py`.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 20 C++ tests and 1,647 Python tests (17 and
+  1,537 before this phase). The Python suite took 7 min 53 s on this machine.
+- Tests written first. The Python ones were seen failing for their reason
+  (`StreamReason`, `trace` and `Step` missing): `test_core_types.py` (layout,
+  round trips of every control kind, every refusal) and `test_book_resume.py`
+  (the resume rules on hand-built streams, every kind of failure against
+  strict mode, the clean fixtures, the repair, the eight integrity cases,
+  check snapshots, the golden table, the command line). The C++ ones
+  (`test_events.cpp`, `test_types.cpp`: layouts by `static_assert`, the reason
+  rules) were written before the headers changed but not built in between.
+- **Resume mode goes stale exactly where strict mode raises**, on eleven
+  kinds of failure (five stored, three of the book's own checks, an update
+  before any snapshot and after a reset, a stored event after the last
+  message): same record, same error, and the same books before it.
+- **Recovery on fixture data:** in every damaged case the book goes stale
+  where strict mode raises and recovers at the resnapshot; after it, the
+  damaged log's book equals the undamaged log's (top 25 after every message,
+  in full at checkpoints) on Kraken and Coinbase. The resnapshot alone
+  changes no book on either fixture.
+- **Golden files regenerated with the command line:** the message rows equal
+  the previous files' rows in every previous column (compared table to
+  table); the only new rows are each stream's session start, connect and
+  disconnect (13,785 and 2,705 rows); nothing is stale or recovered on the
+  clean fixtures. `book verify` passed on both.
+- **Breakage pass:** 17 deliberate breakages of the new code (fifteen in the
+  reference book: recovery, staleness, resets, event order, the reasons, the
+  default mode, check snapshots, the golden columns, the command line; two in
+  the repair). All 17 caught.
+- The C++ build is warning-free under `/W4 /WX`.
+- **Not verified:** nothing was run against a venue; the `local_data` and
+  `network` tests were not run (nothing they cover changed). The D3 policy is
+  a decision only; nothing of it is built.
+
+**Notes for the next phases:**
+
+- **Phase 4** writes the converter from `BookMessage`s and stored stream
+  events to `MarketEvent`s to ADR 0020's table, and checks the C++ book step
+  by step against the golden files and `integrity-points.json`.
+- **Open questions for the owner** (ADR 0020): whether the recorder should
+  resubscribe on a gap, whether a check snapshot may reseed a stale book, D3's
+  numbers, the phases proposed for D4 to D7 and T3, and the Review items.
 
 ### Phase 4: C++ order book, verified
 
 - [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
-      truncation to a subscribed depth, and a stale flag on an integrity
-      failure (a sequence gap on Coinbase, a checksum mismatch on Kraken).
+      truncation to a subscribed depth, and a stale flag. A snapshot is
+      framed (`SnapshotBegin`, levels, `SnapshotEnd`) and takes effect at its
+      end; an update at its `kLastInMessage` level. The book goes stale on a
+      `StreamStale` event, on its own check failing (Kraken's checksum,
+      computed with the instrument's precisions; Coinbase's book numbers not
+      increasing), on an update with no book, and on a snapshot frame that is
+      not complete; a `StreamReset` empties it without ending staleness; a
+      complete snapshot that passes its check recovers it. *(Amended in
+      Phase 3h, ADR 0020: was "a stale flag on an integrity failure (a
+      sequence gap on Coinbase, a checksum mismatch on Kraken)".)*
 - [ ] Driven in tests from Python through the bindings, with events
       normalized by the Phase 1c adapters (C++ feed handlers come in
-      Phase 6).
-- [ ] Matches the Python reference reconstructor: top-of-book and top-20
-      depth equal the Phase 2 golden files after every event, for both
-      venues, with zero differences.
+      Phase 6) and converted to `MarketEvent`s by a Python converter built
+      in this phase: levels, snapshot frames, and control events from the
+      stored stream events by ADR 0020's table (a record's control events
+      before its levels; a source per log and connection; `kLastInMessage`
+      on every message's last level). *(Amended in Phase 3h: the converter
+      and its rules.)*
+- [ ] Matches the Python reference reconstructor: after every step of the
+      Phase 2 golden files (every message, stale and reset row), the C++
+      book's stale flag and top-of-book and top-20 depth equal the row, for
+      both venues, with zero differences. *(Amended in Phase 3h: was "after
+      every event"; the files now have a row per step.)*
 - [ ] Matches exchange snapshots under ADR 0014's rule, as the reference
       does: over the Phase 1c fixtures the book equals every
       `CHECK_SNAPSHOT` on every level (both are timed on a stream batch),
@@ -1687,14 +1799,29 @@ consolidates the data core's ADRs into one specification (ADR 0019).
       Coinbase exemption follow ADR 0014.)*
 - [ ] Both comparisons run as tests in `scripts/check.ps1` on the committed
       fixtures.
-- [ ] Gap handling tested: on the Phase 2 gap fixtures (message removed,
-      duplicated, swapped) the book is marked stale at the same event where
-      the reference reconstructor raises, and it recovers on the next
-      snapshot.
+- [ ] Gap handling tested: on the integrity cases of
+      `golden/integrity-points.json` (the Phase 2 gap fixtures: a message
+      removed, duplicated or swapped, each with a later snapshot to recover
+      at), the book goes stale and recovers at exactly the listed points, and
+      between them its top-20 equals the reference's resume-mode book after
+      every message. The two cases with no stored events test its own Kraken
+      checksum and Coinbase numbering. *(Amended in Phase 3h: was "stale at
+      the same event where the reference reconstructor raises, and it
+      recovers on the next snapshot"; resume mode goes stale exactly there,
+      and the fixtures had no next snapshot.)*
 - [ ] Zero heap allocations in steady state, asserted by a test that counts
       `operator new` calls after warm-up.
 - [ ] Benchmark for apply-delta and top-of-book recorded in the PR as the
       baseline (numbers and machine).
+- [ ] *Proposed by ADR 0020 (D7), awaiting the owner:* `from_bytes` refuses
+      the unassigned flag bit; the converter refuses a depth above 65,535
+      and an exponent outside 0 to 18; the `InstrumentMeta` binding refuses
+      exponents outside 0 to 18.
+- [ ] *Proposed by ADR 0020 (T3), awaiting the owner:* the session's first
+      commit, test-only: `stream_events` in `test_schema.py`'s `ALL`, the
+      vestigial `TRADES` exemption dropped, the identical-reload test renamed
+      to what it checks, and the `SystemClock` wall-clock exception written
+      into CLAUDE.md.
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -1707,6 +1834,17 @@ consolidates the data core's ADRs into one specification (ADR 0019).
       a Linux build exists), with a test that the affinity took effect.
 - [ ] Reusable allocation guard (counting `operator new`) for tests.
 - [ ] Queue throughput and latency benchmark recorded as baseline.
+- [ ] *(Added in Phase 3h, ADR 0020, D3.)* An all-or-nothing push of n
+      elements: it pushes all of them or none, and single-thread tests show
+      that a push that does not fit leaves nothing of it in the queue.
+- [ ] *(Added in Phase 3h.)* The two-thread stress test includes framed
+      bursts the size of a Coinbase snapshot (38,532 levels and its two frame
+      events) among single events; the consumer never sees part of a frame.
+- [ ] *(Added in Phase 3h.)* A capacity helper (the smallest power of two
+      holding twice a given largest message), tested; `StreamReason` gains
+      `QueueOverflow`, with the Python mirror and its test.
+- [ ] *(Added in Phase 3h.)* The benchmark includes pushing and draining one
+      framed Coinbase-sized snapshot.
 
 ### Phase 6: C++ feed handlers (offline)
 
@@ -1726,6 +1864,12 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 - [ ] Malformed input is rejected and counted, never crashes (a fuzz-style
       test with truncated and corrupted payloads).
 - [ ] No allocation per message after warm-up.
+- [ ] *(Added in Phase 3h, ADR 0020.)* Handlers emit snapshots framed and
+      control events with their source and reason, as the Phase 4 converter
+      does, and the two agree event for event on the fixtures. A message
+      that does not fit the queue is dropped whole and the source gets a
+      `StreamStale` (`QueueOverflow`) before anything else of it (tested
+      with a stalled consumer).
 
 ### Phase 7: Deterministic replay engine
 
@@ -1794,6 +1938,11 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       Boost.Beast with OpenSSL via vcpkg). Record in a new ADR.
 - [ ] Feed threads connect to Kraken and Coinbase public streams, with
       reconnect, resubscribe and resync.
+- [ ] *(Added in Phase 3h, ADR 0020.)* Each feed's market-data queue is sized
+      at startup from the configured largest snapshot of its instruments (at
+      least twice it; a smaller one is refused), and a resync is asked for
+      only once the queue has room for a whole snapshot, with a growing
+      backoff (tested offline with a stalled core).
 - [ ] The feed process measures its clock offset at startup as the recorder
       does (ADR 0011), refuses to start above 250 ms unless overridden, and
       records the measurement and any override.

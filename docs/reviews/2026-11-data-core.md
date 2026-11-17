@@ -72,6 +72,17 @@ and the duplicate-column error now says what is wrong. The ADR chain (A) is
 consolidated in `docs/data-core-spec.md`. Still open: D1 to D7, T3, and the
 minor notes other than the duplicate-column one.
 
+**Update, 2026-11-16 (Phase 3h, ADR 0020).** D1, D2 and D3 are decided by the
+owner. `MarketEvent` has stream control kinds (stale, reset, snapshot begin
+and end) with a reason and a source id; the C++ `InstrumentMeta` has the
+venue's precisions; the reference book has a resume mode that goes stale
+exactly where strict mode raises and recovers at the next snapshot, and the
+golden files carry the stale and recovered points (`integrity-points.json`).
+D3's policy (whole messages only, capacity from the largest snapshot, resyncs
+gated on room) is recorded for Phase 5 to build. D4 to D7 and T3 have a
+recommendation and a phase each in ADR 0020, not yet decided. Of T3's six
+tests, two were already resolved by Phases 3e and 3g.
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |

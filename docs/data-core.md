@@ -111,13 +111,20 @@ its loader failed or died; finish it, or load the log again with `ingest`.
 
 ```
 python -m quantagent.data.book verify --store data/normalized --venue kraken --instrument BTC-USD
-python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE
+python -m quantagent.data.book verify ... --resume
+python -m quantagent.data.book golden --store ... --venue ... --instrument ... --out FILE [--resume]
 ```
 
 `verify` replays every message under the venue's integrity rule and compares
 every check snapshot (spec 11); it exits 1 on an integrity failure, a
-mismatched snapshot or a crossed book. The golden files and how to regenerate
-them are in `python/tests/fixtures/golden/README.md`.
+mismatched snapshot or a crossed book. By default it is strict and stops at
+the first failure. With `--resume` (ADR 0020) it marks the book stale there
+and goes on, printing each stale period, where it recovered (the next stream
+snapshot), and how many stream messages were not applied; check snapshots
+taken while the book was stale are not compared (`stream_unreliable`). It
+still exits 1 if the book was ever stale. `golden --resume` writes the stale
+and recovered points into the table instead of failing. The golden files and
+how to regenerate them are in `python/tests/fixtures/golden/README.md`.
 
 ## 7. Clock accuracy and known data
 
