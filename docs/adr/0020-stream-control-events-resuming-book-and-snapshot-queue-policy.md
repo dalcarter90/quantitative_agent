@@ -1,6 +1,6 @@
 # 0020: Stream control events, a resuming reference book, and large snapshots against a bounded queue
 
-Status: Accepted (owner decisions, 2026-11-16); implementation choices awaiting the owner's review, see "Review". The recommendations for D4 to D7 and T3 are proposals, not decisions
+Status: Accepted (owner decisions, 2026-11-16; implementation choices, D3's numbers and the phases for D4 to D7 and T3 confirmed by the owner 2026-11-16, see "Owner's answers" and "Review")
 Date: 2026-11-16
 Amends: 0004 (the full-queue policy, for messages of many events). Restated in `docs/data-core-spec.md` (sections 6, 11, 12) and `docs/architecture.md` (sections 4.1, 5, 6.3)
 
@@ -55,6 +55,22 @@ The owner decided on 2026-11-16:
    implies are added to the roadmap.
 5. **D4 to D7 and T3** are listed below with a recommendation and a phase
    each. None is implemented.
+
+Asked on the pull request (2026-11-16), the owner also decided:
+
+6. **The recommendations for D4 to D7 and T3 stand, in the phases given.**
+   The `SystemClock` exception to CLAUDE.md's test rules is approved (written
+   in this change; the rest of T3 is Phase 4's first commit).
+7. **D3's numbers stand:** at least twice the largest snapshot, a message
+   that does not fit dropped whole rather than the feed waiting, and resyncs
+   gated on room with a growing backoff.
+8. **A check snapshot may not reseed a stale book.**
+9. **The recorder does not resubscribe on a gap.** Instead, in the recorder
+   phase (with D5 and D6, before Phase 8; roadmap Phase 7a), it reconnects
+   its stream on a fixed interval, configurable, between 15 and 30 minutes,
+   so a gap costs at most one interval of stale book in recorded data. A
+   scheduled reconnect must not be a quality WARNING, as an unscheduled one
+   is.
 
 ## How it is built
 
@@ -267,13 +283,15 @@ resyncs (rules 3 and 5).
 
 ## Recommendations for D4 to D7 and T3
 
-Proposals; none is implemented, and each needs the owner's decision.
+Confirmed by the owner, with their phases (decision 6); none is implemented
+here except the CLAUDE.md exception of T3. D5 and D6 are joined in the
+recorder phase by decision 9's periodic reconnect.
 
 | Finding | Where it stands | Recommendation | Phase |
 |---------|-----------------|----------------|-------|
 | **D4.** A session per decision time is slow, and slower with history | The replay cursor (ADR 0017) removed the cost of opening a session per decision. A range query still resolves record versions over everything the session can see before filtering on the window (spec 12) | The cursor's version is fixed for its life, so it can resolve versions once, when it opens, and `advance` then only filters on receipt time. Measure a one-hour replay at one decision a second, each reading a one-second book window, record it as the baseline, and set a budget from it. A derived top-of-book or checkpoint dataset only if Phase 12's features need the book in research | 7 (replay engine), where the cost first matters; the derived dataset in 12 if needed |
-| **D5.** `recv_ts` in recordings is when the recorder's coroutine resumed; probes share its event loop and link | Unchanged; stated in spec 12 | Take the probe connection on its own thread with its own event loop, stamping its records there, with one writer for the log; then measure the stream's lag around probes again. Record the data that latency models will be calibrated on after that | A small recorder phase before Phase 8 (the simulated exchange models latency from these stamps) |
-| **D6.** The `clock_skew` band was calibrated on data with a 1.4 s clock error | Unchanged. The synchronized 60-second recordings of 2026-11-17 had median lags of 0.154 s (Kraken) and 0.599 s (Coinbase), well above the ~95 ms seen before, unexplained | Measure the clock again at session stop (a second `CLOCK_OFFSET`, compared by `recording_clock`); explain the lag before tightening anything; then set the band from synchronized recordings | With D5, before Phase 8 |
+| **D5.** `recv_ts` in recordings is when the recorder's coroutine resumed; probes share its event loop and link | Unchanged; stated in spec 12 | Take the probe connection on its own thread with its own event loop, stamping its records there, with one writer for the log; then measure the stream's lag around probes again. Record the data that latency models will be calibrated on after that | A small recorder phase before Phase 8, Phase 7a (the simulated exchange models latency from these stamps) |
+| **D6.** The `clock_skew` band was calibrated on data with a 1.4 s clock error | Unchanged. The synchronized 60-second recordings of 2026-11-17 had median lags of 0.154 s (Kraken) and 0.599 s (Coinbase), well above the ~95 ms seen before, unexplained | Measure the clock again at session stop (a second `CLOCK_OFFSET`, compared by `recording_clock`); explain the lag before tightening anything; then set the band from synchronized recordings | With D5, Phase 7a |
 | **D7.** C++ nits | `InstrumentId` fixed in Phase 3g. Open: `depth` is 16 bits while the schema stores int32 and the adapters accept up to 100,000; `from_bytes` accepts the unassigned flag bit 0x80; `InstrumentMeta` accepts any int8 exponent | `from_bytes` refuses unknown flag bits; the Phase 4 converter refuses a depth above 65,535 and an exponent outside 0 to 18 (no schema change: Kraken's largest depth is 1,000); the `InstrumentMeta` binding refuses exponents outside 0 to 18 as it now does precisions | 4 |
 | **T3.** Six tests whose names promised more than they checked | Two are resolved: the property test (renamed in Phase 3e) covers `stream_events`, and the quality test now checks both cutoffs at their boundaries (`test_checks_only_see_what_the_session_sees`). A reload that removes rows is now tested in `test_loads.py`. Open: `test_schema.py`'s `ALL` holds three datasets, not `stream_events`; `test_no_key_depends_on_receive_time` still exempts `TRADES`, which no longer needs it; `test_normalizing_a_log_again_keeps_its_id_so_rows_are_corrections` checks an identical reload only; the C++ `SystemClock` test asserts on the wall clock, which CLAUDE.md forbids without an exception written down | Add `STREAM_EVENTS` to `ALL` (with a row factory); drop the `TRADES` exemption; rename the reload test to what it checks; write the `SystemClock` exception into CLAUDE.md's test rules (a CLAUDE.md change, so the owner's) | Test-only: the first commit of Phase 4's session, before its own work |
 
@@ -349,27 +367,37 @@ Proposals; none is implemented, and each needs the owner's decision.
 - **ADR 0004's full-queue rule for market data** is refined by D3: whole
   messages only, and resyncs gated on room. Its other edges are unchanged.
 - **`MarketEvent` has two reserved bytes left** (82 and 83).
-- **Recorded data still cannot recover within a session** unless the venue
-  sends a new snapshot: the recorder never resubscribes, so a lost Coinbase
-  message leaves the rest of that connection stale (open question below).
+- **Recorded data recovers within a session only at a new snapshot.** Until
+  the recorder phase, the recorder never reconnects on purpose, so a lost
+  Coinbase message leaves the rest of that connection stale. After it, the
+  stream is reconnected every 15 to 30 minutes (decision 9), so a gap costs
+  at most one interval.
 - **The Python suite grows by about a minute** (`test_book_resume.py` took
   65 s alone; the eight damaged cases are replayed and compared on every run).
 
-## Open questions for the owner
+## Owner's answers
+
+The questions this ADR first left open, and the owner's answers on the pull
+request (2026-11-16):
 
 1. **Should the recorder resubscribe when it sees a gap** (it would have to
    read Coinbase's `sequence_num`), so recorded data recovers within a
-   session? Recommendation: not now; the recorder stays a byte recorder, and
-   Phase 11's feed handlers resync live.
-2. **May a check snapshot reseed a stale book?** Recommendation: no, for the
-   reason above.
+   session? *Recommended: not now.* **Answer: no gap-triggered resubscribe;
+   the recorder reconnects its stream every 15 to 30 minutes, configurable,
+   in the recorder phase** (decision 9). It stays a byte recorder: the
+   reconnect is on a timer, not on anything it parses.
+2. **May a check snapshot reseed a stale book?** *Recommended: no.*
+   **Answer: no** (decision 8).
 3. **D3's numbers:** twice the largest snapshot, drop whole rather than wait,
-   resync gated on room with a growing backoff.
-4. **D4 to D7 and T3:** the phases recommended above.
+   resync gated on room with a growing backoff. **Answer: confirmed**
+   (decision 7).
+4. **D4 to D7 and T3:** the phases recommended above. **Answer: confirmed,
+   with the `SystemClock` exception approved** (decision 6).
 
 ## Review
 
-Choices made while building it, awaiting the owner:
+Choices made while building it. **Confirmed by the owner, 2026-11-16: all
+fifteen, as written.**
 
 1. **Kind numbers and names:** `StreamStale` 4, `StreamReset` 5,
    `SnapshotBegin` 6, `SnapshotEnd` 7; one `StreamReason` byte, 1 to 5 stale

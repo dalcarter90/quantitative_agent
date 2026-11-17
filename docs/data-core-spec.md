@@ -739,14 +739,16 @@ refused).
   probes share its event loop and link (review, D5).
 - **The clock is measured at session start only;** the `clock_skew` band was
   calibrated on data with a 1.4 s clock error (review, D6).
-- **Recorded data recovers only at a new snapshot.** The recorder never
-  resubscribes, so after a lost message the rest of that connection is stale
-  in resume mode, until a reconnect or the next session (ADR 0020, open
-  question).
+- **Recorded data recovers only at a new snapshot.** The recorder does not
+  resubscribe on a gap, so after a lost message the rest of that connection is
+  stale in resume mode, until a reconnect or the next session. The recorder
+  phase (before Phase 8) makes it reconnect its stream every 15 to 30 minutes,
+  configurable, so a gap costs at most one interval (ADR 0020, decision 9).
 - **Settled by ADR 0020** (review, D1 to D3): `MarketEvent` has control kinds
   and a source; the C++ `InstrumentMeta` has the precisions; the reference book
   resumes; the policy for a large snapshot against a bounded queue is decided
-  and is built in Phase 5. D4 to D7 have recommendations there, not decisions.
+  and is built in Phase 5. D4 to D7 are assigned to phases there (D4 Phase 7,
+  D5 and D6 the recorder phase, D7 Phase 4).
 - The Linux preset and the `__int128` path are unbuilt.
 
 ## Appendix A: where each ADR's decisions are now
@@ -767,7 +769,7 @@ refused).
 | 0017 | Two cutoffs, committed batches, receipt-time windows, replay cursor | 2, 8, 9 | Superseded |
 | 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9, 10 | Superseded |
 | 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; implementation choices confirmed |
-| 0020 | The stream events a book acts on; the reference book's resume mode, steps and golden points (and, outside the data core, `MarketEvent`'s control kinds and the queue policy) | 6, 11, 12 | Restated here; implementation choices awaiting the owner |
+| 0020 | The stream events a book acts on; the reference book's resume mode, steps and golden points (and, outside the data core, `MarketEvent`'s control kinds and the queue policy) | 6, 11, 12 | Restated here; implementation choices confirmed |
 
 ADRs 0001 to 0004 and 0007 are not about the data core. ADR 0020 is in part:
 its `MarketEvent` and queue decisions are in architecture sections 5 and 6.3.

@@ -497,7 +497,7 @@ def _everything(root, version=None):
     return found
 
 
-@pytest.mark.parametrize("venue", ["kraken", "coinbase"])
+@pytest.mark.parametrize("venue", ["kraken", pytest.param("coinbase", marks=pytest.mark.slow)])
 def test_loading_a_log_twice_reads_the_same_as_loading_it_once(tmp_path, venue):
     once, twice = tmp_path / "once", tmp_path / "twice"
     ingest(fixture_path(venue), AppendOnlyStore(once))
@@ -509,6 +509,7 @@ def test_loading_a_log_twice_reads_the_same_as_loading_it_once(tmp_path, venue):
     assert len(files) == 2 * len(list(once.rglob("*.parquet")))  # both loads are on disk
 
 
+@pytest.mark.slow
 def test_a_reload_after_a_fix_clears_the_coinbase_errors_the_fix_resolved(tmp_path):
     """The review's R04 experiment on Coinbase left two phantom errors: the
     rejected message, and the sequence gap it caused."""

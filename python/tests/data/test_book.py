@@ -520,6 +520,7 @@ def test_kraken_a_lost_top_of_book_update_raises_at_the_next_message():
     assert error.expected != error.computed
 
 
+@pytest.mark.slow
 def test_kraken_own_checksum_and_the_adapters_events_agree():
     records = kraken_records()
     updates = book_updates(records)
@@ -542,6 +543,7 @@ def test_kraken_own_checksum_and_the_adapters_events_agree():
     assert agreed >= 6
 
 
+@pytest.mark.slow
 def test_kraken_cannot_see_a_lost_update_below_the_top_ten_levels():
     """Documents a limit of the venue's rule: its checksum covers ten levels per
     side of a 25-level book. A lost update that never reaches the top ten
@@ -613,6 +615,7 @@ def test_coinbase_a_gap_is_invisible_from_the_book_messages_alone():
     assert outcome(removed(records, lost.seq), "coinbase", use_events=False) is None
 
 
+@pytest.mark.slow
 def test_coinbase_a_repeated_message_raises():
     records = coinbase_records()
     target = book_updates(records)[500]

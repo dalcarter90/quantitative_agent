@@ -281,7 +281,10 @@ def test_replay_in_resume_mode_yields_every_stream_message():
 # --- the recorded fixtures --------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module", params=["kraken", "coinbase"])
+SLOW = pytest.mark.slow  # over about 5 s (CLAUDE.md, "Working efficiently")
+
+
+@pytest.fixture(scope="module", params=["kraken", pytest.param("coinbase", marks=SLOW)])
 def clean(request):
     venue = request.param
     records = list(read_fixture(venue))
@@ -347,7 +350,12 @@ def test_a_resnapshot_alone_changes_no_book(clean):
 # --- the integrity cases (golden/integrity-points.json) ----------------------------------------
 
 
-@pytest.fixture(scope="module", params=CASES, ids=lambda c: c.name)
+# The Coinbase cases normalize a 38,000-level book: each takes over 5 s.
+@pytest.fixture(
+    scope="module",
+    params=[pytest.param(c, marks=SLOW) if c.venue == "coinbase" else c for c in CASES],
+    ids=lambda c: c.name,
+)
 def case(request):
     return request.param
 
@@ -394,7 +402,7 @@ def test_each_case_goes_stale_where_strict_mode_raises_and_recovers_at_the_resna
     assert not any(s.stale for s in steps[index[1] :])
 
 
-@pytest.mark.parametrize("name", ["kraken-removed", "coinbase-removed"])
+@pytest.mark.parametrize("name", ["kraken-removed", pytest.param("coinbase-removed", marks=SLOW)])
 def test_after_recovery_the_book_is_the_true_book_again(name):
     """After the recovering snapshot, the damaged log's book equals the
     undamaged log's at every message: nothing of the stale period remains."""

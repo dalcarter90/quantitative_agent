@@ -19,6 +19,7 @@ The properties:
 import tempfile
 from pathlib import Path
 
+import pytest
 from _builders import INT64_MAX, LOG, NS_PER_DAY, T0
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -318,6 +319,7 @@ AVAILABILITY = st.one_of(
 )
 
 
+@pytest.mark.slow
 @settings(max_examples=60, deadline=None)
 @given(
     history_spec=st.lists(batches(), min_size=1, max_size=6),
@@ -342,6 +344,7 @@ def test_no_method_returns_a_row_it_should_not(
             _check_session(session, expected, available_at, session.version, committed, window)
 
 
+@pytest.mark.slow
 @settings(max_examples=25, deadline=None)
 @given(
     history_spec=st.lists(batches(), min_size=1, max_size=5),

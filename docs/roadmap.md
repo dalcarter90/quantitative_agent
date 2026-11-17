@@ -43,6 +43,7 @@ before making it.
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
 | 7 | Deterministic replay engine | Not started |
+| 7a | Recorder fidelity: probes apart, clock at stop, periodic reconnect (ADR 0020) | Not started |
 | 8 | Simulated exchange and cost model | Not started |
 | 9 | Pre-trade risk checks and kill switch | Not started |
 | 10 | Order state machine and paper gateway | Not started |
@@ -1695,6 +1696,15 @@ and T3.
       each; none implemented.
 - [x] Tests written first; spec, architecture, roadmap (Phase 4's and 5's
       criteria) and ADRs updated.
+- [x] Owner decisions on the PR (2026-11-16): ADR 0020's fifteen Review items,
+      D3's numbers and the phases for D4 to D7 and T3 confirmed; a check
+      snapshot may not reseed a stale book; no gap-triggered resubscribe, but
+      the recorder reconnects its stream every 15 to 30 minutes in the
+      recorder phase (Phase 7a below); the `SystemClock` test exception
+      written into CLAUDE.md.
+- [x] Added by the owner during the PR: a "Working efficiently" section in
+      CLAUDE.md, and a `slow` marker on tests slower than about 5 s, which
+      `check.ps1` runs and day-to-day runs can skip (`--skip-slow`).
 
 **What was built:**
 
@@ -1754,15 +1764,21 @@ and T3.
 - **Not verified:** nothing was run against a venue; the `local_data` and
   `network` tests were not run (nothing they cover changed). The D3 policy is
   a decision only; nothing of it is built.
+- **After the owner's decisions:** 24 tests marked `slow` from a measured full
+  run (each over 5 s of its own time, or the slow case of a parametrized
+  test); `--skip-slow` collects 1,626 of the 1,650 default tests. The
+  `--skip-slow` option and the reminder are tested on a sample project
+  (`test_run_options.py`). No breakage pass: docs and test-only changes
+  (CLAUDE.md, "Working efficiently"). `scripts/check.ps1`: ALL GREEN, 20 C++
+  tests and 1,650 Python tests.
 
 **Notes for the next phases:**
 
 - **Phase 4** writes the converter from `BookMessage`s and stored stream
   events to `MarketEvent`s to ADR 0020's table, and checks the C++ book step
   by step against the golden files and `integrity-points.json`.
-- **Open questions for the owner** (ADR 0020): whether the recorder should
-  resubscribe on a gap, whether a check snapshot may reseed a stale book, D3's
-  numbers, the phases proposed for D4 to D7 and T3, and the Review items.
+- **The owner answered ADR 0020's open questions** on the PR; see its
+  "Owner's answers". The recorder phase is Phase 7a.
 
 ### Phase 4: C++ order book, verified
 
@@ -1813,15 +1829,15 @@ and T3.
       `operator new` calls after warm-up.
 - [ ] Benchmark for apply-delta and top-of-book recorded in the PR as the
       baseline (numbers and machine).
-- [ ] *Proposed by ADR 0020 (D7), awaiting the owner:* `from_bytes` refuses
-      the unassigned flag bit; the converter refuses a depth above 65,535
-      and an exponent outside 0 to 18; the `InstrumentMeta` binding refuses
+- [ ] *(Added in Phase 3h, ADR 0020, D7.)* `from_bytes` refuses the
+      unassigned flag bit; the converter refuses a depth above 65,535 and an
+      exponent outside 0 to 18; the `InstrumentMeta` binding refuses
       exponents outside 0 to 18.
-- [ ] *Proposed by ADR 0020 (T3), awaiting the owner:* the session's first
-      commit, test-only: `stream_events` in `test_schema.py`'s `ALL`, the
-      vestigial `TRADES` exemption dropped, the identical-reload test renamed
-      to what it checks, and the `SystemClock` wall-clock exception written
-      into CLAUDE.md.
+- [ ] *(Added in Phase 3h, ADR 0020, T3.)* The session's first commit,
+      test-only: `stream_events` in `test_schema.py`'s `ALL`, the vestigial
+      `TRADES` exemption dropped, and the identical-reload test renamed to
+      what it checks. (The `SystemClock` exception is already in CLAUDE.md,
+      written in Phase 3h.)
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -1889,6 +1905,40 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
 - [ ] A test proves the callback cannot see data after simulated time, and
       cannot move the cursor.
 - [ ] Replay speed recorded (events per second) as baseline.
+- [ ] *(Added in Phase 3h, ADR 0020, D4.)* The cursor resolves record
+      versions once, when it opens (its version is fixed for its life), and
+      `advance` only filters on receipt time. A one-hour replay at one
+      decision a second, each reading a one-second book window, is measured
+      and recorded as the baseline, and a budget is set from it.
+
+### Phase 7a: Recorder fidelity
+
+Added in Phase 3h (ADR 0020), before Phase 8, whose latency model is
+calibrated on the recordings' receipt stamps. Data core: changes the recorder
+and the quality checks, and needs an ADR and a spec edit.
+
+- [ ] D5: the probe connection runs on its own thread with its own event
+      loop and stamps its records there; one writer keeps the log in `seq`
+      order. The stream's lag around probes is measured again, before and
+      after, on recordings of at least 30 minutes.
+- [ ] D6: the recorder measures its clock again at session stop (a second
+      `CLOCK_OFFSET`), and `recording_clock` compares the two. The higher
+      median lags of the 2026-11-17 recordings (0.154 s Kraken, 0.599 s
+      Coinbase) are explained before the `clock_skew` band is tightened; the
+      band is then set from synchronized recordings.
+- [ ] Periodic reconnect (owner decision, ADR 0020 decision 9): the recorder
+      closes and reopens its stream connection on a fixed interval,
+      configurable from 15 to 30 minutes (outside that range refused), so a
+      lost message costs at most one interval of stale book. It does not
+      resubscribe on a gap. Each reconnect is recorded (`disconnect` with a
+      reason saying it was scheduled, then `connect`), fetches metadata
+      first as at session start, and is tested deterministically with
+      scripted clocks.
+- [ ] The quality checks treat a scheduled reconnect as normal (no
+      `disconnect` or `reconnect` WARNING for it), and an unscheduled one
+      as before.
+- [ ] On a recording with a message removed, resume-mode replay recovers at
+      the next scheduled reconnect's snapshot.
 
 ### Phase 8: Simulated exchange and cost model
 
