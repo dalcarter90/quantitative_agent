@@ -107,6 +107,10 @@ struct MarketEvent {
   static constexpr std::uint8_t kHasDepth = 1u << 4;
   static constexpr std::uint8_t kHasTradeId = 1u << 5;
   static constexpr std::uint8_t kEventTsFromReceipt = 1u << 6;  // ADR 0008
+  // Every assigned flag; the eighth bit is unassigned (review D7, ADR 0020).
+  static constexpr std::uint8_t kKnownFlags =
+      static_cast<std::uint8_t>(kLastInMessage | kHasMono | kHasVenueSeq | kHasChecksum |
+                                kHasDepth | kHasTradeId | kEventTsFromReceipt);
 
   Timestamp recv_ts;
   MonoTimestamp recv_mono;

@@ -39,7 +39,8 @@ before making it.
 | 3f | Loads, one observation per trade, refused input (ADR 0018) | Done |
 | 3g | Fixed exponents, per-severity limits, the data core spec (ADR 0019) | Done |
 | 3h | Stream control events, a resuming reference book, the snapshot queue policy (ADR 0020) | Done |
-| 4 | C++ order book, verified | Not started |
+| 4a | The MarketEvent converter, D7, T3 (ADR 0021) | Done |
+| 4b | C++ order book, verified | Not started |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
 | 7 | Deterministic replay engine | Not started |
@@ -1780,7 +1781,86 @@ and T3.
 - **The owner answered ADR 0020's open questions** on the PR; see its
   "Owner's answers". The recorder phase is Phase 7a.
 
-### Phase 4: C++ order book, verified
+### Phase 4: C++ order book, verified (split into 4a and 4b)
+
+Split by the owner on 2026-11-17 into two pull requests: 4a, the converter
+from stored data to `MarketEvent`s with the review's D7 and T3, and 4b, the
+C++ book and its verification. Every original Phase 4 criterion is below,
+under the part that meets it.
+
+### Phase 4a: The MarketEvent converter, D7, T3 (done)
+
+- [x] *(Added in Phase 3h, ADR 0020, T3.)* The session's first commit,
+      test-only: `stream_events` in `test_schema.py`'s `ALL`, the vestigial
+      `TRADES` exemption dropped, and the identical-reload test renamed to
+      what it checks. (The `SystemClock` exception is already in CLAUDE.md,
+      written in Phase 3h.)
+- [x] *(Added in Phase 3h, ADR 0020, D7.)* `from_bytes` refuses the
+      unassigned flag bit; the converter refuses a depth above 65,535 and an
+      exponent outside 0 to 18; the `InstrumentMeta` binding refuses
+      exponents outside 0 to 18.
+- [x] The converter half of the original "Driven in tests" criterion: a
+      Python converter from the stored book events and stream events to
+      `MarketEvent`s, by ADR 0020's rules: levels, snapshot frames (stream
+      and check), and control events from the stored stream events by its
+      table (a record's control events before its levels; a source per log
+      and connection; `kLastInMessage` on every message's last level).
+      Its own choices are ADR 0021.
+- [x] Its steps are the reference book's, one for one, on both fixtures and
+      the eight integrity cases, and every event it makes is one
+      `MarketEvent.from_bytes` accepts.
+
+**What was built:**
+
+- `python/src/quantagent/marketevents.py`: `convert(book_events,
+  stream_events, instruments, *, instrument, sources=None)`, yielding one
+  `EventGroup(log_id, seq, step, events)` per step (`message`, `check`,
+  `stale`, `reset`); `SourceMap`; `MAX_DEPTH`. It reads nothing itself.
+- `cpp/include/qa/events.hpp`: `MarketEvent::kKnownFlags`. Bindings:
+  `MarketEvent.KNOWN_FLAGS`; `from_bytes` refuses any other flag bit;
+  `InstrumentMeta` refuses an exponent outside 0 to 18.
+- Tests: `test_marketevents.py` (41, six of them `slow`); T3's changes to
+  `test_schema.py` and `test_log_id.py`; seven binding tests in
+  `test_core_types.py`.
+- ADR 0021; architecture section 6.3.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 20 C++ tests and 1,724 Python tests (1,650
+  before: 41 converter tests, 26 `stream_events` cases from T3, seven binding
+  tests). The Python suite took 11 min 1 s, against 8 min 11 s for the last
+  run of Phase 3h; the machine was slower throughout, and the slow-test
+  reminder listed eight existing Coinbase tests at 5.0 to 5.8 s that stayed
+  under 4.8 s in the measured run. They are not marked (owner's call).
+- Tests written first and seen failing for their reason: the converter tests
+  (no module), the binding tests (no exponent check, no `KNOWN_FLAGS`).
+- The converter's steps equal the reference book's resume-mode steps (record,
+  step and reason) on both fixtures and all eight integrity cases, with and
+  without stored events as each case says; every event of both fixtures
+  survives `to_bytes` and `from_bytes`; every stored row is one level event,
+  every snapshot (stream and check) one frame.
+- Converting the Coinbase fixture takes 1.1 s, Kraken's 0.24 s.
+- **Breakage pass:** 20 deliberate breakages of the converter (flags, frames,
+  sources, ordering, venue times, the refusals, the source map) and 2 of the
+  D7 binding checks (each rebuilt): all 22 caught.
+- T3 added 26 `stream_events` cases to `test_schema.py`, all passing.
+
+**Notes for Phase 4b:**
+
+- **The book learns a frame's kind from its levels.** `SnapshotBegin` does
+  not say whether a stream or a check snapshot follows (ADR 0020), so the C++
+  book must not touch the stream's book until it sees the first level, and a
+  check snapshot's frame must leave it as it was.
+- **Ask the owner: how a precision change reaches the C++ book.** Kraken can
+  change a pair's printed precision mid-session (an `instrument` update), and
+  the checksum's digits follow it; `MarketEvent` carries no metadata. The
+  converter passes such a change through (ADR 0021); the book needs either a
+  metadata path or a rule to refuse it.
+- **Ask the owner: the book's capacity.** A Coinbase book is about 38,500
+  levels (both sides); a book that allocates nothing after startup needs a
+  capacity per side, and a rule for a message that would exceed it.
+
+### Phase 4b: C++ order book, verified
 
 - [ ] L2 order book: apply snapshot, apply delta, top-N query, best bid/ask,
       truncation to a subscribed depth, and a stale flag. A snapshot is
@@ -1795,12 +1875,9 @@ and T3.
       sequence gap on Coinbase, a checksum mismatch on Kraken)".)*
 - [ ] Driven in tests from Python through the bindings, with events
       normalized by the Phase 1c adapters (C++ feed handlers come in
-      Phase 6) and converted to `MarketEvent`s by a Python converter built
-      in this phase: levels, snapshot frames, and control events from the
-      stored stream events by ADR 0020's table (a record's control events
-      before its levels; a source per log and connection; `kLastInMessage`
-      on every message's last level). *(Amended in Phase 3h: the converter
-      and its rules.)*
+      Phase 6) and converted by the Phase 4a converter
+      (`quantagent.marketevents`, ADR 0021). *(Amended in Phase 4a: the
+      converter is built there; this half drives the book with it.)*
 - [ ] Matches the Python reference reconstructor: after every step of the
       Phase 2 golden files (every message, stale and reset row), the C++
       book's stale flag and top-of-book and top-20 depth equal the row, for
@@ -1829,15 +1906,6 @@ and T3.
       `operator new` calls after warm-up.
 - [ ] Benchmark for apply-delta and top-of-book recorded in the PR as the
       baseline (numbers and machine).
-- [ ] *(Added in Phase 3h, ADR 0020, D7.)* `from_bytes` refuses the
-      unassigned flag bit; the converter refuses a depth above 65,535 and an
-      exponent outside 0 to 18; the `InstrumentMeta` binding refuses
-      exponents outside 0 to 18.
-- [ ] *(Added in Phase 3h, ADR 0020, T3.)* The session's first commit,
-      test-only: `stream_events` in `test_schema.py`'s `ALL`, the vestigial
-      `TRADES` exemption dropped, and the identical-reload test renamed to
-      what it checks. (The `SystemClock` exception is already in CLAUDE.md,
-      written in Phase 3h.)
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -1881,8 +1949,8 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       test with truncated and corrupted payloads).
 - [ ] No allocation per message after warm-up.
 - [ ] *(Added in Phase 3h, ADR 0020.)* Handlers emit snapshots framed and
-      control events with their source and reason, as the Phase 4 converter
-      does, and the two agree event for event on the fixtures. A message
+      control events with their source and reason, as the Phase 4a converter
+      does (ADR 0021), and the two agree event for event on the fixtures. A message
       that does not fit the queue is dropped whole and the source gets a
       `StreamStale` (`QueueOverflow`) before anything else of it (tested
       with a stalled consumer).

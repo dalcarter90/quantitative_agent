@@ -194,6 +194,10 @@ TEST(Events, FlagsAreDistinctBits) {
     EXPECT_EQ(seen & flag, 0u) << flag;
     seen |= flag;
   }
+  // Review D7 (ADR 0020): kKnownFlags is exactly these, so the eighth bit is
+  // unassigned and from_bytes refuses it.
+  EXPECT_EQ(seen, MarketEvent::kKnownFlags);
+  EXPECT_EQ(MarketEvent::kKnownFlags, 0x7Fu);
 }
 
 }  // namespace

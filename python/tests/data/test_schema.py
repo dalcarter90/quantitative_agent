@@ -7,15 +7,17 @@ from quantagent.data.schema import (
     BOOK_EVENTS,
     DATASETS,
     INSTRUMENTS,
+    STREAM_EVENTS,
     TRADES,
     BookEventKind,
     SchemaError,
     Side,
+    StreamEventKind,
     table_from_rows,
     validate_table,
 )
 
-ALL = [TRADES, BOOK_EVENTS, INSTRUMENTS]
+ALL = [TRADES, BOOK_EVENTS, INSTRUMENTS, STREAM_EVENTS]
 
 
 def trade_row(**overrides):
@@ -73,15 +75,37 @@ def instrument_row(**overrides):
     return row
 
 
-ROW_FACTORIES = {"trades": trade_row, "book_events": book_row, "instruments": instrument_row}
+def stream_event_row(**overrides):
+    # Integrity events are always stamped with the receipt time (ADR 0010).
+    row = {
+        "event_ts": 1_700_000_000_050_000_000,
+        "event_ts_source": "receipt",
+        "recv_ts": 1_700_000_000_050_000_000,
+        "log_id": "20231114T120000.000000000Z-000000000000",
+        "seq": 1,
+        "event_index": 0,
+        "kind": StreamEventKind.SEQUENCE_GAP,
+        "connection": "ws",
+        "expected": 5,
+        "observed": 7,
+        "detail": None,
+    }
+    row.update(overrides)
+    return row
+
+
+ROW_FACTORIES = {"trades": trade_row, "book_events": book_row, "instruments": instrument_row,
+                 "stream_events": stream_event_row}  # fmt: skip
 
 
 def test_the_datasets_are_registered():
-    # stream_events (ADR 0010) has its own tests in test_stream_events.py.
+    # stream_events (ADR 0010) also has its own tests in test_stream_events.py.
     assert set(DATASETS) == {"trades", "book_events", "instruments", "stream_events"}
     assert DATASETS["trades"] is TRADES
     assert DATASETS["book_events"] is BOOK_EVENTS
     assert DATASETS["instruments"] is INSTRUMENTS
+    assert DATASETS["stream_events"] is STREAM_EVENTS
+    assert {d.name for d in ALL} == set(DATASETS)  # "every dataset" means all four
 
 
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
@@ -300,7 +324,8 @@ def test_validate_table_rejects_non_tables():
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
 def test_every_dataset_is_at_its_schema_version_with_event_ts_source(dataset):
     # instruments is version 4 since it holds the venue's precisions (ADR 0019).
-    assert dataset.version == {"trades": 3, "book_events": 3, "instruments": 4}[dataset.name]
+    versions = {"trades": 3, "book_events": 3, "instruments": 4, "stream_events": 2}
+    assert dataset.version == versions[dataset.name]
     field = dataset.schema.field("event_ts_source")
     assert field.type == pa.string()
     assert not field.nullable
@@ -325,6 +350,14 @@ def test_a_receipt_row_must_hold_recv_ts_in_event_ts(dataset):
     table_from_rows(dataset, [factory(event_ts_source="receipt", event_ts=77, recv_ts=77)])
     with pytest.raises(SchemaError, match="receipt"):
         table_from_rows(dataset, [factory(event_ts_source="receipt", event_ts=76, recv_ts=77)])
+    if dataset is STREAM_EVENTS:
+        # An integrity event has no venue time: it is noticed at a record (ADR 0010).
+        assert dataset.allowed["event_ts_source"] == {"receipt"}
+        for event_ts in (76, 77, 78):
+            with pytest.raises(SchemaError, match="event_ts_source"):
+                row = factory(event_ts_source="venue", event_ts=event_ts, recv_ts=77)
+                table_from_rows(dataset, [row])
+        return
     # A venue timestamp may equal, precede or follow the receipt time.
     for event_ts in (76, 77, 78):
         table_from_rows(dataset, [factory(event_ts_source="venue", event_ts=event_ts, recv_ts=77)])
@@ -400,7 +433,7 @@ def test_every_row_names_the_raw_log_it_came_from(dataset):
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
 def test_no_key_depends_on_receive_time(dataset):
     assert "recv_ts" not in dataset.key
-    assert "event_ts" not in dataset.key or dataset is TRADES
+    assert "event_ts" not in dataset.key  # trades too, since ADR 0018
 
 
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)

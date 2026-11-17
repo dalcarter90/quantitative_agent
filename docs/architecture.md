@@ -434,8 +434,19 @@ Stream control (ADR 0020):
   nothing between them; this applies to check snapshots too. An update takes
   effect at its `kLastInMessage` level, a snapshot at its `SnapshotEnd`.
 - `MarketEvent.from_bytes` refuses unknown kinds and reasons, a reason that
-  does not fit its kind, a control event carrying a market value, and
-  non-zero reserved bytes.
+  does not fit its kind, a control event carrying a market value, a flag bit
+  outside `kKnownFlags`, and non-zero reserved bytes. The `InstrumentMeta`
+  binding refuses an exponent outside 0 to 18, and a precision outside 0 to
+  18 or above its exponent.
+- **From stored data:** `quantagent.marketevents.convert(book_events,
+  stream_events, instruments, *, instrument, sources)` turns what a
+  `PITSession` returns into these events, one group per step in the
+  reference book's order (message, check snapshot, stale, reset), with the
+  sources numbered by a `SourceMap` the caller can share (ADR 0021). It
+  refuses what an event cannot carry: a depth above 65,535, an exponent
+  outside 0 to 18 or not the instrument's fixed one, a message with no
+  metadata. The C++ book is driven with it in tests (Phase 4b), and the C++
+  feed handlers are compared with it (Phase 6).
 
 `OrderRequest`, 64 bytes (core to execution): `client_order_id` 0,
 `target_order_id` 8 (the order a cancel refers to), `price` 16, `qty` 24,

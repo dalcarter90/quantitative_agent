@@ -748,7 +748,7 @@ refused).
   and a source; the C++ `InstrumentMeta` has the precisions; the reference book
   resumes; the policy for a large snapshot against a bounded queue is decided
   and is built in Phase 5. D4 to D7 are assigned to phases there (D4 Phase 7,
-  D5 and D6 the recorder phase, D7 Phase 4).
+  D5 and D6 the recorder phase, D7 Phase 4a, where it is done: ADR 0021).
 - The Linux preset and the `__int128` path are unbuilt.
 
 ## Appendix A: where each ADR's decisions are now

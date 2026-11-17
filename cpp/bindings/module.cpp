@@ -132,6 +132,16 @@ void require_at_most(E value, E last, const char* what) {
   }
 }
 
+// Review D7 (ADR 0020): an exponent is 0 to 18, as in the store's schema.
+std::int8_t exponent_from(py::handle value, const char* what) {
+  const auto exponent = int_from<std::int8_t>(value, what);
+  if (exponent < 0 || exponent > 18) {
+    throw py::value_error(std::string(what) + " " + std::to_string(exponent) +
+                          " must be 0 to 18");
+  }
+  return exponent;
+}
+
 // ADR 0019: a precision is 0 to 18 and never above its exponent, as in the
 // store's schema.
 std::int8_t precision_from(py::handle value, std::int8_t exponent, const char* what) {
@@ -145,6 +155,10 @@ std::int8_t precision_from(py::handle value, std::int8_t exponent, const char* w
 
 // ADR 0020: what MarketEvent.from_bytes refuses beyond unknown enum values.
 void require_well_formed(const qa::MarketEvent& event) {
+  if ((event.flags & ~qa::MarketEvent::kKnownFlags) != 0) {  // review D7
+    throw py::value_error("flags " + std::to_string(event.flags) +
+                          " set a bit no flag is assigned to");
+  }
   if (!qa::reason_fits(event.kind, event.reason)) {
     throw py::value_error("reason " + std::to_string(static_cast<int>(event.reason)) +
                           " does not fit kind " + std::to_string(static_cast<int>(event.kind)) +
@@ -244,8 +258,8 @@ PYBIND11_MODULE(_core, m) {
       .def(py::init([](qa::InstrumentId id, py::handle price_exp, py::handle qty_exp,
                        py::handle price_precision, py::handle qty_precision, qa::Price tick_size,
                        qa::Qty lot_size) {
-             const auto price_exponent = int_from<std::int8_t>(price_exp, "price_exp");
-             const auto qty_exponent = int_from<std::int8_t>(qty_exp, "qty_exp");
+             const auto price_exponent = exponent_from(price_exp, "price_exp");
+             const auto qty_exponent = exponent_from(qty_exp, "qty_exp");
              return qa::InstrumentMeta{
                  id,
                  price_exponent,
@@ -306,6 +320,7 @@ PYBIND11_MODULE(_core, m) {
   event.attr("HAS_DEPTH") = MarketEvent::kHasDepth;
   event.attr("HAS_TRADE_ID") = MarketEvent::kHasTradeId;
   event.attr("EVENT_TS_FROM_RECEIPT") = MarketEvent::kEventTsFromReceipt;
+  event.attr("KNOWN_FLAGS") = MarketEvent::kKnownFlags;
   event.def("to_bytes", &to_bytes<MarketEvent>)
       .def_static("from_bytes",
                   [](const py::bytes& raw) {
