@@ -8,6 +8,7 @@ accepts.
 """
 
 import functools
+import itertools
 
 import pyarrow as pa
 import pytest
@@ -401,6 +402,22 @@ def test_each_logs_versions_are_on_its_own_stream_source_whatever_has_no_message
     assert [g.events[0].source for g in groups] == [
         sources.source(LOG, "ws"), sources.source(LOG, "ws"), sources.source(OTHER_LOG, "ws"),
         sources.source(OTHER_LOG, "ws")]  # fmt: skip
+
+
+def test_two_versions_at_one_record_come_in_the_reference_books_order_whatever_the_rows_order():
+    """Which the adapters refuse (ADR 0023), but a store written before may
+    hold. The reference book takes, of a record's versions, the one with the
+    largest scales (``book._versions_by_log``); the converter emits that one
+    last, so the C++ book ends on it, in whatever order the session returned
+    the rows (``PITSession.instruments`` does not order rows of one record)."""
+    one = version(4, price_precision=1, tick_size=10_000_000)
+    two = version(4, price_precision=2, tick_size=1_000_000)
+    finer_lot = version(4, price_precision=2, tick_size=1_000_000, lot_size=2)
+    for rows in itertools.permutations([one, two, finer_lot]):
+        groups = run([], metadata=versions(*rows), with_instruments=True)
+        got = [g.events[0].instrument_meta() for g in groups]
+        assert [(m.price_precision, m.tick_size.value, m.lot_size.value) for m in got] == [
+            (1, 10_000_000, 1), (2, 1_000_000, 1), (2, 1_000_000, 2)]  # fmt: skip
 
 
 @pytest.mark.parametrize(

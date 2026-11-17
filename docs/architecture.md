@@ -74,7 +74,7 @@ thread.
 | Direction | Interface | Notes |
 |-----------|-----------|-------|
 | Python → C++ | `ReplayEngine(config).run(raw_log, strategy)` | Backtests. Runs the C++ core over a recorded log. `strategy` is called on decision-clock events (section 4.3). |
-| Python → C++ | `OrderBook(instrument, check, capacity)`, `apply(event)`, `top(side, n)`, `best_bid()`, `is_stale`, `stale_count(reason)` | For verification against the Python reference reconstructor and for research (ADR 0022). Prices and quantities come back as integer mantissas. |
+| Python → C++ | `OrderBook(instrument, check, capacity)`, `apply(event)`, `top(side, n)`, `best_bid()`, `is_stale`, `stale_count(reason)`, `bound_source`, `other_source_updates` | For verification against the Python reference reconstructor and for research (ADRs 0022, 0023). Prices and quantities come back as integer mantissas. |
 | Python → C++ | `Engine.submit_targets(TargetSet)` | Live/paper. Enqueues onto the control SPSC queue. Non-blocking. |
 | Python → C++ | `Engine.pause(scope, reason)`, `Engine.flatten(scope, reason)` | Risk-reducing commands only. There is no binding that raises a limit or resumes. |
 | C++ → Python | `Engine.snapshot()` | Positions, open orders, PnL, book tops, feature values, health counters. Read through a seqlock, never blocks the core. |
@@ -209,9 +209,15 @@ Tool calls only, listed exhaustively in section 8.
    `InstrumentUpdate` events at the record where they change (ADR 0022); a
    mismatch marks the book stale in the same way. A stale book recovers at the
    next complete snapshot that passes the check. Each book's capacity is fixed
-   at startup; a level that does not fit marks it stale too.
+   at startup; a level that does not fit marks it stale too. While an update
+   or a snapshot is being applied the book cannot be read; it is bound to the
+   stream of the snapshot it was built from, and an update of another stream
+   is ignored and counted (ADR 0023).
 6. **Features.** Incremental features (order flow imbalance, spread,
-   microprice, rolling volatility) update in place.
+   microprice, rolling volatility) update in place, from the book only when an
+   event's result says a message took effect (`Applied` or `Recovered`, ADR
+   0023); so do pre-trade risk's checks against the book and the published
+   snapshot.
 7. **Order management.** The core compares current position and working
    orders against the latest `TargetSet` and decides on new/cancel/replace.
 8. **Pre-trade risk.** Every outgoing order passes all checks: kill switch,
@@ -449,8 +455,9 @@ Stream control (ADR 0020):
 - `MarketEvent.from_bytes` refuses unknown kinds and reasons, a reason that
   does not fit its kind, a control event carrying a market value, a flag bit
   outside `kKnownFlags`, non-zero reserved bytes, and an `InstrumentUpdate`
-  whose scales the store could not hold or that carries a side, venue number,
-  trade id, checksum, depth or another flag. The `InstrumentMeta` binding
+  whose scales the store could not hold, whose tick or lot size is below 1
+  (ADR 0023), or that carries a side, venue number, trade id, checksum, depth
+  or another flag. The `InstrumentMeta` binding
   refuses an exponent outside 0 to 18, and a precision outside 0 to 18 or
   above its exponent.
 - **From stored data:** `quantagent.marketevents.convert(book_events,
@@ -458,8 +465,9 @@ Stream control (ADR 0020):
   `PITSession` returns into these events, one group per step in the
   reference book's order (message, check snapshot, stale, reset), plus one
   `instrument` group per stored metadata version (ADR 0022), with the sources
-  numbered by a `SourceMap` the caller can share (ADR 0021). It refuses what
-  an event cannot carry: a depth above 65,535, an exponent outside 0 to 18 or
+  numbered by a `SourceMap` the caller can share (ADR 0021); two versions at
+  one record come in the reference book's order, so the last is the one it
+  takes (ADR 0023). It refuses what an event cannot carry: a depth above 65,535, an exponent outside 0 to 18 or
   not the instrument's fixed one, a precision outside 0 to its exponent, a
   message with no metadata. The C++ book is driven with it in tests (Phase
   4b), and the C++ feed handlers are compared with it (Phase 6). It does not
@@ -480,9 +488,20 @@ it; a reset empties it. It goes stale with a `StaleReason`: 1 to 5 are the
 `StreamReason`s of the same number (from a `StreamStale` or its own check),
 and its own are `DeltaBeforeSnapshot` (64), `IncompleteMessage` (65, events
 missing or out of order), `CapacityExceeded` (66) and `InvalidEvent` (67), each
-counted (`stale_count`). Each side is a ring buffer of levels kept best first;
-the queries show nothing unless a snapshot has taken effect since the start,
-the last reset and the last failure (`has_book`).
+counted (`stale_count`); `stale_reason_of` maps a `StreamStale`'s reason with
+a case for every `StreamReason`, checked at build time, so a reason
+`StreamReason` gains fails the build until it is mapped and counted (ADR
+0023). Each side is a ring buffer of levels kept best first; the queries show
+nothing (`checksum()` is 0) unless a snapshot has taken effect since the start,
+the last reset and the last failure and no update or stream snapshot is being
+applied (`has_book`, ADR 0023): a consumer reads the book after a result of
+`Applied` or `Recovered`. The book is bound (`bound_source`) to the source of
+the stream snapshot it is built from, from that snapshot's first level until a
+reset or a failure; a snapshot of another source rebinds it, and an update of
+another source is ignored, interrupts nothing and is counted
+(`other_source_updates`). Its metadata, at startup and in an
+`InstrumentUpdate`, must be what the store could hold (`meta_fits`: the scales,
+and a tick and lot size of at least 1).
 
 `OrderRequest`, 64 bytes (core to execution): `client_order_id` 0,
 `target_order_id` 8 (the order a cancel refers to), `price` 16, `qty` 24,

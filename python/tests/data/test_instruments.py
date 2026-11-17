@@ -41,6 +41,7 @@ from quantagent.data.schema import (
     BookEventKind,
     SchemaError,
     Side,
+    StreamEventKind,
     check_row,
     table_from_rows,
 )
@@ -246,6 +247,30 @@ def test_metadata_finer_than_the_fixed_exponent_is_refused_not_rescaled(entries)
     normalized = normalize(log(venue, start, *messages))
     assert [r.reason for r in normalized.report.rejects] == ["precision_exceeds_exponent"]
     assert ("instruments", venue, INSTRUMENT) not in normalized.rows
+
+
+@pytest.mark.parametrize("second", [{"price_precision": 2, "price_increment": "0.01"}, {}],
+                         ids=["different", "identical"])  # fmt: skip
+def test_a_record_listing_the_pair_twice_is_refused_and_the_version_in_force_stays(second):
+    """Two metadata versions of one instrument at one record (review 2026-11 of
+    the C++ book, finding 5): nothing says which is in force, so the record is
+    refused (ADR 0023), whether the two differ or not. It is a hole in the
+    stream like any refused record (MESSAGE_REJECTED, which makes a book stale),
+    and the version before it stays in force: the next update is checked at one
+    decimal."""
+    twice = ("ws", '{"channel":"instrument","type":"update","data":{"assets":[],"pairs":['
+                   f'{kraken_pair()},{kraken_pair(**second)}]}}}}')  # fmt: skip
+    after = ([("73468.5", "0.30000000")], [("73468.6", "0.89472056")])
+    at_one_decimal = kraken_book("update", [("73468.5", "0.30000000")], [], after=after)
+    normalized = normalize(log("kraken", *PRECISION_CHANGE_LOG[:4], twice, at_one_decimal))
+    assert [(r.seq, r.reason) for r in normalized.report.rejects] == [(4, "two_metadata_versions")]
+    assert "BTC/USD 2 times" in normalized.report.rejects[0].detail
+    assert [v["seq"] for v in rows_of(normalized, INSTRUMENTS, "kraken")] == [1]
+    events = normalized.rows[("stream_events", "kraken", INSTRUMENT)]
+    assert [(e["seq"], e["connection"]) for e in events
+            if e["kind"] == StreamEventKind.MESSAGE_REJECTED] == [(4, "ws")]  # fmt: skip
+    assert normalized.report.events["CHECKSUM_MISMATCH"] == 0
+    assert {r["seq"] for r in rows_of(normalized, BOOK_EVENTS, "kraken")} == {3, 5}
 
 
 def test_metadata_for_an_instrument_without_a_fixed_exponent_is_refused():

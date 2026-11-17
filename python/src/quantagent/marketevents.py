@@ -38,6 +38,8 @@ its levels.
   book) at its record, on its log's stream source: the C++ book takes the
   precisions Kraken's checksum is computed with from the stream, at exactly
   the record where they changed. Every version is one event, changed or not.
+  Two versions at one record (which the adapters refuse, ADR 0023) are
+  emitted in the reference book's order, so the last is the one it takes.
 
 Frames and control events are stamped with the record's receipt time
 (``kEventTsFromReceipt``) and carry no market values. Trades are not
@@ -197,6 +199,15 @@ def _check_version(version: dict[str, Any], exponents: list[tuple[int, int]]) ->
         )
 
 
+def _version_order(version: dict[str, Any]) -> tuple:
+    """The order versions are emitted in: by record, then as the reference book
+    orders a record's versions (``book._versions_by_log``: the four scales), then
+    by tick and lot size, so the order is total."""
+    return (version["log_id"], version["seq"], version["price_exp"], version["qty_exp"],
+            version["price_precision"], version["qty_precision"], version["tick_size"],
+            version["lot_size"])  # fmt: skip
+
+
 def _instrument_group(version: dict[str, Any], sources: SourceMap, instrument: Any) -> EventGroup:
     meta = _core.InstrumentMeta(instrument, version["price_exp"], version["qty_exp"],
                                 version["price_precision"], version["qty_precision"],
@@ -307,9 +318,13 @@ def convert(
              for log, seq, index, event_ts, source in zip(*columns, strict=True)}  # fmt: skip
     messages = list(messages_from_table(book_events, instruments))  # (log_id, seq) order
     columns = [instruments.column(name).to_pylist() for name in _INSTRUMENT_COLUMNS]
+    # In (log_id, seq) order, and at one record by the reference book's rule (the
+    # last is the one with the largest scales), so the C++ book ends on the
+    # version the reference takes, whatever order the session returned them in.
+    # The adapters refuse a record with two versions (ADR 0023); a store written
+    # before that, or hand-built data, may still have one.
     versions = sorted((dict(zip(_INSTRUMENT_COLUMNS, values, strict=True))
-                       for values in zip(*columns, strict=True)),
-                      key=lambda v: (v["log_id"], v["seq"]))  # fmt: skip
+                       for values in zip(*columns, strict=True)), key=_version_order)  # fmt: skip
     exponents: list[tuple[int, int]] = []
     for version in versions:
         _check_version(version, exponents)

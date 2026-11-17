@@ -133,4 +133,12 @@ inline constexpr int kMaxExponent = 18;
          meta.qty_precision <= meta.qty_exp;
 }
 
+// The store's whole rule for an instrument's metadata (ADR 0023): the scales
+// fit, and the tick and lot sizes are at least 1, as the schema requires. A
+// tick of 0 would divide by zero when a price is rounded to it, and a negative
+// one would invert a price collar.
+[[nodiscard]] constexpr bool meta_fits(const InstrumentMeta& meta) noexcept {
+  return scales_fit(meta) && meta.tick_size.mantissa() >= 1 && meta.lot_size.mantissa() >= 1;
+}
+
 }  // namespace qa

@@ -1,6 +1,6 @@
 # 0022: The C++ order book: instrument updates in the stream, a fixed capacity, and what makes it stale
 
-Status: Accepted (owner decisions, 2026-11-17); the `InstrumentUpdate` layout and the implementation choices await the owner's review, see "Review"
+Status: Accepted (owner decisions, 2026-11-17); the `InstrumentUpdate` layout and the implementation choices confirmed by the owner (2026-11-17, see "Review"), item 11 amended; amended by 0023 (an update cannot be read until it takes effect; the book is bound to one stream; a tick or lot size below 1 is refused)
 Date: 2026-11-17
 Amends: 0020 (a ninth `MarketEvent` kind), 0021 (the converter emits it; its Review is confirmed here)
 
@@ -280,7 +280,10 @@ table-driven CRC32; no dependency is added.
 
 ## Review
 
-Choices made while building it, awaiting the owner:
+Choices made while building it. **Confirmed by the owner, 2026-11-17: all
+sixteen, item 11 amended** (ADR 0023): an update cannot be read either, from
+its first level until it takes effect, as a snapshot cannot, and consumers act
+only on results that say a message took effect.
 
 1. **The `InstrumentUpdate` layout** above: kind 8; the tick size in `price`,
    the lot size in `qty`, the four scales in `level_index`; no reserved byte.

@@ -5,14 +5,24 @@ Each test proves one finding of the review and is named after its number
 (``test_finding_01_...``). It states what the ADRs and the architecture
 promise, or what the review argues the book should do.
 
-EVERY TEST HERE IS MARKED ``xfail(strict=True, raises=AssertionError)`` WITH
-ITS FINDING NUMBER AS THE REASON, so ``scripts/check.ps1`` stays green while
-the finding is open. The marker is strict: once a finding is fixed its test
-passes, the suite fails on the unexpected pass, and the marker has to be
-removed in the same change. From then on the test is the finding's regression
-test. Only an ``AssertionError`` counts as the expected failure, and the
-setup inside each test raises ``SetupError`` instead of asserting, so a test
-cannot be XFAIL because its setup went wrong.
+A TEST WHOSE FINDING IS STILL OPEN IS MARKED
+``xfail(strict=True, raises=AssertionError)`` WITH ITS FINDING NUMBER AS THE
+REASON, so ``scripts/check.ps1`` stays green while the finding is open. The
+marker is strict: once a finding is fixed its test passes, the suite fails on
+the unexpected pass, and the marker has to be removed in the same change. From
+then on the test is the finding's regression test. The setup inside each test
+raises ``SetupError`` instead of asserting, so a test cannot be XFAIL because
+its setup went wrong.
+
+Every finding with a test here is fixed, and no test is marked (ADR 0023):
+finding 1 (an update cannot be read until its last level, as a snapshot
+cannot), finding 2 (the book is bound to its snapshot's stream), finding 5 (the
+Kraken adapter refuses a record with two versions of the instrument; the
+converter emits two versions at one record in the reference book's order, so
+the C++ book takes the same one) and finding 6 (a tick or lot size below 1 is
+refused). Each test kept its shape: finding 1's accepts "nothing", which the
+fix chose, and finding 5's still builds the two versions by hand, as a store
+written before the adapters refused them could hold them.
 
 If the owner decides a behavior is intended, the test is replaced by one that
 pins the decision, in the same change as the ADR that records it. Do not
@@ -52,7 +62,6 @@ from quantagent.marketevents import convert
 
 REASON = _core.StreamReason
 NOTHING = ([], [])  # what the queries show when the book cannot be read
-REVIEW = "docs/reviews/2026-11-cpp-order-book.md"
 
 
 class SetupError(Exception):
@@ -64,22 +73,14 @@ def require(condition: bool, what: str) -> None:
         raise SetupError(what)
 
 
-def finding(number: int, summary: str):
-    return pytest.mark.xfail(strict=True, raises=AssertionError,
-                             reason=f"finding {number} ({REVIEW}): {summary}")  # fmt: skip
-
-
 def crossed(book) -> bool:
     bid, ask = book.best_bid(), book.best_ask()
     return bid is not None and ask is not None and bid[0] >= ask[0]
 
 
-# --- finding 1: a half-applied update reads as a fresh book ------------------------------------
-
-F1 = "between an update's levels the queries show a book the reference never has"
+# --- finding 1: a half-applied update reads as a fresh book (fixed, ADR 0023) ------------------
 
 
-@finding(1, F1)
 def test_finding_01_between_the_levels_of_an_update_the_book_shows_no_state_the_reference_has_not():
     """ADR 0022: an update "takes effect at its kLastInMessage level". Coinbase
     lists an update's bids before its asks, so when the market moves up a tick
@@ -107,7 +108,6 @@ def test_finding_01_between_the_levels_of_an_update_the_book_shows_no_state_the_
     require(book.apply(last).effect == EFFECT.Applied, "the message then takes effect")
 
 
-@finding(1, F1)
 def test_finding_01_between_the_levels_of_a_kraken_update_the_book_is_deeper_than_its_depth():
     """Kraken's book is cut to its depth when a message ends. In between, the
     side holds a level more than the depth (80,077 of the one-hour recording's
@@ -128,7 +128,7 @@ def test_finding_01_between_the_levels_of_a_kraken_update_the_book_is_deeper_tha
     require(book.apply(last).effect == EFFECT.Applied, "the message then takes effect")
 
 
-@finding(1, F1)  # 4.4 s alone, most of it the fixture's conversion (cached when run with others)
+# 4.4 s alone, most of it the fixture's conversion (cached when run with others)
 def test_finding_01_on_the_coinbase_fixture_half_applied_updates_show_crossed_books():
     """The same on recorded data: updates of the committed Coinbase fixture
     whose half-applied book is crossed while the book says it can be read (57
@@ -151,10 +151,9 @@ def test_finding_01_on_the_coinbase_fixture_half_applied_updates_show_crossed_bo
     assert shown_crossed == 0, f"{shown_crossed} of {messages} messages showed a crossed book"
 
 
-# --- finding 2: the book follows whatever stream it is given ----------------------------------
+# --- finding 2: the book follows whatever stream it is given (fixed, ADR 0023) ----------------
 
 
-@finding(2, "a stream's update is applied to a book built from another stream's snapshot")
 def test_finding_02_an_update_of_another_stream_is_not_applied_to_the_book():
     """Two logs of one instrument that overlap in time (a recorder restarted
     before the old one stopped), merged by monotonic stamp as Phase 7's replay
@@ -180,7 +179,7 @@ def test_finding_02_an_update_of_another_stream_is_not_applied_to_the_book():
     assert book.is_stale or sides(book) == b_book, (result, sides(book))
 
 
-# --- finding 5: two metadata versions at one record ----------------------------------------
+# --- finding 5: two metadata versions at one record (fixed, ADR 0023) ------------------------
 
 
 def _version(price_precision: int) -> dict:
@@ -190,7 +189,6 @@ def _version(price_precision: int) -> dict:
             "lot_size": 1}  # fmt: skip
 
 
-@finding(5, "the reference and the converter pick different versions when two share a record")
 def test_finding_05_two_metadata_versions_at_one_record_give_both_books_the_same_precision():
     """Two ``instruments`` rows at one record (a Kraken instrument message
     listing the pair twice). The reference takes the version with the larger
@@ -220,10 +218,9 @@ def test_finding_05_two_metadata_versions_at_one_record_give_both_books_the_same
         assert (got.reason, got.stale) == (step.reason, step.stale), where
 
 
-# --- finding 6: tick and lot sizes the store refuses -----------------------------------------
+# --- finding 6: tick and lot sizes the store refuses (fixed, ADR 0023) -----------------------
 
 
-@finding(6, "a tick or lot size below 1 is taken, though the store refuses it")
 @pytest.mark.parametrize("changes", [{"tick_size": 0}, {"tick_size": -1}, {"lot_size": 0}],
                          ids=str)  # fmt: skip
 def test_finding_06_metadata_with_a_tick_or_lot_the_store_refuses_is_refused(changes):

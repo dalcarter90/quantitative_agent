@@ -162,6 +162,10 @@ ctest --preset windows-release
 .\build\windows\bench\Release\qa_bench.exe
 cd ..
 
+# The book benchmark that replays the Coinbase fixture reads data\bench\;
+# write it once (and after the fixture, adapters or converter change):
+.venv\Scripts\python cpp\bench\export_events.py
+
 # Python
 .venv\Scripts\python -m pytest python
 .venv\Scripts\python -m pytest python\tests\test_binding.py -k hello   # one test

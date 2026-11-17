@@ -14,7 +14,9 @@ before this was written:
 - Trades (https://docs.kraken.com/api/docs/websocket-v2/trade): ``side`` is the
   taker's side. ``trade_id`` is a per-book sequence number.
 - Instrument metadata (the ``instrument`` channel) has no venue timestamp, so
-  those rows take the receipt time (ADR 0008).
+  those rows take the receipt time (ADR 0008). A message that lists the
+  recorded pair more than once is refused (``two_metadata_versions``, ADR
+  0023): nothing says which version would be in force.
 - Prices and quantities arrive as JSON numbers, always printed with the pair's
   precision (``price_precision``, ``qty_precision``). They are read as text so
   no digit is lost; the checksum is defined over those digits. They are stored
@@ -169,6 +171,15 @@ class KrakenAdapter(VenueAdapter):
                 lot_size=pair["qty_increment"],
             )
             rows.append(("instruments", row))
+        if len(rows) > 1:
+            # Two versions of one instrument at one record: no rule says which is
+            # in force, so the record is refused, as one with a value it cannot
+            # hold is (ADR 0023). The version in force stays.
+            raise Rejected(
+                "two_metadata_versions",
+                f"the message lists {self.symbol} {len(rows)} times; one record carries at most "
+                "one metadata version of an instrument (ADR 0023)",
+            )
         for _, row in rows:  # the whole message parsed
             self.use(row)
         return data(f"instrument.{kind}", rows, empty=f"instrument.{kind}.other_pairs")
