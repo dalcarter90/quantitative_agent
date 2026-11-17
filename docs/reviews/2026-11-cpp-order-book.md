@@ -14,6 +14,11 @@ Reviewer: a session that did not write the code. Nothing was fixed.
   ahead of `main` (`f1df44a`, ADR 0022's owner decisions, then the book).
   The C++ Release build was brought up to date first; nothing recompiled, so
   the `.pyd` the tests import is this tree's.
+- **Baseline:** `scripts/check.ps1` on this review's branch (the reviewed
+  tree plus this file and its tests) printed `ALL GREEN`: 77 C++ tests, 1,834
+  Python tests passed and this review's 8 tests `XFAIL` (6 deselected:
+  `network` and `local_data`), ruff clean, no unmarked test over 5 s. The
+  PR's own count was 77 and 1,834.
 - **Proof:** findings 1, 2, 5 and 6 have failing tests in
   `python/tests/data/test_review_2026_11_order_book.py` (8 tests). Each is
   marked `xfail(strict=True, raises=AssertionError)` with its finding number,
