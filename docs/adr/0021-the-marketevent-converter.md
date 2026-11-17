@@ -1,6 +1,6 @@
 # 0021: The converter from stored data to MarketEvents
 
-Status: Accepted for Phase 4a; implementation choices awaiting the owner's review, see "Review"
+Status: Accepted; implementation choices confirmed by the owner (2026-11-17, see "Review"); amended by 0022 (the converter also emits instrument updates)
 Date: 2026-11-17
 Amends: none (builds ADR 0020's converter rules; closes review D7 and T3)
 
@@ -102,7 +102,10 @@ D7 (what `MarketEvent` and `InstrumentMeta` refuse) and the T3 test cleanup;
 
 ## Review
 
-Choices made while building it, awaiting the owner:
+Choices made while building it. **Confirmed by the owner, 2026-11-17: all
+nine, as written** (ADR 0022). On item 7 the owner added a condition, recorded
+in the roadmap's Phase 7 criteria: the converter must handle trades before
+the replay engine needs them.
 
 1. **The module and its name:** `quantagent.marketevents`, outside the data
    package; `convert`, `EventGroup`, `SourceMap`, the step names.

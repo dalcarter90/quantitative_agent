@@ -1,6 +1,6 @@
 # 0020: Stream control events, a resuming reference book, and large snapshots against a bounded queue
 
-Status: Accepted (owner decisions, 2026-11-16; implementation choices, D3's numbers and the phases for D4 to D7 and T3 confirmed by the owner 2026-11-16, see "Owner's answers" and "Review")
+Status: Accepted (owner decisions, 2026-11-16; implementation choices, D3's numbers and the phases for D4 to D7 and T3 confirmed by the owner 2026-11-16, see "Owner's answers" and "Review"); amended by 0022 (`MarketEvent` gains a ninth kind, `InstrumentUpdate`)
 Date: 2026-11-16
 Amends: 0004 (the full-queue policy, for messages of many events). Restated in `docs/data-core-spec.md` (sections 6, 11, 12) and `docs/architecture.md` (sections 4.1, 5, 6.3)
 

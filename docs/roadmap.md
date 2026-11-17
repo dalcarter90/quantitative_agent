@@ -1978,6 +1978,10 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       `advance` only filters on receipt time. A one-hour replay at one
       decision a second, each reading a one-second book window, is measured
       and recorded as the baseline, and a budget is set from it.
+- [ ] *(Added in Phase 4b, ADR 0022: owner decision on ADR 0021's Review
+      item 7.)* `quantagent.marketevents.convert` handles trades (`Trade`
+      events on the stream source) before the replay engine needs them: it
+      is done before the engine's trade events are built or compared.
 
 ### Phase 7a: Recorder fidelity
 
