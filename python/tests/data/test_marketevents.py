@@ -27,7 +27,7 @@ from quantagent.data.schema import (
     StreamEventKind,
     table_from_rows,
 )
-from quantagent.marketevents import MAX_DEPTH, EventGroup, SourceMap, convert
+from quantagent.marketevents import MAX_DEPTH, STEPS, EventGroup, SourceMap, convert
 
 K = StreamEventKind
 SNAP, DELTA, CHECK = BookEventKind.SNAPSHOT, BookEventKind.DELTA, BookEventKind.CHECK_SNAPSHOT
@@ -78,10 +78,14 @@ def stored(seq, kind, *, connection="ws", event_index=0, log_id=LOG, expected=No
             "detail": detail}  # fmt: skip
 
 
-def run(rows, events=(), *, metadata=None, sources=None):
+def run(rows, events=(), *, metadata=None, sources=None, with_instruments=False):
+    """The converter's groups for hand-built rows. Every metadata version is a
+    group of its own (ADR 0022); they have their own tests below and are left
+    out here unless asked for, so a test of messages sees its messages."""
     table = table_from_rows(BOOK_EVENTS, rows) if rows else BOOK_EVENTS.schema.empty_table()
     meta = metadata if metadata is not None else instruments(*sorted({r["log_id"] for r in rows}))
-    return list(convert(table, events, meta, instrument=INSTRUMENT_ID, sources=sources))
+    groups = list(convert(table, events, meta, instrument=INSTRUMENT_ID, sources=sources))
+    return [g for g in groups if with_instruments or g.step != "instrument"]
 
 
 def flags(*names):
@@ -328,6 +332,120 @@ def test_exponents_must_be_the_same_for_every_message():
     assert len(run(rows, metadata=same)) == 2
 
 
+# --- instrument updates (ADR 0022) -----------------------------------------------------------
+
+
+def version(seq, *, log_id=LOG, price_exp=8, qty_exp=8, price_precision=1, qty_precision=8,
+            tick_size=10_000_000, lot_size=1):  # fmt: skip
+    """One stored instruments row: the metadata version observed in record ``seq``."""
+    return {"event_ts": 1_000 + seq, "event_ts_source": "receipt", "recv_ts": 1_000 + seq,
+            "log_id": log_id, "seq": seq, "price_exp": price_exp, "qty_exp": qty_exp,
+            "price_precision": price_precision, "qty_precision": qty_precision,
+            "tick_size": tick_size, "lot_size": lot_size}  # fmt: skip
+
+
+def versions(*rows):
+    return table_from_rows(INSTRUMENTS, list(rows))
+
+
+def test_every_stored_metadata_version_is_one_instrument_update_at_its_record():
+    sources = SourceMap()
+    meta = versions(version(1), version(4, price_precision=2, tick_size=1_000_000))
+    rows = [level(3, 0, BUY, 100, 3, kind=SNAP), level(5, 0, BUY, 100, 0)]
+    groups = run(rows, metadata=meta, sources=sources, with_instruments=True)
+    assert [(g.log_id, g.seq, g.step) for g in groups] == [
+        (LOG, 1, "instrument"), (LOG, 3, "message"), (LOG, 4, "instrument"),
+        (LOG, 5, "message")]  # fmt: skip
+    first, change = groups[0], groups[2]
+    for group, precision, tick in ((first, 1, 10_000_000), (change, 2, 1_000_000)):
+        (event,) = group.events
+        assert event.kind == KIND.InstrumentUpdate
+        got = event.instrument_meta()
+        assert (got.id.value, got.price_exp, got.qty_exp) == (INSTRUMENT_ID, 8, 8)
+        assert (got.price_precision, got.qty_precision) == (precision, 8)
+        assert (got.tick_size.value, got.lot_size.value) == (tick, 1)
+        # Stamped with its record; the venues give metadata no time of its own.
+        assert (event.seq, event.recv_ts.value, event.event_ts.value) == (
+            group.seq, 1_000 + group.seq, 1_000 + group.seq)  # fmt: skip
+        assert event.flags == EV.EVENT_TS_FROM_RECEIPT
+        # On the log's stream source, like a session event.
+        assert event.source == sources.source(LOG, "ws")
+        assert (event.reason, event.side) == (REASON.NoReason, _core.Side.Unknown)
+        assert EV.from_bytes(event.to_bytes()).to_bytes() == event.to_bytes()
+    assert len(sources) == 1
+
+
+def test_a_version_with_a_venue_time_keeps_it():
+    timed = {**version(1), "event_ts": 777, "event_ts_source": "venue"}
+    (group,) = run([], metadata=versions(timed), with_instruments=True)
+    (event,) = group.events
+    assert (event.event_ts.value, event.recv_ts.value, event.flags) == (777, 1_001, 0)
+
+
+def test_at_one_record_control_events_come_first_then_the_instrument_update_then_levels():
+    rows = [level(2, 0, BUY, 100, 3, kind=SNAP)]
+    events = [stored(2, K.CONNECT, event_index=1), stored(2, K.DISCONNECT, event_index=0)]
+    groups = run(rows, events, metadata=versions(version(2)), with_instruments=True)
+    assert [(g.seq, g.step) for g in groups] == [(2, "reset"), (2, "reset"), (2, "instrument"),
+                                                 (2, "message")]  # fmt: skip
+
+
+def test_each_logs_versions_are_on_its_own_stream_source_whatever_has_no_messages():
+    sources = SourceMap()
+    meta = versions(version(0), version(0, log_id=OTHER_LOG), version(9, log_id=OTHER_LOG))
+    groups = run([level(1, 0, BUY, 1, 1, kind=SNAP)], metadata=meta, sources=sources,
+                 with_instruments=True)  # fmt: skip
+    assert [(g.log_id, g.seq, g.step) for g in groups] == [
+        (LOG, 0, "instrument"), (LOG, 1, "message"), (OTHER_LOG, 0, "instrument"),
+        (OTHER_LOG, 9, "instrument")]  # fmt: skip
+    assert [g.events[0].source for g in groups] == [
+        sources.source(LOG, "ws"), sources.source(LOG, "ws"), sources.source(OTHER_LOG, "ws"),
+        sources.source(OTHER_LOG, "ws")]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        # Exponents are fixed per instrument (ADR 0019): two versions cannot differ.
+        ([version(0), version(4, price_exp=7)], "exponent"),
+        ([version(0), version(4, qty_exp=9, qty_precision=8)], "exponent"),
+        ([version(0, price_exp=19, price_precision=0)], "price_exp 19"),
+        ([version(0, price_precision=9)], "precision"),
+        ([version(0, qty_precision=-1)], "precision"),
+    ],
+)
+def test_a_metadata_version_no_event_can_carry_is_refused_before_anything_is_yielded(rows, message):
+    # The schema refuses most of these; build the table around it, as a damaged
+    # or hand-made input could.
+    table = pa.Table.from_pylist(rows, schema=INSTRUMENTS.schema)
+    groups = convert(BOOK_EVENTS.schema.empty_table(), [], table, instrument=INSTRUMENT_ID)
+    with pytest.raises(ValueError, match=message):
+        next(groups)
+
+
+@pytest.mark.parametrize("venue", ["kraken", pytest.param("coinbase", marks=pytest.mark.slow)])
+def test_on_a_fixture_the_sessions_metadata_is_one_update_before_its_first_snapshot(venue):
+    book, events, meta = fixture_tables(venue)
+    sources = SourceMap()
+    groups = list(convert(book, events, meta, instrument=INSTRUMENT_ID, sources=sources))
+    (index,) = [i for i, g in enumerate(groups) if g.step == "instrument"]
+    (row,) = meta.to_pylist()
+    group = groups[index]
+    # Kraken's arrives on the stream, Coinbase's over REST: both on the stream source.
+    assert (group.log_id, group.seq) == (row["log_id"], row["seq"])
+    assert group.events[0].source == sources.source(row["log_id"], "ws")
+    got = group.events[0].instrument_meta()
+    assert (got.price_exp, got.qty_exp, got.price_precision, got.qty_precision) == (
+        8, 8, {"kraken": 1, "coinbase": 2}[venue], 8)  # fmt: skip
+    assert (got.tick_size.value, got.lot_size.value) == (row["tick_size"], row["lot_size"])
+    first_message = next(i for i, g in enumerate(groups) if g.step == "message")
+    assert index < first_message
+
+
+def test_the_step_names_are_the_groups_a_user_may_meet():
+    assert STEPS == ("message", "check", "stale", "reset", "instrument")
+
+
 # --- the recorded fixtures and the integrity cases -------------------------------------------
 
 
@@ -364,7 +482,7 @@ def snake(name):
 def converted_steps(groups):
     steps = []
     for g in groups:
-        if g.step == "check":
+        if g.step in ("check", "instrument"):  # not steps of the reference book
             continue
         reason = snake(g.events[0].reason.name) if g.step in ("stale", "reset") else None
         steps.append((g.log_id, g.seq, g.step, reason))

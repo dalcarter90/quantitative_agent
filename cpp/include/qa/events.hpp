@@ -43,6 +43,15 @@
 // SnapshotBegin, its levels (level_index 0 to n-1, the last flagged
 // kLastInMessage), then SnapshotEnd, all with one source and seq and nothing
 // else between them.
+//
+// An InstrumentUpdate (ADR 0022) carries a version of the instrument's
+// metadata in fields the kind has no other use for: the tick size in price,
+// the lot size in qty, and the four scales in level_index, one byte each from
+// the lowest (price_exp, qty_exp, price_precision, qty_precision, the order of
+// InstrumentMeta's bytes 4 to 7). set_instrument_meta and instrument_meta are
+// the only code that packs and unpacks them. It arrives at the record where
+// the version arrived, on the log's stream source, after that record's control
+// events and before its levels.
 
 #include "qa/types.hpp"
 
@@ -62,6 +71,8 @@ enum class EventKind : std::uint8_t {
   StreamReset = 5,    // a new session or connection: the book is gone until a snapshot
   SnapshotBegin = 6,  // a snapshot's levels follow; level_index is how many
   SnapshotEnd = 7,    // they are complete; level_index is how many
+  // A version of the instrument's metadata (ADR 0022): see set_instrument_meta.
+  InstrumentUpdate = 8,
 };
 
 // Why a StreamStale (1 to 5) or a StreamReset (6 to 8). Each is a stored stream
@@ -111,6 +122,9 @@ struct MarketEvent {
   static constexpr std::uint8_t kKnownFlags =
       static_cast<std::uint8_t>(kLastInMessage | kHasMono | kHasVenueSeq | kHasChecksum |
                                 kHasDepth | kHasTradeId | kEventTsFromReceipt);
+  // The only flags an InstrumentUpdate may carry (ADR 0022).
+  static constexpr std::uint8_t kInstrumentUpdateFlags =
+      static_cast<std::uint8_t>(kHasMono | kEventTsFromReceipt);
 
   Timestamp recv_ts;
   MonoTimestamp recv_mono;
@@ -135,6 +149,32 @@ struct MarketEvent {
     return (flags & flag) != 0;
   }
 };
+
+// Makes `event` an InstrumentUpdate carrying `meta` (ADR 0022): its kind,
+// instrument, price (the tick size), qty (the lot size) and level_index (the
+// scales). Every other field is left as it is.
+constexpr void set_instrument_meta(MarketEvent& event, const InstrumentMeta& meta) noexcept {
+  const auto byte = [](std::int8_t value, unsigned shift) {
+    return static_cast<std::uint32_t>(static_cast<std::uint8_t>(value)) << shift;
+  };
+  event.kind = EventKind::InstrumentUpdate;
+  event.instrument = meta.id;
+  event.price = meta.tick_size;
+  event.qty = meta.lot_size;
+  event.level_index = byte(meta.price_exp, 0) | byte(meta.qty_exp, 8) |
+                      byte(meta.price_precision, 16) | byte(meta.qty_precision, 24);
+}
+
+// The metadata an InstrumentUpdate carries. Meaningful only for that kind;
+// scales_fit says whether the scales are ones the store could hold.
+[[nodiscard]] constexpr InstrumentMeta instrument_meta(const MarketEvent& event) noexcept {
+  const auto scale = [&event](unsigned shift) {
+    return static_cast<std::int8_t>(static_cast<std::uint8_t>(event.level_index >> shift));
+  };
+  return InstrumentMeta{event.instrument, scale(0),    scale(8),
+                        scale(16),        scale(24),   event.price,
+                        event.qty};
+}
 
 enum class RequestKind : std::uint8_t { New = 0, Cancel = 1 };
 enum class OrderType : std::uint8_t { Limit = 0, Market = 1 };

@@ -105,11 +105,22 @@ sizes), the venue's integrity rule (`BookCheck::KrakenChecksum` or
 one `MarketEvent` and never throws, allocates, locks or reads a clock.
 
 **Storage.** Each side is a ring buffer of `(price, quantity)` levels kept in
-order, best first, allocated once in the constructor. A level is found by
-searching from the best end; inserting or removing one moves the levels on
-the nearer side of it, so a change near the top of the book moves few. A
-snapshot arrives best first on both venues, which is an append at the worse
-end. Cutting to a depth drops the worse end.
+order, best first, allocated once in the constructor (a power of two at
+least the capacity; `BookSide::kMaxCapacity` is 2^20 levels, a 16 MB ring). A
+level is found by binary search over its ranks; inserting or removing one
+moves the levels on the nearer side of it by one slot, so a change near
+either end of the book moves few. A snapshot arrives best first on both
+venues, which is an append at the worse end. Cutting to a depth drops the
+worse end. While a stream snapshot is being built the book cannot be read
+(`has_book()` is false): it takes effect only at the frame's end.
+
+**A message interrupted.** When an event arrives that does not continue the
+message in progress (another record's event, a level out of position, a frame
+end that counts differently), the message fails (`IncompleteMessage`) and the
+event is then taken on its own; the result is the event's own failure if it
+found one, otherwise the `IncompleteMessage`. A level or frame end that belongs
+to no message is skipped while the book is stale, as an update is, and makes
+a book that is not stale go stale (`IncompleteMessage`).
 
 **Capacity.** `capacity_per_side` defaults to `OrderBook::kDefaultCapacity`,
 65,536. A venue that keeps a cut book is sized from its depth with
@@ -138,7 +149,7 @@ until it recovers, as the reference book's is discarded.
 |---------------|---------------|
 | `SequenceGap` 1, `SequenceRepeat` 2, `SequenceOutOfOrder` 3, `ChecksumMismatch` 4, `MessageRejected` 5 | A `StreamStale` event with the `StreamReason` of the same number; and the book's own check: Kraken's checksum computed from the book differs from the message's (4); a Coinbase book message's number equals (2) or is below (3) the previous one's |
 | `DeltaBeforeSnapshot` 64 | An update with no book: none since the start or the last reset |
-| `IncompleteMessage` 65 | A message whose events did not all arrive in order: a frame whose count does not match its levels, a level out of position or outside a frame, another record's event inside a frame or an update, a `kLastInMessage` flag anywhere but on the last level |
+| `IncompleteMessage` 65 | A message whose events did not all arrive in order: a frame whose count does not match its levels, a level out of position or outside a frame, any other event inside a frame or an update, a `kLastInMessage` flag anywhere but on a frame's last level |
 | `CapacityExceeded` 66 | A level that does not fit the side's capacity |
 | `InvalidEvent` 67 | An event the book cannot act on: a level with no side or a negative quantity; a message without the header its venue's check needs (no checksum on Kraken, no number on Coinbase); an empty snapshot frame, which says neither whose it is nor carries a header; an `InstrumentUpdate` whose scales do not fit or whose exponents are not the book's; a `StreamStale` without a stale reason; a kind the book does not know |
 
@@ -262,7 +273,7 @@ table-driven CRC32; no dependency is added.
   of their instrument, and are compared with the converter on it too.
 - The C++ book's precisions follow the stream; its exponents never change.
 - A book costs 16 bytes per level per side, rounded up to a power of two:
-  2 MB for the default capacity, under 2 KB for Kraken at depth 25.
+  2 MB for the default capacity, 2 KB for Kraken at depth 25.
 - Phase 9's stale-book check reads `is_stale()`; a stale book holds nothing
   to price an order against.
 - Phase 7's criteria gain the converter's trades (decision 1).
@@ -293,9 +304,22 @@ Choices made while building it, awaiting the owner:
 11. **The queries show nothing unless the book can be read**, and return
     integer mantissas in Python.
 12. **The constructor throws** on a configuration it cannot build (a capacity
-    of 0 or above 2^24, scales that do not fit). It runs at startup, not on
+    of 0 or above 2^20, scales that do not fit). It runs at startup, not on
     the hot path.
 13. **The allocation test has its own binary** (`qa_alloc_tests`), so only it
     runs on a replaced `operator new`; Phase 5 builds the reusable guard.
-14. **Existing tests changed to the new kind, none weakened**, listed in the
-    roadmap's Phase 4b notes.
+14. **An interrupted message** fails as `IncompleteMessage` and the event is
+    then taken on its own (above); **an orphan level or frame end** is skipped
+    while stale and fails a book that is not. So one lost or misplaced event
+    is one failure, however many of its message's events follow it. A trade
+    arriving inside a message interrupts it too.
+15. **The ring's maximum is 2^20 levels a side** (16 MB), not more: the
+    largest Coinbase BTC-USD side recorded is 22,639.
+16. **Existing tests changed to the new kind, none weakened.**
+    `test_core_types.py`: the unknown-kind refusal tries kinds 9, 10 and 255
+    instead of 8, 9 and 255, since 8 is now `InstrumentUpdate`.
+    `test_marketevents.py`: its `run` helper leaves out `instrument` groups
+    unless asked (`with_instruments=True`), so the hand-built tests see only
+    the groups they assert on, and `converted_steps` skips `instrument` groups
+    as it skips `check` groups; no assertion changed. The new converter tests
+    ask for them.

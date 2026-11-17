@@ -16,7 +16,8 @@ returns.
 
 ``convert`` yields one ``EventGroup`` per step, in the reference book's order
 (``book.trace``): records in ``(log_id, seq)`` order, and at one record its
-control events (in ``event_index`` order) before its levels.
+control events (in ``event_index`` order), then its instrument update, then
+its levels.
 
 - A stream message (``step="message"``) is its levels, each a ``MarketEvent``
   with the row's price, quantity, side, venue time and position, and the
@@ -32,10 +33,15 @@ control events (in ``event_index`` order) before its levels.
   ``StreamReset`` with the ``StreamReason`` of the same name, its
   ``level_index`` the stored ``event_index``. A sequence event also says which
   venue number arrived. Every other stored event is left out.
+- A stored metadata version (an ``instruments`` row, ADR 0022) is one
+  ``InstrumentUpdate`` (``step="instrument"``, not a step of the reference
+  book) at its record, on its log's stream source: the C++ book takes the
+  precisions Kraken's checksum is computed with from the stream, at exactly
+  the record where they changed. Every version is one event, changed or not.
 
 Frames and control events are stamped with the record's receipt time
 (``kEventTsFromReceipt``) and carry no market values. Trades are not
-converted: nothing uses them yet.
+converted yet; the replay engine needs them first (roadmap Phase 7).
 """
 
 import heapq
@@ -56,7 +62,11 @@ MAX_EXPONENT = 18
 MAX_SOURCE = 2**32 - 1
 
 STREAM, PROBE = "ws", "probe"  # the two connections a source can be (ADR 0020)
-STEPS = ("message", "check", "stale", "reset")
+STEPS = ("message", "check", "stale", "reset", "instrument")
+_INSTRUMENT_COLUMNS = (
+    "log_id", "seq", "recv_ts", "event_ts", "event_ts_source", "price_exp", "qty_exp",
+    "price_precision", "qty_precision", "tick_size", "lot_size",
+)  # fmt: skip
 
 _EV = _core.MarketEvent
 _LEVEL_KINDS = {
@@ -167,6 +177,42 @@ def _check_message(message: BookMessage, exponents: list[tuple[int, int]]) -> No
                          f"depth (at most {MAX_DEPTH})")  # fmt: skip
 
 
+def _check_version(version: dict[str, Any], exponents: list[tuple[int, int]]) -> None:
+    """What an InstrumentUpdate cannot carry, or an instrument cannot have."""
+    where = f"instruments row (log {version['log_id']}, seq {version['seq']})"
+    for name in ("price_exp", "qty_exp"):
+        if not 0 <= version[name] <= MAX_EXPONENT:
+            raise ValueError(f"{where}: {name} {version[name]} is outside 0 to {MAX_EXPONENT}")
+    for name, exponent in (("price_precision", "price_exp"), ("qty_precision", "qty_exp")):
+        if not 0 <= version[name] <= version[exponent]:
+            raise ValueError(f"{where}: {name} {version[name]} is outside 0 to its exponent "
+                             f"{version[exponent]}")  # fmt: skip
+    numbers = (version["price_exp"], version["qty_exp"])
+    if not exponents:
+        exponents.append(numbers)
+    elif numbers != exponents[0]:
+        raise ValueError(
+            f"{where}: exponents {numbers} differ from {exponents[0]} earlier in the same "
+            "conversion; an instrument's exponents are fixed (ADR 0019)"
+        )
+
+
+def _instrument_group(version: dict[str, Any], sources: SourceMap, instrument: Any) -> EventGroup:
+    meta = _core.InstrumentMeta(instrument, version["price_exp"], version["qty_exp"],
+                                version["price_precision"], version["qty_precision"],
+                                _core.Price(version["tick_size"]),
+                                _core.Qty(version["lot_size"]))  # fmt: skip
+    event = _EV.instrument_update(meta)
+    event.recv_ts = _core.Timestamp(version["recv_ts"])
+    event.event_ts = _core.Timestamp(version["event_ts"])
+    event.seq = version["seq"]
+    # Whatever channel it came on, a metadata version belongs to its log's stream.
+    event.source = sources.source(version["log_id"], STREAM)
+    if version["event_ts_source"] == EVENT_TS_RECEIPT:
+        event.flags = _EV.EVENT_TS_FROM_RECEIPT
+    return EventGroup(version["log_id"], version["seq"], "instrument", (event,))
+
+
 def _message_group(message: BookMessage, times: dict[tuple[str, int, int], tuple[int, str]],
                    sources: SourceMap, instrument: Any) -> EventGroup:  # fmt: skip
     check = message.kind == BookEventKind.CHECK_SNAPSHOT
@@ -248,9 +294,10 @@ def convert(
     ``book_events`` and ``instruments`` are the tables ``PITSession`` returns,
     ``stream_events`` its rows (``.to_pylist()``); ``instrument`` is the
     ``InstrumentId`` the events carry; ``sources`` numbers the sources (a new
-    map unless one is shared). Raises ``ValueError`` for what a MarketEvent
-    cannot carry: a message with no metadata in force, an exponent outside 0
-    to 18 or different from the first message's, a depth above 65,535.
+    map unless one is shared). Raises ``ValueError``, before yielding
+    anything, for what a MarketEvent cannot carry: a message with no metadata
+    in force, an exponent outside 0 to 18 or different from another's, a
+    precision outside 0 to its exponent, a depth above 65,535.
     """
     sources = SourceMap() if sources is None else sources
     instrument_id = _core.InstrumentId(instrument)
@@ -259,19 +306,28 @@ def convert(
     times = {(log, seq, index): (event_ts, source)
              for log, seq, index, event_ts, source in zip(*columns, strict=True)}  # fmt: skip
     messages = list(messages_from_table(book_events, instruments))  # (log_id, seq) order
+    columns = [instruments.column(name).to_pylist() for name in _INSTRUMENT_COLUMNS]
+    versions = sorted((dict(zip(_INSTRUMENT_COLUMNS, values, strict=True))
+                       for values in zip(*columns, strict=True)),
+                      key=lambda v: (v["log_id"], v["seq"]))  # fmt: skip
     exponents: list[tuple[int, int]] = []
+    for version in versions:
+        _check_version(version, exponents)
     for message in messages:
         _check_message(message, exponents)
     controls = sorted((row for row in stream_events if _acts_on_book(row)),
                       key=lambda r: (r["log_id"], r["seq"], r["event_index"]))  # fmt: skip
-    # At one record, its control events (0) come before its message (1).
+    # At one record: its control events (0), its instrument update (1), its message (2).
     keyed = heapq.merge(
-        (((r["log_id"], r["seq"], 0, r["event_index"]), r) for r in controls),
-        (((m.log_id, m.seq, 1, 0), m) for m in messages),
+        (((r["log_id"], r["seq"], 0, r["event_index"]), "control", r) for r in controls),
+        (((v["log_id"], v["seq"], 1, 0), "instrument", v) for v in versions),
+        (((m.log_id, m.seq, 2, 0), "message", m) for m in messages),
         key=lambda item: item[0],
     )
-    for _, item in keyed:
-        if isinstance(item, BookMessage):
+    for _, what, item in keyed:
+        if what == "message":
             yield _message_group(item, times, sources, instrument_id)
+        elif what == "instrument":
+            yield _instrument_group(item, sources, instrument_id)
         else:
             yield _control_group(item, sources, instrument_id)
