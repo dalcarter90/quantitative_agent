@@ -51,6 +51,7 @@ class FakeSocket:
         return False
 
 
+KRAKEN_INSTRUMENT = '{"channel":"instrument","type":"snapshot","data":{"assets":[],"pairs":[{"symbol":"BTC/USD","qty_precision":8,"qty_increment":0.00000001,"price_precision":1,"price_increment":0.1}]}}'  # noqa: E501
 KRAKEN_SNAPSHOT = '{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[],"asks":[],"checksum":0,"timestamp":"2026-01-01T00:00:00.000000Z"}]}'  # noqa: E501
 KRAKEN_UPDATE = '{"channel":"book","type":"update","data":[]}'
 
@@ -64,6 +65,7 @@ def run_kraken(
     reconnects=False,
     measure_clock=GOOD_CLOCK,
     allow_clock_offset=False,
+    **options,
 ):
     """Run the recorder against scripted sockets.
 
@@ -99,6 +101,7 @@ def run_kraken(
             reconnect_delay=0.01,
             measure_clock=measure_clock,
             allow_clock_offset=allow_clock_offset,
+            **options,
         )
     )
     return path, list(read_raw_log(path)), probes
@@ -166,7 +169,7 @@ def test_no_subscription_or_request_carries_credentials():
 
 
 def test_recording_writes_control_records_then_every_message_in_order(tmp_path):
-    main = FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE])
+    main = FakeSocket([KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE])
     path, records, probes = run_kraken(tmp_path, [main])
 
     assert path.name.endswith(".qaraw.zst")
@@ -195,7 +198,7 @@ def test_recording_writes_control_records_then_every_message_in_order(tmp_path):
     assert main.sent == subscribed
 
     stream = [r.payload.decode() for r in records if r.channel == "ws"]
-    assert stream == [KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE]
+    assert stream == [KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE]
     # Every received message is preceded by the connect record of its connection.
     first_ws = next(i for i, r in enumerate(records) if r.channel == "ws")
     connect_at = next(
@@ -221,8 +224,8 @@ def test_probes_record_fresh_snapshots_on_a_separate_channel(tmp_path):
 
 
 def test_a_dropped_connection_is_recorded_and_reconnected(tmp_path):
-    first = FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_UPDATE], then="close")
-    second = FakeSocket([KRAKEN_SNAPSHOT])
+    first = FakeSocket([KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT, KRAKEN_UPDATE], then="close")
+    second = FakeSocket([KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT])
     _, records, _ = run_kraken(tmp_path, [first, second], probe_interval=10, reconnects=True)
 
     events = [e for e in controls(records) if e.get("connection") == "ws"]
@@ -233,8 +236,10 @@ def test_a_dropped_connection_is_recorded_and_reconnected(tmp_path):
     assert "scripted disconnect" in events[drop]["reason"]
     assert kinds[drop + 1] == "connect"
     assert [r.payload.decode() for r in records if r.channel == "ws"] == [
+        KRAKEN_INSTRUMENT,
         KRAKEN_SNAPSHOT,
         KRAKEN_UPDATE,
+        KRAKEN_INSTRUMENT,
         KRAKEN_SNAPSHOT,
     ]
     assert second.sent == VENUES["kraken"].subscriptions("BTC/USD", 25)
@@ -277,6 +282,103 @@ def test_recv_ts_is_taken_when_each_message_arrives(tmp_path):
     times = [r.recv_ts for r in records]
     assert times == sorted(times)
     assert times[0] > 1_600_000_000 * 10**9
+
+
+class ScriptedClock:
+    """The recorder's clocks, moved only by the scripted socket below."""
+
+    def __init__(self):
+        self.now = 1_800_000_000 * 10**9
+
+    def stamp(self):
+        return self.now, self.now
+
+
+class DelayedSocket(FakeSocket):
+    """Delivers each message ``delay`` ns of scripted time after the read for it
+    began, and says when each was delivered."""
+
+    def __init__(self, messages, clock, delay):
+        super().__init__(messages)
+        self.clock, self.delay, self.delivered = clock, delay, []
+
+    async def recv(self):
+        if not self._messages:
+            await asyncio.sleep(3600)
+        await asyncio.sleep(0)
+        self.clock.now += self.delay
+        self.delivered.append(self.clock.now)
+        return self._messages.pop(0)
+
+
+def test_each_stamp_is_taken_after_its_message_arrives_and_before_the_next_read(
+    tmp_path, monkeypatch
+):
+    """The review's T1 mutation: a recorder that stamps a message before waiting
+    for it (so each record carries the previous message's time) passed every
+    other test. Here the clocks move only when a message is delivered, so a
+    stamp taken anywhere but between a delivery and the next read is wrong."""
+    clock = ScriptedClock()
+    monkeypatch.setattr(recorder, "stamp", clock.stamp)
+    delay = 7_000_000  # 7 ms between asking for a message and getting it
+    main = DelayedSocket([KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT, KRAKEN_UPDATE, KRAKEN_UPDATE],
+                         clock, delay)  # fmt: skip
+    _, records, _ = run_kraken(tmp_path, [main], probe_interval=10)
+    stream = [r for r in records if r.channel == "ws"]
+    assert len(stream) == len(main.delivered) == 4
+    for written, delivered in zip(stream, main.delivered, strict=True):
+        # Not before the message arrived, and not after the next read began
+        # (that read moves the clock on by the delay).
+        assert delivered <= written.recv_ts < delivered + delay
+        assert written.recv_mono_ns == written.recv_ts
+
+
+# --- instrument metadata before market data (ADR 0019) ------------------------------------------
+
+
+def test_kraken_subscribes_to_book_and_trades_only_once_the_instrument_snapshot_is_in(tmp_path):
+    """Every market data message of a session then follows a metadata version
+    in the log, so one is in effect from the session's first row (review, R06)."""
+    main = FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT, KRAKEN_UPDATE])
+    _, records, _ = run_kraken(tmp_path, [main], probe_interval=10)
+    kinds = []
+    for written in records:
+        if written.channel == "ws":
+            kinds.append(json.loads(written.payload).get("channel"))
+        elif written.channel == "recorder":
+            event = json.loads(written.payload)
+            if event["event"] == "subscribe":
+                kinds.append("subscribe " + event["request"]["params"]["channel"])
+    assert kinds == [
+        "subscribe instrument",
+        "book",  # whatever arrives first is recorded; it was not asked for yet
+        "instrument",
+        "subscribe book",
+        "subscribe trade",
+        "book",
+        "book",
+    ]
+    assert main.sent == VENUES["kraken"].subscriptions("BTC/USD", 25)
+
+
+def test_kraken_reconnects_if_no_instrument_snapshot_arrives(tmp_path):
+    silent = FakeSocket([KRAKEN_SNAPSHOT])  # then nothing
+    second = FakeSocket([KRAKEN_INSTRUMENT, KRAKEN_SNAPSHOT])
+    _, records, _ = run_kraken(tmp_path, [silent, second], duration=0.6, probe_interval=10,
+                               reconnects=True, metadata_timeout=0.1)  # fmt: skip
+    reasons = [e["reason"] for e in controls(records)
+               if e["event"] == "disconnect" and e["connection"] == "ws"]  # fmt: skip
+    assert "instrument metadata" in reasons[0] and reasons[-1] == "session ended"
+    assert silent.sent == VENUES["kraken"].subscriptions("BTC/USD", 25)[:1]
+    assert second.sent == VENUES["kraken"].subscriptions("BTC/USD", 25)
+
+
+def test_coinbase_needs_no_wait_because_its_metadata_comes_before_connecting():
+    spec = VENUES["coinbase"]
+    assert spec.metadata_requests == 0 and spec.rest("BTC-USD")
+    kraken = VENUES["kraken"]
+    assert kraken.metadata_requests == 1
+    assert kraken.is_metadata(KRAKEN_INSTRUMENT) and not kraken.is_metadata(KRAKEN_SNAPSHOT)
 
 
 @pytest.mark.network
@@ -387,7 +489,7 @@ def test_the_session_start_records_this_machines_clock_identity(tmp_path):
 
     _, records, _ = run_kraken(tmp_path, [FakeSocket([KRAKEN_SNAPSHOT, KRAKEN_UPDATE])])
     start = controls(records)[0]
-    assert start["recorder_version"] == recorder.RECORDER_VERSION == 3
+    assert start["recorder_version"] == recorder.RECORDER_VERSION == 4
     assert start["clock_identity"] == clock_identity().to_json()
 
 

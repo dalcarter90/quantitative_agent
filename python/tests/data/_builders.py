@@ -85,10 +85,20 @@ def book_table(*specs, log_id=LOG):
 
 
 def instrument_table(
-    event_ts, *, price_exp=2, qty_exp=5, tick_size=1, lot_size=1, seq=0, log_id=LOG
+    event_ts,
+    *,
+    price_exp=2,
+    qty_exp=5,
+    tick_size=1,
+    lot_size=1,
+    seq=0,
+    log_id=LOG,
+    price_precision=None,
+    qty_precision=None,
 ):
     """One metadata version. Its identity is (log_id, seq): give each version a
-    different seq, and a correction the seq of the version it corrects."""
+    different seq, and a correction the seq of the version it corrects. The
+    precisions default to the exponents (ADR 0019)."""
     row = {
         "event_ts": event_ts,
         "event_ts_source": "venue",
@@ -97,6 +107,8 @@ def instrument_table(
         "seq": seq,
         "price_exp": price_exp,
         "qty_exp": qty_exp,
+        "price_precision": price_exp if price_precision is None else price_precision,
+        "qty_precision": qty_exp if qty_precision is None else qty_precision,
         "tick_size": tick_size,
         "lot_size": lot_size,
     }

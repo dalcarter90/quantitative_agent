@@ -20,6 +20,12 @@ template <class I>
 concept LosslessToInt64 =
     std::integral<I> && !std::same_as<I, bool> && (std::signed_integral<I> || sizeof(I) < 8);
 
+// Integers that convert to uint32 without loss, and are not bool: unsigned
+// types of at most 32 bits. A signed type could be negative.
+template <class I>
+concept LosslessToUint32 =
+    std::unsigned_integral<I> && !std::same_as<I, bool> && sizeof(I) <= sizeof(std::uint32_t);
+
 // One int64 value with a distinct type per Tag.
 template <class Tag>
 class Int64Value {
@@ -74,13 +80,15 @@ class MonoTimestamp : public detail::Int64Value<MonoTimestamp> {
 class InstrumentId {
  public:
   constexpr InstrumentId() noexcept = default;
-  // Callers keep ids within 0..2^32-1; the Python bindings check it.
+  // Only from integers that fit without loss (review, D7): an int64 or a
+  // signed int does not compile. The Python bindings range-check first.
+  template <detail::LosslessToUint32 I>
+  constexpr explicit InstrumentId(I value) noexcept : value_(value) {}
   template <std::integral I>
-    requires(!std::same_as<I, bool>)
-  constexpr explicit InstrumentId(I value) noexcept : value_(static_cast<std::uint32_t>(value)) {}
+    requires(!detail::LosslessToUint32<I>)
+  explicit InstrumentId(I) = delete;
   template <std::floating_point F>
   explicit InstrumentId(F) = delete;
-  explicit InstrumentId(bool) = delete;
 
   [[nodiscard]] constexpr std::uint32_t value() const noexcept { return value_; }
   friend constexpr bool operator==(InstrumentId, InstrumentId) noexcept = default;

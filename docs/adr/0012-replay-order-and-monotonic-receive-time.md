@@ -1,6 +1,6 @@
 # 0012: Replay order is `seq`; receive time gains a monotonic stamp
 
-Status: Accepted (owner decision), amended by 0013, which settles the "Open" point below
+Status: Accepted (owner decision), amended by 0013, which settles the "Open" point below; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-12
 Amends: 0005, 0006, 0008
 

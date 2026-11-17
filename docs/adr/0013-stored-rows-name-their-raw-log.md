@@ -1,6 +1,6 @@
 # 0013: Stored rows name their raw log; keys and order use `(log_id, seq)`
 
-Status: Accepted (owner decision; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015 and 0018
+Status: Accepted (owner decision; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015 and 0018; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-12
 Amends: 0006, 0009, 0010, 0012
 

@@ -205,20 +205,14 @@ def test_event_ts_source_on_real_data(capture):
 def test_instrument_metadata_from_real_data(capture):
     venue, _, normalized = capture
     (meta,) = rows(normalized, INSTRUMENTS, venue)
+    # The fixed exponents of BTC-USD and the venue's own precision (ADR 0019):
+    # Kraken prints one decimal and ticks 0.1; Coinbase's tick is 0.01.
+    found = tuple(meta[name] for name in ("price_exp", "qty_exp", "price_precision",
+                                          "qty_precision", "tick_size", "lot_size"))  # fmt: skip
     if venue == "kraken":
-        assert (meta["price_exp"], meta["qty_exp"], meta["tick_size"], meta["lot_size"]) == (
-            1,
-            8,
-            1,
-            1,
-        )
+        assert found == (8, 8, 1, 8, 10_000_000, 1)
     else:
-        assert (meta["price_exp"], meta["qty_exp"], meta["tick_size"], meta["lot_size"]) == (
-            2,
-            8,
-            1,
-            1,
-        )
+        assert found == (8, 8, 2, 8, 1_000_000, 1)
     first_data = min(r["seq"] for d in (TRADES, BOOK_EVENTS) for r in rows(normalized, d, venue))
     assert meta["seq"] < first_data  # metadata is known before any market data
 
@@ -252,10 +246,21 @@ def apply(book, message, depth=None):
     return book
 
 
-def kraken_checksum(book):
+def kraken_divisors(normalized):
+    """What turns the stored mantissas back into the digits Kraken prints: they
+    are at the fixed exponents, Kraken prints at its precision (ADR 0019)."""
+    (meta,) = rows(normalized, INSTRUMENTS, "kraken")
+    return (10 ** (meta["price_exp"] - meta["price_precision"]),
+            10 ** (meta["qty_exp"] - meta["qty_precision"]))  # fmt: skip
+
+
+def kraken_checksum(book, divisors):
+    price_divisor, qty_divisor = divisors
     asks = sorted(book[Side.SELL].items())[:10]
     bids = sorted(book[Side.BUY].items(), reverse=True)[:10]
-    text = "".join(f"{price}{qty}" for price, qty in [*asks, *bids])
+    for price, qty in [*asks, *bids]:  # exact: Kraken's digits, then zeros
+        assert price % price_divisor == 0 and qty % qty_divisor == 0
+    text = "".join(f"{p // price_divisor}{q // qty_divisor}" for p, q in [*asks, *bids])
     return zlib.crc32(text.encode())
 
 
@@ -264,6 +269,8 @@ def test_kraken_checksum_is_reproduced_from_the_stored_mantissas_for_every_messa
     # quantity was converted exactly, the order of levels within a message was
     # kept, and the book is cut to the subscribed depth after each update.
     normalized = normalize(read_raw_log(fixture_path("kraken")))
+    divisors = kraken_divisors(normalized)
+    assert divisors == (10_000_000, 1)
     book_rows = rows(normalized, BOOK_EVENTS, "kraken")
     stream = [r for r in book_rows if r["kind"] != BookEventKind.CHECK_SNAPSHOT]
     assert {r["depth"] for r in book_rows} == {25}
@@ -272,14 +279,14 @@ def test_kraken_checksum_is_reproduced_from_the_stored_mantissas_for_every_messa
     book, checked = None, 0
     for message in by_message(stream):
         book = apply(book, message, depth=25)
-        assert kraken_checksum(book) == message[0]["checksum"], message[0]["seq"]
+        assert kraken_checksum(book, divisors) == message[0]["checksum"], message[0]["seq"]
         assert len({row["checksum"] for row in message}) == 1
         checked += 1
     assert checked > 10_000
 
     probes = [r for r in book_rows if r["kind"] == BookEventKind.CHECK_SNAPSHOT]
     for message in by_message(probes):
-        assert kraken_checksum(apply(None, message, depth=25)) == message[0]["checksum"]
+        assert kraken_checksum(apply(None, message, depth=25), divisors) == message[0]["checksum"]
         assert Counter(row["side"] for row in message) == {Side.BUY: 25, Side.SELL: 25}
 
 
@@ -288,11 +295,12 @@ def test_kraken_checksum_check_would_notice_a_single_wrong_digit():
     stream = [
         r for r in rows(normalized, BOOK_EVENTS, "kraken") if r["kind"] == BookEventKind.SNAPSHOT
     ]
+    divisors = kraken_divisors(normalized)
     book = apply(None, stream, depth=25)
-    assert kraken_checksum(book) == stream[0]["checksum"]
+    assert kraken_checksum(book, divisors) == stream[0]["checksum"]
     best_bid = max(book[Side.BUY])
-    book[Side.BUY][best_bid] += 1
-    assert kraken_checksum(book) != stream[0]["checksum"]
+    book[Side.BUY][best_bid] += 1  # the last digit Kraken prints of its quantity
+    assert kraken_checksum(book, divisors) != stream[0]["checksum"]
 
 
 def test_coinbase_sequence_numbers_are_stored_and_continuous_on_the_stream():

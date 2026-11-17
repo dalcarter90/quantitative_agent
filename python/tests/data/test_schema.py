@@ -64,6 +64,8 @@ def instrument_row(**overrides):
         "seq": 1,
         "price_exp": 2,
         "qty_exp": 5,
+        "price_precision": 2,
+        "qty_precision": 5,
         "tick_size": 1,
         "lot_size": 1,
     }
@@ -132,8 +134,9 @@ def test_partition_columns_are_not_stored_in_the_file(dataset):
         assert name not in dataset.stored_schema.names
 
 
-def test_instrument_metadata_has_exponents_tick_and_lot():
-    for name in ("price_exp", "qty_exp", "tick_size", "lot_size"):
+def test_instrument_metadata_has_exponents_precisions_tick_and_lot():
+    for name in ("price_exp", "qty_exp", "price_precision", "qty_precision", "tick_size",
+                 "lot_size"):  # fmt: skip
         assert name in INSTRUMENTS.schema.names
 
 
@@ -240,6 +243,10 @@ def test_book_kind_must_be_snapshot_or_delta():
         {"tick_size": 0},
         {"tick_size": -1},
         {"lot_size": 0},
+        {"price_precision": -1},
+        {"price_precision": 3},  # above price_exp 2
+        {"qty_precision": -1},
+        {"qty_precision": 6},  # above qty_exp 5
     ],
 )
 def test_instrument_metadata_must_be_structurally_valid(overrides):
@@ -291,8 +298,9 @@ def test_validate_table_rejects_non_tables():
 
 
 @pytest.mark.parametrize("dataset", ALL, ids=lambda d: d.name)
-def test_every_dataset_is_at_schema_version_3_with_event_ts_source(dataset):
-    assert dataset.version == 3
+def test_every_dataset_is_at_its_schema_version_with_event_ts_source(dataset):
+    # instruments is version 4 since it holds the venue's precisions (ADR 0019).
+    assert dataset.version == {"trades": 3, "book_events": 3, "instruments": 4}[dataset.name]
     field = dataset.schema.field("event_ts_source")
     assert field.type == pa.string()
     assert not field.nullable

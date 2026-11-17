@@ -1,6 +1,6 @@
 # 0014: Coinbase check snapshots are judged by stream batch
 
-Status: Accepted (owner decision, 2026-11-13; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015
+Status: Accepted (owner decision, 2026-11-13; implementation choices confirmed by the owner 2026-11-13, see "Review"), amended by 0015; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-13
 Amends: 0009, 0010
 

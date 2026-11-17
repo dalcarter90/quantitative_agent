@@ -27,6 +27,9 @@ Most of this is not built yet. Read these before changing anything:
 - `docs/roadmap.md`: the phases, their order and acceptance criteria.
 - `docs/architecture.md`: layers, interfaces, threading, representations.
 - `docs/adr/`: why each major decision was made.
+- `docs/data-core-spec.md`: the data core as it is, in one place. It
+  supersedes ADRs 0005 and 0008 to 0018 (and 0006's store tiers), which keep
+  the reasons.
 
 ## Safety rules (never break these)
 
@@ -79,7 +82,8 @@ If a task seems to require breaking one of these, stop and ask the owner.
   settled; check before building on them.
 - **Record decisions.** A new major decision gets a new ADR in `docs/adr/`
   listing the alternatives considered. Do not rewrite an accepted ADR;
-  supersede it.
+  supersede it. A decision about the data core also updates
+  `docs/data-core-spec.md` in the same change.
 - **Keep docs true.** If you change an interface described in
   `docs/architecture.md`, update the document in the same PR. Tick off
   roadmap criteria and update the status table as you complete them.
@@ -162,8 +166,11 @@ cd ..
 .venv\Scripts\python -m quantagent.data.quality --store data\normalized --start 2026-11-11 --end 2026-11-11
 ```
 
-`docs/data-core.md` describes the data core: datasets, store, `PITSession`,
-adapters and quality checks.
+`docs/data-core-spec.md` describes the data core: representation, raw logs,
+datasets, stream events, adapters, store, `PITSession`, quality checks and the
+reference book. `docs/data-core.md` is the guide to its commands. Every
+instrument needs fixed exponents in `adapters.FIXED_EXPONENTS` before its logs
+load (ADR 0019).
 
 Crypto venues are Kraken and Coinbase. Binance.com refuses API access from US
 addresses, so it is not used. Recorded data and stores live under `data/`,
@@ -183,7 +190,7 @@ Things that commonly go wrong:
   is the one Python imports.
 - **`StoreVersionError` when opening a store**: it was written by an earlier
   version of the code (before loads, ADR 0018; before commit markers, ADR
-  0017; or another schema).
+  0017; `instruments` before schema version 4, ADR 0019; or another schema).
   Rebuild it from the raw logs into a new directory with the adapters command
   above. `PITSession(..., as_of=...)` is a `TypeError` for the same reason:
   pass `available_at`, and `version` for a knowledge cutoff.

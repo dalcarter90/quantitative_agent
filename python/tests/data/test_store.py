@@ -81,6 +81,8 @@ def instrument(event_ts, *, price_exp=2, qty_exp=5, tick_size=1, lot_size=1, seq
         "seq": seq,
         "price_exp": price_exp,
         "qty_exp": qty_exp,
+        "price_precision": price_exp,
+        "qty_precision": qty_exp,
         "tick_size": tick_size,
         "lot_size": lot_size,
     }

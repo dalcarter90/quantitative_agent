@@ -8,11 +8,13 @@ events it writes are part of the test) or in the normalized rows.
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
-from _builders import INT64_MAX
+from _builders import INT64_MAX, LOG, NS_PER_DAY, T0
 from test_fixtures import INSTRUMENT, fixture_path
+from test_review_2026_11 import comparison, events_store, stream_event
 from test_stream_events import copy_log
 
 import quantagent.data.quality as quality
@@ -25,9 +27,11 @@ from quantagent.data.quality import (
     check_clock_skew,
     check_crossed_books,
     check_independent_snapshots,
+    check_loads,
     check_outliers,
     check_recording_clock,
     check_stream_integrity,
+    check_trade_observations,
     run_checks,
 )
 from quantagent.data.rawlog import RawLogWriter, read_raw_log
@@ -42,6 +46,8 @@ from quantagent.data.session import PITSession
 from quantagent.data.store import AppendOnlyStore
 
 NS = 1_000_000_000
+HOUR = 3600 * NS
+ONE_DAY = NS_PER_DAY
 ALL = (0, INT64_MAX)
 # The checks of the data itself (check_independent_snapshots grades the
 # check-snapshot events; its own tests are in test_check_snapshots.py).
@@ -49,7 +55,8 @@ ALL = (0, INT64_MAX)
 # the committed fixtures were recorded before the clock was measured, so it
 # reports that on them (and should).
 CHECKS = [check_stream_integrity, check_independent_snapshots, check_clock_skew,
-          check_crossed_books, check_outliers]  # fmt: skip
+          check_crossed_books, check_outliers, check_trade_observations,
+          check_loads]  # fmt: skip
 TRADES = ("trades", "kraken", INSTRUMENT)
 BOOK = ("book_events", "kraken", INSTRUMENT)
 EVENTS = ("stream_events", "kraken", INSTRUMENT)
@@ -1116,3 +1123,171 @@ def test_venue_time_is_compared_within_each_log_only(tmp_path, kraken_rows):
 
     result = run(check_clock_skew, planted(tmp_path, kraken_rows, edit))
     assert [f.what for f in result.findings if f.what == "event_ts_backwards"] == []
+
+
+# --- the finding limit is per severity (review, R07; ADR 0019) ----------------------------------
+
+
+def comparisons_store(tmp_path, *results):
+    """A Coinbase session with one CHECK_SNAPSHOT_COMPARED event per result:
+    "explained" is INFO, "garbled" (no known result) WARNING, "mismatch" ERROR."""
+    rows = [stream_event(0, StreamEventKind.SESSION_START, T0)]
+    for seq, result in enumerate(results, start=1):
+        if result == "mismatch":
+            rows.append(comparison(seq, T0 + seq, "mismatch", violations=3))
+        else:
+            rows.append(comparison(seq, T0 + seq, result, unverified=1))
+    return events_store(tmp_path / "store", rows)
+
+
+def test_each_severity_has_its_own_limit_so_lesser_findings_never_hide_an_error(tmp_path):
+    root = comparisons_store(tmp_path, *["explained"] * 5, *["garbled"] * 5, "mismatch")
+    with PITSession(root, available_at=INT64_MAX) as session:
+        result = check_independent_snapshots(session, "coinbase", INSTRUMENT, *ALL,
+                                             QualityConfig(max_findings=2))  # fmt: skip
+    assert Counter(f.severity for f in result.findings) == {
+        Severity.INFO: 2, Severity.WARNING: 2, Severity.ERROR: 1}  # fmt: skip
+    assert result.truncated is True
+    assert result.cut == (Severity.INFO, Severity.WARNING)  # an error was never cut
+
+
+def test_errors_beyond_their_own_limit_are_cut_and_say_so(tmp_path):
+    root = comparisons_store(tmp_path, *["mismatch"] * 3)
+    with PITSession(root, available_at=INT64_MAX) as session:
+        result = check_independent_snapshots(session, "coinbase", INSTRUMENT, *ALL,
+                                             QualityConfig(max_findings=2))  # fmt: skip
+    assert [f.severity for f in result.findings] == [Severity.ERROR] * 2
+    assert result.cut == (Severity.ERROR,)
+
+
+def test_a_limited_query_still_returns_the_errors_behind_many_warnings(tmp_path, kraken_rows):
+    """The outlier check's book query is limited in SQL. Many zero-quantity
+    snapshot levels (WARNING) come before a negative price (ERROR) there."""
+
+    def edit(rows):
+        snapshot = min(r["seq"] for r in rows[BOOK] if r["kind"] == BookEventKind.SNAPSHOT)
+        last = max(r["seq"] for r in rows[BOOK])
+        rows[BOOK] = [
+            {**r, "qty": 0} if r["seq"] == snapshot
+            else {**r, "price": -1} if r["seq"] == last and r["level_index"] == 0
+            else r
+            for r in rows[BOOK]
+        ]  # fmt: skip
+
+    root = planted(tmp_path, kraken_rows, edit)
+    result = run(check_outliers, root, config=QualityConfig(max_findings=3))
+    whats = Counter(f.what for f in result.findings)
+    assert whats == {"zero_quantity_in_snapshot": 3, "nonpositive_price": 1}
+    assert result.cut == (Severity.WARNING,)
+
+
+def test_errors_found_after_the_warnings_are_full_are_all_kept(tmp_path, kraken_rows):
+    """The outlier check finds trade WARNINGs first (here every trade is an
+    outlier), then book ERRORs. A full WARNING limit must not limit those."""
+
+    def edit(rows):
+        snapshot = min(r["seq"] for r in rows[BOOK] if r["kind"] == BookEventKind.SNAPSHOT)
+        rows[BOOK] = [{**r, "price": -1} if r["seq"] == snapshot and r["level_index"] < 2 else r
+                      for r in rows[BOOK]]  # fmt: skip
+
+    root = planted(tmp_path, kraken_rows, edit)
+    result = run(check_outliers, root, config=QualityConfig(outlier_bps=0, max_findings=3))
+    assert Counter(f.severity for f in result.findings) == {Severity.WARNING: 3,
+                                                           Severity.ERROR: 2}  # fmt: skip
+    assert result.cut == (Severity.WARNING,)
+
+
+def test_a_report_whose_findings_were_cut_fails_whatever_their_severity(tmp_path, capsys):
+    root = comparisons_store(tmp_path, *["explained"] * 4)
+    config = tmp_path / "quality.json"
+    config.write_text('{"max_findings": 3}', encoding="utf-8")
+    arguments = ["--store", str(root), "--start", "2023-11-14", "--end", "2023-11-14",
+                 "--config", str(config)]  # fmt: skip
+    assert quality.main(arguments) == 1
+    out = capsys.readouterr().out
+    assert "INFO findings were cut off by max_findings" in out
+    assert "TRUNCATED" in out
+    # The same findings within the limit pass: only INFO, below --fail-on.
+    config.write_text('{"max_findings": 4}', encoding="utf-8")
+    assert quality.main(arguments) == 0
+
+
+# --- a session is judged on every day it spans (review, R08; ADR 0019) ---------------------------
+
+
+MIDNIGHT = (
+    T0 // ONE_DAY + 1
+) * ONE_DAY  # the session below begins at 23:59 and records into the next day
+
+
+def spanning_session(tmp_path, *, clock=True, later=()):
+    start = MIDNIGHT - 60 * NS
+    rows = [stream_event(0, StreamEventKind.SESSION_START, start,
+                         detail='{"monotonic_stamps":true}')]  # fmt: skip
+    if clock:
+        rows.append(stream_event(1, StreamEventKind.CLOCK_OFFSET, start + 1, expected=LIMIT,
+                                 observed=1_400_000_000, detail='{"servers":[]}'))  # fmt: skip
+    rows.append(stream_event(2, StreamEventKind.CONNECT, start + 2, connection="ws"))
+    rows += [stream_event(seq, kind, ts, connection="ws") for seq, kind, ts in later]
+    return events_store(tmp_path / "store", rows)
+
+
+def day_findings(root, check, day_start):
+    with PITSession(root, available_at=INT64_MAX) as session:
+        result = check(session, "coinbase", INSTRUMENT, day_start, day_start + ONE_DAY,
+                       QualityConfig())  # fmt: skip
+    return [(f.what, f.seq) for f in result.findings], result.stats
+
+
+def test_a_clock_never_measured_is_reported_on_every_day_its_session_spans(tmp_path):
+    root = spanning_session(
+        tmp_path, clock=False, later=[(900, StreamEventKind.SUBSCRIPTION_ACK, MIDNIGHT + HOUR)]
+    )
+    for day in (MIDNIGHT - ONE_DAY, MIDNIGHT):
+        findings, stats = day_findings(root, check_recording_clock, day)
+        assert findings == [("clock_not_recorded", 0)]
+        assert stats["sessions"] == 1
+
+
+def test_a_day_with_only_market_data_of_a_session_still_gets_its_clock(tmp_path):
+    root = spanning_session(tmp_path)
+    trade = {"event_ts": MIDNIGHT + HOUR, "event_ts_source": "venue", "recv_ts": MIDNIGHT + HOUR,
+             "log_id": LOG, "seq": 901, "trade_id": "t", "price": 1, "qty": 1,
+             "side": 1}  # fmt: skip
+    AppendOnlyStore(root)._append(DATASETS["trades"], "coinbase", INSTRUMENT,
+                                  table_from_rows(DATASETS["trades"], [trade]))  # fmt: skip
+    findings, _ = day_findings(root, check_recording_clock, MIDNIGHT)
+    assert findings == [("clock_offset_exceeded", 1)]
+    # A day with nothing of the session has nothing to report.
+    assert day_findings(root, check_recording_clock, MIDNIGHT + ONE_DAY)[0] == []
+
+
+def test_a_session_with_no_rows_in_the_range_is_not_judged_in_it(tmp_path):
+    """Two sessions in one log: the first, with a bad clock, ends the day before.
+    The second day's report holds only the second session."""
+    first, second = MIDNIGHT - 2 * HOUR, MIDNIGHT + HOUR
+    rows = [
+        stream_event(0, StreamEventKind.SESSION_START, first, detail='{"monotonic_stamps":true}'),
+        stream_event(1, StreamEventKind.CLOCK_OFFSET, first + 1, expected=LIMIT,
+                     observed=1_400_000_000, detail='{"servers":[]}'),
+        stream_event(2, StreamEventKind.SESSION_START, second, detail='{"monotonic_stamps":true}'),
+        stream_event(3, StreamEventKind.CLOCK_OFFSET, second + 1, expected=LIMIT,
+                     observed=1_000_000, detail='{"servers":[]}'),
+    ]  # fmt: skip
+    root = events_store(tmp_path / "store", rows)
+    findings, stats = day_findings(root, check_recording_clock, MIDNIGHT)
+    assert findings == [] and stats["sessions"] == 1
+    findings, stats = day_findings(root, check_recording_clock, MIDNIGHT - ONE_DAY)
+    assert findings == [("clock_offset_exceeded", 1)] and stats["sessions"] == 1
+
+
+def test_a_reconnect_is_one_whatever_day_the_first_connect_was_on(tmp_path):
+    root = spanning_session(tmp_path, later=[
+        (900, StreamEventKind.DISCONNECT, MIDNIGHT + HOUR),
+        (901, StreamEventKind.CONNECT, MIDNIGHT + HOUR + 1),
+    ])  # fmt: skip
+    findings, _ = day_findings(root, check_stream_integrity, MIDNIGHT)
+    assert ("reconnect", 901) in findings
+    # On the first day the session's first connect is not a reconnect.
+    findings, _ = day_findings(root, check_stream_integrity, MIDNIGHT - ONE_DAY)
+    assert [what for what, _ in findings if what == "reconnect"] == []

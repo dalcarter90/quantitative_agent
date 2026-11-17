@@ -11,7 +11,8 @@ CHECK_SNAPSHOT_COMPARED stream event per check snapshot. The reconstructor
 applies it again from the stored rows. These tests check each, and that the
 two agree.
 
-Synthetic book used below (prices with 2 decimals, quantities in whole units):
+Synthetic book used below (prices with 2 decimals, quantities in whole units;
+stored at the fixed exponents of ADR 0019, so 99.00 is 9_900_000_000):
 
     after the stream snapshot (0 ms)   bids 100 x1, 99 x2, 98 x3    asks 101 x1, 102 x2, 103 x3
     batch at 50 ms                     bid 100 -> 5                  ask 104 -> 1 (new)
@@ -192,8 +193,8 @@ def test_between_batches_the_next_batchs_levels_are_unverified_not_wrong():
     assert result.matched and not result.exact
     # (side, price, after A, snapshot, after B)
     assert set(result.unverified) == {
-        (Side.BUY, 9900, 200_000_000, None, None),
-        (Side.SELL, 10100, 100_000_000, 700_000_000, 200_000_000),
+        (Side.BUY, 9_900_000_000, 200_000_000, None, None),
+        (Side.SELL, 10_100_000_000, 100_000_000, 700_000_000, 200_000_000),
     }
 
 
@@ -203,7 +204,7 @@ def test_between_batches_a_difference_outside_the_next_batch_is_a_mismatch():
     assert (detail["result"], detail["violations"], detail["unverified"]) == ("mismatch", 1, 0)
     assert (detail["violations_shallowest"], detail["violations_deepest"]) == (2, 2)
     (result,) = reconstructed(session.normalize())
-    assert result.differences == [(Side.BUY, 9800, 300_000_000, 400_000_000)]
+    assert result.differences == [(Side.BUY, 9_800_000_000, 300_000_000, 400_000_000)]
 
 
 def test_between_batches_equal_on_every_level_is_exact():

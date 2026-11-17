@@ -51,13 +51,12 @@ from quantagent.data.adapters.base import (
     as_list,
     as_object,
     data,
+    decimals,
     ignored,
-    increment,
     load_json,
-    receipt_time,
     venue_time,
 )
-from quantagent.data.fixedpoint import INT64_MAX, to_mantissa
+from quantagent.data.fixedpoint import INT64_MAX
 from quantagent.data.rawlog import RawRecord
 from quantagent.data.schema import BookEventKind, Side, StreamEventKind
 
@@ -268,18 +267,13 @@ class CoinbaseAdapter(VenueAdapter):
     def _product(self, record: RawRecord) -> Handled:
         product = as_object(load_json(record.payload), "product")
         self.require_symbol(product["product_id"])
-        price_exp, tick_size = increment(product["price_increment"], "price_increment")
-        qty_exp, lot_size = increment(product["base_increment"], "base_increment")
-        row = {
-            **receipt_time(record),
-            "recv_ts": record.recv_ts,
-            "seq": record.seq,
-            "price_exp": price_exp,
-            "qty_exp": qty_exp,
-            "tick_size": tick_size,
-            "lot_size": lot_size,
-        }
-        self.exponents = (price_exp, qty_exp)
+        tick, lot = product["price_increment"], product["base_increment"]
+        # Coinbase states no precision of its own: its prices and sizes have as
+        # many decimals as its increments. The exponents are fixed (ADR 0019).
+        row = self.metadata(record, price_precision=decimals(tick, "price_increment"),
+                            qty_precision=decimals(lot, "base_increment"), tick_size=tick,
+                            lot_size=lot)  # fmt: skip
+        self.use(row)
         return "data", "product", [("instruments", row)]
 
     def _book(self, record: RawRecord, message: dict) -> Handled:
@@ -300,7 +294,7 @@ class CoinbaseAdapter(VenueAdapter):
             if book_kind is None:
                 continue  # an update on a probe connection
             kinds.add(kind)
-            price_exp, qty_exp = self.require_exponents()
+            self.require_exponents()
             header = {
                 "recv_ts": record.recv_ts,
                 "seq": record.seq,
@@ -319,8 +313,8 @@ class CoinbaseAdapter(VenueAdapter):
                     **header,
                     "level_index": index,
                     "side": side,
-                    "price": to_mantissa(update["price_level"], price_exp),
-                    "qty": to_mantissa(update["new_quantity"], qty_exp),
+                    "price": self.price(update["price_level"]),
+                    "qty": self.qty(update["new_quantity"]),
                 }
                 rows.append(("book_events", row))
                 levels.append((side, row["price"], row["qty"]))
@@ -444,7 +438,7 @@ class CoinbaseAdapter(VenueAdapter):
                 self.note(StreamEventKind.TRADE_BACKFILL, connection=record.channel)
             for trade in as_list(event["trades"], "trades"):
                 self.require_symbol(as_object(trade, "trade")["product_id"])
-                price_exp, qty_exp = self.require_exponents()
+                self.require_exponents()
                 trade_id, maker_side = trade["trade_id"], trade["side"]
                 if not isinstance(trade_id, str) or not trade_id:
                     raise TypeError("trade_id is not a non-empty string")
@@ -455,8 +449,8 @@ class CoinbaseAdapter(VenueAdapter):
                     "recv_ts": record.recv_ts,
                     "seq": record.seq,
                     "trade_id": trade_id,
-                    "price": to_mantissa(trade["price"], price_exp),
-                    "qty": to_mantissa(trade["size"], qty_exp),
+                    "price": self.price(trade["price"]),
+                    "qty": self.qty(trade["size"]),
                     "side": _AGGRESSOR_FOR_MAKER[maker_side],
                 }
                 rows.append(("trades", row))

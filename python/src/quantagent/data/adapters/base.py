@@ -73,6 +73,18 @@ CLOCK_STEP_FLOOR_NS = 25_000_000
 # What must agree between two observations of one trade (ADR 0015).
 _TRADE_FIELDS = ("price", "qty", "side")
 
+# Each instrument's representation (ADR 0019): (price_exp, qty_exp), fixed for
+# the life of the instrument and independent of its tick and lot sizes, which
+# are validation rules. Chosen generous enough for any tick or lot size the
+# instrument may have: BTC-USD prices to 1e-8 USD (up to about 9.2e10) and
+# quantities to one satoshi. Metadata needing more decimals is refused, never
+# stored at another scale. An instrument not listed here has no
+# representation: its metadata is refused until one is chosen and added.
+FIXED_EXPONENTS: dict[tuple[str, str], tuple[int, int]] = {
+    ("kraken", "BTC-USD"): (8, 8),
+    ("coinbase", "BTC-USD"): (8, 8),
+}
+
 
 def _compact(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
@@ -224,18 +236,17 @@ def checked_depth(value: int) -> int:
     return value
 
 
-def increment(text: Any, what: str) -> tuple[int, int]:
-    """Decimal places and mantissa of a tick or lot size given as a decimal string.
+def decimals(text: Any, what: str) -> int:
+    """The decimal places a tick or lot size given as a decimal string needs.
 
-    "0.01" is two places with mantissa 1; "0.050" is two places with mantissa 5.
+    "0.01" needs two places; so does "0.050"; "1" needs none.
     """
     if not isinstance(text, str):
         raise TypeError(f"{what} must be a decimal string, got {type(text).__name__}")
     match = _PLAIN_DECIMAL.fullmatch(text)
     if match is None:
         raise ValueError(f"{what} is not a plain decimal: {text!r}")
-    exponent = len((match.group(1) or "").rstrip("0"))
-    return exponent, positive(to_mantissa(text, exponent), what)
+    return len((match.group(1) or "").rstrip("0"))
 
 
 def positive(value: int, what: str) -> int:
@@ -276,6 +287,8 @@ class VenueAdapter:
         self.symbol: str | None = None  # the venue's name for it
         self.start_depth: int | None = None
         self.exponents: tuple[int, int] | None = None  # (price_exp, qty_exp) in force
+        # (price_precision, qty_precision): the venue's own decimals, in force.
+        self.precision: tuple[int, int] | None = None
         self.anomalies: list[SequenceAnomaly] = []
         self.events: list[Row] = []  # stream events noticed while handling a record
         self._clock_offset: int | None = None  # recv_ts - recv_mono_ns of the previous record
@@ -350,7 +363,7 @@ class VenueAdapter:
                 raise TypeError("start record has a malformed symbol or depth")
             self.instrument, self.symbol = message["instrument"], symbol
             self.start_depth = checked_depth(depth)
-            self.exponents = None
+            self.exponents = self.precision = None
             self.on_session_start()
             self._clock_offset = None  # a new log: its counter reading starts afresh
             about = {
@@ -420,6 +433,77 @@ class VenueAdapter:
         if self.exponents is None:
             raise Rejected("no_instrument_metadata", "no instrument metadata before this message")
         return self.exponents
+
+    def metadata(
+        self,
+        record: RawRecord,
+        *,
+        price_precision: int,
+        qty_precision: int,
+        tick_size: str,
+        lot_size: str,
+    ) -> Row:
+        """An ``instruments`` row at the instrument's fixed exponents (ADR 0019).
+
+        ``price_precision`` and ``qty_precision`` are the decimals the venue
+        uses, and ``tick_size`` and ``lot_size`` its increments as decimal
+        text. Metadata needing more decimals than the fixed exponents is
+        refused: the representation never changes. The caller makes the
+        version current (``use``) once the whole message is known to be good.
+        """
+        venue, instrument = self.venue, self.instrument
+        fixed = FIXED_EXPONENTS.get((venue, instrument))
+        if fixed is None:
+            raise Rejected(
+                "no_fixed_exponent",
+                f"{venue}/{instrument} has no fixed price and quantity exponent in "
+                "adapters.FIXED_EXPONENTS; choose one generous enough for any tick and lot "
+                "size it may have, and add it (ADR 0019)",
+            )
+        price_exp, qty_exp = fixed
+        for what, precision, exp in (("price", price_precision, price_exp),
+                                     ("quantity", qty_precision, qty_exp)):  # fmt: skip
+            if type(precision) is not int or precision < 0:
+                raise ValueError(f"{what} precision {precision!r} is not a decimal count")
+            if precision > exp:
+                raise Rejected(
+                    "precision_exceeds_exponent",
+                    f"{what} needs {precision} decimals, more than the fixed exponent {exp} of "
+                    f"{venue}/{instrument} holds; the representation is never changed, so this "
+                    "metadata is refused (ADR 0019)",
+                )
+        return {
+            **receipt_time(record),
+            "recv_ts": record.recv_ts,
+            "seq": record.seq,
+            "price_exp": price_exp,
+            "qty_exp": qty_exp,
+            "price_precision": price_precision,
+            "qty_precision": qty_precision,
+            "tick_size": positive(to_mantissa(tick_size, price_exp), "tick size"),
+            "lot_size": positive(to_mantissa(lot_size, qty_exp), "lot size"),
+        }
+
+    def use(self, row: Row) -> None:
+        """Make the metadata in ``row`` the version in force for what follows."""
+        self.exponents = (row["price_exp"], row["qty_exp"])
+        self.precision = (row["price_precision"], row["qty_precision"])
+
+    def price(self, text: Any) -> int:
+        """A price as the venue sent it, as a mantissa at the fixed exponent.
+
+        It may have no more decimals than the venue's precision in force: a
+        venue does not send a price finer than it quotes, so one that does is
+        malformed (a ValueError), as it was when the exponent was the
+        precision. Then it is scaled to the fixed exponent (ADR 0019).
+        """
+        (exp, _), (precision, _) = self.require_exponents(), self.precision
+        return to_mantissa(text, precision) * 10 ** (exp - precision)
+
+    def qty(self, text: Any) -> int:
+        """A quantity, as ``price`` does a price."""
+        (_, exp), (_, precision) = self.require_exponents(), self.precision
+        return to_mantissa(text, precision) * 10 ** (exp - precision)
 
 
 # --- driver ------------------------------------------------------------------------

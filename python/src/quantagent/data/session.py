@@ -26,7 +26,13 @@ record by record, for logs that have no load.
 
 **One row per trade.** Trades are stored once per observation. The session
 shows each trade once: its first observation in ``(log_id, seq)`` order among
-the observations inside both cutoffs.
+the observations inside both cutoffs. ``trade_observations`` shows them all,
+for the quality check that compares logs (ADR 0019); ``sql`` cannot.
+
+**Instrument metadata.** ``instrument_for`` gives the version a stored row was
+written with; ``instrument`` the version in effect at a time, a log's first
+version being in effect from the log's first row (ADR 0019).
+docs/data-core-spec.md section 9 is the full description.
 
 That is enforced in three independent ways (architecture section 3.2):
 
@@ -59,6 +65,7 @@ reads. A store written by another version of the code is refused with a
 import inspect
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -93,6 +100,7 @@ from quantagent.data.store import (
 
 __all__ = [
     "InstrumentMeta",
+    "LoadRead",
     "PITSession",
     "QueryError",
     "QueryRejected",
@@ -108,6 +116,21 @@ _DUCKDB_TYPES = {pa.int8(): "TINYINT", pa.int32(): "INTEGER", pa.int64(): "BIGIN
                  pa.uint64(): "UBIGINT", pa.string(): "VARCHAR"}  # fmt: skip
 _PARTITION_DIRECTORY = re.compile(r"(venue|instrument|date)=[^=]+")
 _DATE_DIRECTORY = re.compile(r"date=([0-9]{4}-[0-9]{2}-[0-9]{2})")
+_DUPLICATE_COLUMN = re.compile(r'has duplicate column name "([^"]*)"')
+# Every stored observation of a trade, before the cut to one per trade_id
+# (ADR 0019). Not a dataset name, so sqlguard refuses it in ``sql``.
+_TRADE_OBSERVATIONS = "trade_observations"
+# The columns of a trade's first observation that trade_observations adds, in
+# the stored schema's order.
+_FIRST_OBSERVATION = tuple(
+    f.name for f in TRADES.stored_schema
+    if f.name in {"recv_ts", "log_id", "seq", "price", "qty", "side"}
+)  # fmt: skip
+_TRADE_OBSERVATION_SCHEMA = pa.schema(
+    [*TRADES.stored_schema.remove_metadata(),
+     *(pa.field(f"first_{name}", TRADES.stored_schema.field(name).type, nullable=False)
+       for name in _FIRST_OBSERVATION)]
+)  # fmt: skip
 
 _AS_OF_RETIRED = (
     "as_of was retired (ADR 0017): it was a knowledge cutoff, and a session now has two "
@@ -173,6 +196,23 @@ class _CommittedBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadRead:
+    """The load a session reads one log from (ADR 0018).
+
+    ``complete`` is false when the log has no complete load within the
+    session's version, so it is read from its latest incomplete load: one
+    still being written, or one that failed or died before its last batch.
+    The log may then go on beyond what the session reads. ``batches`` is how
+    many of the load's batches are committed within the version.
+    """
+
+    log_id: str
+    load_id: int
+    complete: bool
+    batches: int
+
+
+@dataclass(frozen=True, slots=True)
 class _Selection:
     """What a session at one version reads."""
 
@@ -181,6 +221,7 @@ class _Selection:
     # of these logs is read from its load.
     outside_loads: tuple[int, ...]  # knowledge times of the batches outside a load
     loaded_logs: tuple[str, ...]
+    loads: tuple[LoadRead, ...] = ()  # one per loaded log, in log order
 
 
 def _load_of(where: str, knowledge_ts: int, content: dict) -> _LoadOf | None:
@@ -238,10 +279,15 @@ def _select(batches: list[_CommittedBatch], version: int, horizon_day: int) -> _
     chosen = {log_id: complete.get(log_id, latest) for log_id, latest in started.items()}
     read = set(chosen.values())
     kept = [b for b in known if b.load is None or b.load.load_id in read]
+    batches = Counter(b.load.load_id for b in kept if b.load is not None)
     return _Selection(
         files=tuple(f for b in kept for f in b.files if f.day <= horizon_day),
         outside_loads=tuple(sorted(b.knowledge_ts for b in kept if b.load is None)),
         loaded_logs=tuple(sorted(chosen)),
+        loads=tuple(
+            LoadRead(log_id, load_id, complete.get(log_id) == load_id, batches[load_id])
+            for log_id, load_id in sorted(chosen.items())
+        ),
     )
 
 
@@ -349,17 +395,37 @@ def _check_versions(root: Path, files: list[_DataFile]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class InstrumentMeta:
-    """One version of an instrument's metadata, as known to a session."""
+    """One version of an instrument's metadata, as known to a session.
+
+    ``price_exp`` and ``qty_exp`` are the instrument's fixed representation
+    (ADR 0019); ``price_precision`` and ``qty_precision`` the decimals the venue
+    used when this version was observed. ``log_id`` and ``seq`` name the raw
+    record it was observed in.
+    """
 
     venue: str
     instrument: str
-    event_ts: int  # when this version takes effect
+    event_ts: int  # the version's own time: the receipt time, for both venues
     recv_ts: int
     knowledge_ts: int
+    log_id: str
+    seq: int
     price_exp: int
     qty_exp: int
+    price_precision: int
+    qty_precision: int
     tick_size: int  # mantissa at price_exp
     lot_size: int  # mantissa at qty_exp
+
+
+def _meta(venue: str, instrument: str, row: dict[str, Any]) -> InstrumentMeta:
+    return InstrumentMeta(
+        venue=venue,
+        instrument=instrument,
+        **{name: row[name] for name in ("event_ts", "recv_ts", "knowledge_ts", "log_id", "seq",
+                                        "price_exp", "qty_exp", "price_precision",
+                                        "qty_precision", "tick_size", "lot_size")},
+    )  # fmt: skip
 
 
 def _check_time(name: str, value: Any) -> None:
@@ -374,14 +440,23 @@ def _quote(text: str) -> str:
 
 
 def _view_sql(
-    dataset: Dataset, files: list[str], version: int, available_at: int, selection: _Selection
+    dataset: Dataset,
+    files: list[str],
+    version: int,
+    available_at: int,
+    selection: _Selection,
+    *,
+    every_observation: bool = False,
 ) -> str:
+    """The view of ``dataset`` inside both cutoffs. With ``every_observation``
+    it is not cut to ``one_row_per`` (the trade observations view)."""
     stored = dataset.stored_schema
+    view = _TRADE_OBSERVATIONS if every_observation else dataset.name
     columns = ", ".join(f'"{name}"' for name in (*_PARTITION_COLUMNS, *stored.names))
     if not files:
         typed = [f'CAST(NULL AS {t}) AS "{n}"' for n, t in _PARTITION_COLUMNS.items()]
         typed += [f'CAST(NULL AS {_DUCKDB_TYPES[f.type]}) AS "{f.name}"' for f in stored]
-        return f'CREATE OR REPLACE VIEW "{dataset.name}" AS SELECT {", ".join(typed)} WHERE false'
+        return f'CREATE OR REPLACE VIEW "{view}" AS SELECT {", ".join(typed)} WHERE false'
 
     identity = ", ".join(f'"{name}"' for name in ("venue", "instrument", *dataset.key))
     # Latest knowledge first. The remaining columns only make the choice
@@ -408,7 +483,7 @@ def _view_sql(
             WHERE {where}
         ) WHERE _version_rank = 1
     """
-    if dataset.one_row_per:
+    if dataset.one_row_per and not every_observation:
         # One row per trade: the first observation in replay order among those
         # inside both cutoffs (ADR 0018). (log_id, seq) is unique within one
         # partition, because both are in the key.
@@ -421,13 +496,14 @@ def _view_sql(
                 FROM ({versions})
             ) WHERE _first = 1
         """
-    return f'CREATE OR REPLACE VIEW "{dataset.name}" AS {versions}'
+    return f'CREATE OR REPLACE VIEW "{view}" AS {versions}'
 
 
 def _create_views(
     con: duckdb.DuckDBPyConnection, selection: _Selection, version: int, available_at: int
 ) -> None:
-    """(Re)define the four views for ``available_at``, all of them or none."""
+    """(Re)define the views for ``available_at``, all of them or none: one per
+    dataset, and the trade observations view (not reachable from ``sql``)."""
     day = available_at // _NS_PER_DAY
     con.execute("BEGIN")
     try:
@@ -435,6 +511,9 @@ def _create_views(
             # A file of a later receipt day cannot hold a row received by now.
             paths = [f.path for f in selection.files if f.dataset == dataset.name and f.day <= day]
             con.execute(_view_sql(dataset, paths, version, available_at, selection))
+            if dataset.one_row_per:
+                con.execute(_view_sql(dataset, paths, version, available_at, selection,
+                                      every_observation=True))  # fmt: skip
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -497,6 +576,7 @@ def _open(
 
     object.__setattr__(session, "_available_at", available_at)
     object.__setattr__(session, "_version", version)
+    object.__setattr__(session, "_loads", selection.loads)
     object.__setattr__(session, "_con", con)
     object.__setattr__(session, "_redactions", (root_path.as_posix(), str(root_path)))
     return selection
@@ -511,7 +591,7 @@ class PITSession:
     moves through time uses a ``ReplayCursor``.
     """
 
-    __slots__ = ("_available_at", "_version", "_con", "_redactions")
+    __slots__ = ("_available_at", "_version", "_loads", "_con", "_redactions")
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "PITSession":
         if "as_of" in kwargs:
@@ -532,6 +612,14 @@ class PITSession:
     def version(self) -> int:
         """The knowledge cutoff in force: the committed batch this session reads up to."""
         return self._version
+
+    def loads(self) -> tuple[LoadRead, ...]:
+        """The load each loaded log is read from, at this session's version, in
+        ``log_id`` order (ADR 0018). A ``LoadRead`` with ``complete`` false is a
+        log read from an incomplete load, which the ``loads`` quality check
+        reports (ADR 0019). It depends on the version alone, not on
+        ``available_at``."""
+        return self._loads
 
     def trades(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
         """Trades received in ``start <= recv_ts < end``, latest known version of each.
@@ -569,27 +657,96 @@ class PITSession:
     ) -> InstrumentMeta | None:
         """The metadata version in effect at time ``at`` (default: ``available_at``).
 
-        Only versions the session can see are considered, whatever ``at`` is.
-        Returns None if no such version was in effect at that time.
+        A version takes effect at its ``event_ts``, except a log's first
+        version, which is in effect from the log's first row: the earliest
+        ``event_ts`` of any row of that log the session shows (ADR 0019). The
+        recorder fetches metadata before it subscribes to market data, so
+        that version describes every row of its session, including history
+        the venue resent on subscribe with venue times before the session
+        began. Of two versions in effect, the one that took effect later wins,
+        then the later in ``(log_id, seq)`` order.
+
+        Only versions and rows the session can see are considered, whatever
+        ``at`` is. Returns None if no version was in effect at that time. To
+        interpret a stored row, ``instrument_for`` is exact; this is for a
+        point in time.
         """
         effective = self._available_at if at is None else at
         _check_time("at", effective)
         versions = self.instruments(venue, instrument).to_pylist()
-        in_effect = [row for row in versions if row["event_ts"] <= effective]
+        if not versions:
+            return None
+        first_rows = self._first_row_times(venue, instrument)
+        first_of_log: dict[str, int] = {}
+        for row in versions:
+            first_of_log[row["log_id"]] = min(first_of_log.get(row["log_id"], row["seq"]),
+                                              row["seq"])  # fmt: skip
+
+        def takes_effect(row: dict[str, Any]) -> int:
+            if row["seq"] != first_of_log[row["log_id"]]:
+                return row["event_ts"]
+            return min(row["event_ts"], first_rows.get(row["log_id"], row["event_ts"]))
+
+        in_effect = [(takes_effect(r), r["log_id"], r["seq"], r) for r in versions]
+        in_effect = [entry for entry in in_effect if entry[0] <= effective]
         if not in_effect:
             return None
-        row = in_effect[-1]
-        return InstrumentMeta(
-            venue=venue,
-            instrument=instrument,
-            event_ts=row["event_ts"],
-            recv_ts=row["recv_ts"],
-            knowledge_ts=row["knowledge_ts"],
-            price_exp=row["price_exp"],
-            qty_exp=row["qty_exp"],
-            tick_size=row["tick_size"],
-            lot_size=row["lot_size"],
+        return _meta(venue, instrument, max(in_effect, key=lambda entry: entry[:3])[3])
+
+    def instrument_for(
+        self, venue: str, instrument: str, *, log_id: str, seq: int
+    ) -> InstrumentMeta | None:
+        """The metadata version a stored row was written with: the latest
+        version of the row's own log at or before its record (ADR 0019).
+
+        Every market row the adapters store follows a metadata version of its
+        log (they refuse market data before one), so for such a row this
+        never returns None. Only versions the session can see are considered.
+        """
+        if not isinstance(log_id, str) or _LOG_ID.fullmatch(log_id) is None:
+            raise ValueError(f"log_id must be a log id, got {log_id!r}")
+        if type(seq) is not int:
+            raise TypeError(f"seq must be an int, got {type(seq).__name__}")
+        if seq < 0:
+            raise ValueError(f"seq must not be negative, got {seq}")
+        of_log = [
+            row
+            for row in self.instruments(venue, instrument).to_pylist()
+            if row["log_id"] == log_id and row["seq"] <= seq
+        ]
+        if not of_log:
+            return None
+        return _meta(venue, instrument, max(of_log, key=lambda row: row["seq"]))
+
+    def trade_observations(self, venue: str, instrument: str, start: int, end: int) -> pa.Table:
+        """Every stored observation of a trade received in ``start <= recv_ts < end``,
+        each with its trade's first observation (ADR 0019).
+
+        ``trades`` shows one row per trade, its first observation in
+        ``(log_id, seq)`` order (ADR 0018). This shows every observation the
+        session can see, latest known version of each, in ``(log_id, seq)``
+        order, with the first observation's ``log_id``, ``seq``, ``recv_ts``,
+        ``price``, ``qty`` and ``side`` as ``first_...`` columns, wherever and
+        whenever it was received. It is for finding trades that two logs saw
+        differently; research counting trades reads ``trades``. There is no
+        SQL view of it.
+        """
+        _check_name("venue", venue)
+        _check_name("instrument", instrument)
+        _check_time("start", start)
+        _check_time("end", end)
+        names = TRADES.stored_schema.names
+        columns = ", ".join(f'o."{name}"' for name in names)
+        firsts = ", ".join(f'f."{name}" AS "first_{name}"' for name in _FIRST_OBSERVATION)
+        table = self._run(
+            f'SELECT {columns}, {firsts} FROM "{_TRADE_OBSERVATIONS}" o JOIN "trades" f '
+            'ON f."venue" = o."venue" AND f."instrument" = o."instrument" '
+            'AND f."trade_id" = o."trade_id" '
+            'WHERE o."venue" = ? AND o."instrument" = ? AND o."recv_ts" >= ? AND o."recv_ts" < ? '
+            'ORDER BY o."log_id", o."seq", o."trade_id"',
+            [venue, instrument, start, end],
         )
+        return table.cast(_TRADE_OBSERVATION_SCHEMA)
 
     def sql(self, query: str) -> pa.Table:
         """Run one SELECT over the views ``trades``, ``book_events``, ``instruments``
@@ -614,7 +771,18 @@ class PITSession:
             tree = None  # refused below; never executed
         validate(tree, _VIEW_NAMES)
         # Execute the tree that was validated, not the text it came from.
-        return self._run("SELECT * FROM json_execute_serialized_sql(?)", [serialized])
+        try:
+            return self._run("SELECT * FROM json_execute_serialized_sql(?)", [serialized])
+        except QueryError as error:
+            # The result becomes a table, and a table cannot have two columns
+            # of one name; the engine's message names the internal call.
+            duplicate = _DUPLICATE_COLUMN.search(str(error))
+            if duplicate is None:
+                raise
+        raise QueryError(
+            f'the result would have two columns named "{duplicate.group(1)}"; give each '
+            'result column its own name, for example "b.price AS other_price"'
+        )
 
     def close(self) -> None:
         if self._con is not None:
@@ -627,6 +795,19 @@ class PITSession:
         if self._con is None:
             raise RuntimeError("session is closed")
         return self._con
+
+    def _first_row_times(self, venue: str, instrument: str) -> dict[str, int]:
+        """Per log, the earliest ``event_ts`` of any row the session shows."""
+        each = " UNION ALL ".join(
+            f'SELECT "log_id", "event_ts" FROM "{name}" WHERE "venue" = ? AND "instrument" = ?'
+            for name in DATASETS
+        )
+        table = self._run(
+            f'SELECT "log_id", min("event_ts") AS "first" FROM ({each}) GROUP BY "log_id"',
+            [venue, instrument] * len(DATASETS),
+        )
+        return dict(zip(table.column("log_id").to_pylist(), table.column("first").to_pylist(),
+                        strict=True))  # fmt: skip
 
     def _range(
         self, dataset: Dataset, venue: str, instrument: str, start: int, end: int

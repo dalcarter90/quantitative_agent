@@ -16,8 +16,10 @@ before this was written:
 - Instrument metadata (the ``instrument`` channel) has no venue timestamp, so
   those rows take the receipt time (ADR 0008).
 - Prices and quantities arrive as JSON numbers, always printed with the pair's
-  full precision. They are read as text so no digit is lost; the checksum is
-  defined over those digits.
+  precision (``price_precision``, ``qty_precision``). They are read as text so
+  no digit is lost; the checksum is defined over those digits. They are stored
+  at the instrument's fixed exponents (ADR 0019), so the checksum is computed
+  from the stored mantissas scaled back to the precision in force.
 
 Because the checksum is Kraken's only protection for the book, this adapter
 verifies it while normalizing, the way it checks Coinbase's sequence numbers:
@@ -46,12 +48,9 @@ from quantagent.data.adapters.base import (
     data,
     ignored,
     load_json,
-    positive,
-    receipt_time,
     text_int,
     venue_time,
 )
-from quantagent.data.fixedpoint import to_mantissa
 from quantagent.data.rawlog import RawRecord
 from quantagent.data.schema import BookEventKind, Side, StreamEventKind
 
@@ -82,17 +81,20 @@ def _apply(book: Book, levels: list[tuple[Side, int, int]], depth: int | None) -
                 book[side] = {price: book[side][price] for price in kept}
 
 
-def book_checksum(book: Book) -> int:
+def book_checksum(book: Book, divisors: tuple[int, int] = (1, 1)) -> int:
     """Kraken's CRC32 over the ten best asks (ascending) then bids (descending).
 
     Each level contributes its price digits then its quantity digits, with the
     decimal point and leading zeros removed. Kraken prints both at the pair's
-    full precision, so those digits are exactly the stored mantissas.
+    precision (``price_precision``, ``qty_precision``), so those digits are the
+    stored mantissas divided by ``10 ** (exponent - precision)``: ``divisors``.
     https://docs.kraken.com/api/docs/guides/spot-ws-book-v2
     """
+    price_divisor, qty_divisor = divisors
     asks = sorted(book[Side.SELL].items())[:_CHECKSUM_LEVELS]
     bids = sorted(book[Side.BUY].items(), reverse=True)[:_CHECKSUM_LEVELS]
-    return zlib.crc32("".join(f"{price}{qty}" for price, qty in (*asks, *bids)).encode())
+    digits = "".join(f"{p // price_divisor}{q // qty_divisor}" for p, q in (*asks, *bids))
+    return zlib.crc32(digits.encode())
 
 
 class KrakenAdapter(VenueAdapter):
@@ -157,22 +159,24 @@ class KrakenAdapter(VenueAdapter):
         for pair in as_list(as_object(message["data"], "data")["pairs"], "pairs"):
             if as_object(pair, "pair").get("symbol") != self.symbol:
                 continue  # the channel lists every pair; only the recorded one is kept
-            price_exp = text_int(pair["price_precision"], "price_precision")
-            qty_exp = text_int(pair["qty_precision"], "qty_precision")
-            row = {
-                **receipt_time(record),
-                "recv_ts": record.recv_ts,
-                "seq": record.seq,
-                "price_exp": price_exp,
-                "qty_exp": qty_exp,
-                "tick_size": positive(
-                    to_mantissa(pair["price_increment"], price_exp), "price_increment"
-                ),
-                "lot_size": positive(to_mantissa(pair["qty_increment"], qty_exp), "qty_increment"),
-            }
+            # Kraken's precisions are how it prints prices and quantities, and
+            # so what its checksum is over. The exponents are fixed (ADR 0019).
+            row = self.metadata(
+                record,
+                price_precision=text_int(pair["price_precision"], "price_precision"),
+                qty_precision=text_int(pair["qty_precision"], "qty_precision"),
+                tick_size=pair["price_increment"],
+                lot_size=pair["qty_increment"],
+            )
             rows.append(("instruments", row))
-            self.exponents = (price_exp, qty_exp)
+        for _, row in rows:  # the whole message parsed
+            self.use(row)
         return data(f"instrument.{kind}", rows, empty=f"instrument.{kind}.other_pairs")
+
+    def _divisors(self) -> tuple[int, int]:
+        """What turns stored mantissas into the digits Kraken prints now."""
+        (price_exp, qty_exp), (price_precision, qty_precision) = self.exponents, self.precision
+        return 10 ** (price_exp - price_precision), 10 ** (qty_exp - qty_precision)
 
     def _book(self, record: RawRecord, message: dict, kind: str) -> Handled:
         entries = as_list(message["data"], "data")
@@ -187,7 +191,7 @@ class KrakenAdapter(VenueAdapter):
         index = 0
         for entry in entries:
             self.require_symbol(as_object(entry, "book entry")["symbol"])
-            price_exp, qty_exp = self.require_exponents()
+            self.require_exponents()
             checksum = text_int(entry["checksum"], "checksum")
             if not 0 <= checksum <= _MAX_CHECKSUM:
                 raise ValueError(f"checksum {checksum} is not an unsigned 32-bit value")
@@ -208,8 +212,8 @@ class KrakenAdapter(VenueAdapter):
                         **header,
                         "level_index": index,
                         "side": side,
-                        "price": to_mantissa(level["price"], price_exp),
-                        "qty": to_mantissa(level["qty"], qty_exp),
+                        "price": self.price(level["price"]),
+                        "qty": self.qty(level["qty"]),
                     }
                     rows.append(("book_events", row))
                     parsed[-1][1].append((side, row["price"], row["qty"]))
@@ -237,7 +241,7 @@ class KrakenAdapter(VenueAdapter):
                 self._books[connection] = book
                 self._suspect.discard(connection)
         _apply(book, levels, depth)
-        computed = book_checksum(book)
+        computed = book_checksum(book, self._divisors())
         if computed != checksum:
             if book_kind != BookEventKind.CHECK_SNAPSHOT:
                 self._suspect.add(connection)
@@ -256,14 +260,14 @@ class KrakenAdapter(VenueAdapter):
             self.note(StreamEventKind.TRADE_BACKFILL, connection=record.channel)
         for trade in entries:
             self.require_symbol(as_object(trade, "trade")["symbol"])
-            price_exp, qty_exp = self.require_exponents()
+            self.require_exponents()
             row = {
                 **venue_time(trade["timestamp"]),
                 "recv_ts": record.recv_ts,
                 "seq": record.seq,
                 "trade_id": str(text_int(trade["trade_id"], "trade_id")),
-                "price": to_mantissa(trade["price"], price_exp),
-                "qty": to_mantissa(trade["qty"], qty_exp),
+                "price": self.price(trade["price"]),
+                "qty": self.qty(trade["qty"]),
                 "side": _side(trade["side"]),
             }
             rows.append(("trades", row))

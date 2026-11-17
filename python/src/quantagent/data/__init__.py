@@ -1,9 +1,11 @@
-"""Data core: bitemporal, append-only market data storage.
+"""Data core: capture, an append-only bitemporal store, and its one read path.
 
-See docs/architecture.md sections 3.2, 6 and 7, ADR 0005 (representation) and
-ADR 0006 (storage format).
+``recorder`` and ``rawlog`` capture raw logs; ``adapters`` normalize them and
+load them into ``store.AppendOnlyStore``, the only writer; research reads only
+through ``session.PITSession`` (and the backtest harness through
+``session.ReplayCursor``); ``quality`` checks the data and ``book`` is the
+reference order book.
 
-This package currently holds the write side only. The point-in-time read
-path, PITSession, is the only supported way to read the store and arrives in
-roadmap Phase 1b.
+docs/data-core-spec.md is the consolidated description; docs/data-core.md is
+the guide to its commands.
 """

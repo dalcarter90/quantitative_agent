@@ -1,6 +1,6 @@
 # 0010: `stream_events`, a dataset of integrity events
 
-Status: Accepted (owner decision; additions confirmed by the owner 2026-11-12), amended by 0011, 0013, 0014, 0015, 0016 and 0018
+Status: Accepted (owner decision; additions confirmed by the owner 2026-11-12), amended by 0011, 0013, 0014, 0015, 0016, 0018 and 0019; superseded by `docs/data-core-spec.md` (ADR 0019), which restates its decisions as they now stand
 Date: 2026-11-11
 Amends: 0006, 0009
 

@@ -88,10 +88,15 @@ with PITSession(store_root, available_at=t, version=None) as s:
     s.trades(venue, instrument, start, end)  # only rows with recv_ts <= t
     s.book_events(venue, instrument, start, end)
     s.stream_events(venue, instrument, start, end)  # gaps, reconnects, checksum mismatches
+    s.trade_observations(venue, instrument, start, end)  # every observation of each trade
     s.instruments(venue, instrument)         # every metadata version received by t
     s.instrument(venue, instrument, at=u)    # the version in effect at u (default t)
+    s.instrument_for(venue, instrument, log_id=l, seq=n)  # the version a stored row was written with
     s.sql("SELECT ... FROM trades ...")      # one SELECT over the same views
 ```
+
+`docs/data-core-spec.md` is the full description of the data core; this
+section is how the rest of the system uses it.
 
 A session has two cutoffs, because it answers two questions (ADR 0017):
 
@@ -284,14 +289,17 @@ Rules:
 
 ## 6. Price, quantity and timestamp representation
 
-Details and alternatives are in ADR 0005.
+Details are in `docs/data-core-spec.md` section 2; alternatives in ADRs 0005
+and 0019.
 
 ### 6.1 Prices and quantities
 
 - A price or quantity is an `int64` mantissa with a per-instrument decimal
-  exponent: `value = mantissa × 10^-exp`. `price_exp` and `qty_exp` live in
-  instrument metadata and are set to the finest precision the venue supports
-  for that instrument.
+  exponent: `value = mantissa × 10^-exp`. `price_exp` and `qty_exp` are fixed
+  for each instrument (`adapters.FIXED_EXPONENTS`; 8 and 8 for BTC-USD),
+  generous enough for any tick or lot size it may have, and recorded in its
+  instrument metadata (ADR 0019). The venue's own precision, which can
+  change, is recorded beside them.
 - `Price` and `Qty` are distinct strong types in C++. They cannot be mixed or
   implicitly converted to floating point.
 - Tick size and lot size are validation rules in instrument metadata (a valid
@@ -303,8 +311,8 @@ Details and alternatives are in ADR 0005.
 - No `double` appears in the book, order, risk or PnL path. Research code may
   convert to `float64` for features and models; that conversion is explicit
   and one-way. Order prices are produced from integers.
-- Instrument metadata is itself bitemporal, so the exponents and tick sizes in
-  force at any past time are recoverable.
+- Instrument metadata is itself bitemporal, so the tick sizes and precisions
+  in force at any past time are recoverable; the exponents never change.
 
 ### 6.2 Timestamps
 

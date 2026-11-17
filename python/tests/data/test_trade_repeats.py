@@ -195,7 +195,7 @@ def test_an_identical_repeat_in_a_second_log_fed_to_the_same_normalizer_is_dropp
 
 @pytest.mark.parametrize(
     ("change", "field", "now"),
-    [({"price": "73469.8"}, "price", 734698), ({"qty": "0.00051043"}, "qty", 51043),
+    [({"price": "73469.8"}, "price", 7_346_980_000_000), ({"qty": "0.00051043"}, "qty", 51043),
      ({"side": "buy"}, "side", int(Side.BUY))],
 )  # fmt: skip
 def test_a_trade_seen_again_with_a_different_value_is_a_conflict(change, field, now):
@@ -205,8 +205,8 @@ def test_a_trade_seen_again_with_a_different_value_is_a_conflict(change, field, 
     assert (event["seq"], event["connection"]) == (records[-1].seq, "ws")
     detail = json.loads(event["detail"])
     assert detail["trade_id"] == "115202912" and detail["differs"] == [field]
-    first = {"log_id": event["log_id"], "seq": records[-2].seq, "price": 734697, "qty": 51042,
-             "side": int(Side.SELL)}  # fmt: skip
+    first = {"log_id": event["log_id"], "seq": records[-2].seq, "price": 7_346_970_000_000,
+             "qty": 51042, "side": int(Side.SELL)}  # fmt: skip
     assert detail["first"] == first
     assert detail["now"][field] == now
     assert normalized.report.trade_repeats == 1
@@ -225,7 +225,7 @@ def test_each_repeat_is_compared_with_the_first_observation():
     records = kraken(kraken_trade(), kraken_trade(price="1.0"), kraken_trade())
     normalized = normalize(records)
     (event,) = conflicts(normalized, "kraken")
-    assert json.loads(event["detail"])["now"]["price"] == 10
+    assert json.loads(event["detail"])["now"]["price"] == 100_000_000  # 1.0 at exponent 8
     (repeat,) = repeats(normalized, "kraken")  # the third matches the first
     assert repeat["seq"] == records[-1].seq
     assert [r["seq"] for r in trade_rows(normalized, "kraken")] == [r.seq for r in records[-3:-1]]
@@ -378,7 +378,7 @@ def test_a_conflicting_repeat_in_one_log_shows_the_first_observation(tmp_path):
     with PITSession(root, available_at=INT64_MAX) as session:
         stored = session.sql("SELECT count(*) AS n FROM trades").column("n").to_pylist()
     assert stored == [1]
-    assert [(seq, price) for _, seq, _, price in shown(root)] == [(3, 1000)]
+    assert [(seq, price) for _, seq, _, price in shown(root)] == [(3, 10_000_000_000)]
 
 
 def _trade(log_id, seq, recv_ts, price):
