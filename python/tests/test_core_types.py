@@ -88,8 +88,9 @@ def test_instrument_id_and_metadata():
 
 @pytest.mark.parametrize(
     "fields",
+    # Exponent 18 is the largest there is (D7, below), so precision 19 is above both.
     [{"price_precision": 9}, {"qty_precision": 9}, {"price_precision": -1}, {"qty_precision": -1},
-     {"price_exp": 19, "price_precision": 19}, {"qty_exp": 19, "qty_precision": 19}],
+     {"price_exp": 18, "price_precision": 19}, {"qty_exp": 18, "qty_precision": 19}],
 )  # fmt: skip
 def test_instrument_metadata_refuses_a_precision_the_store_would_refuse(fields):
     """ADR 0019: a precision is 0 to 18 and never above its exponent, as in the
@@ -97,6 +98,20 @@ def test_instrument_metadata_refuses_a_precision_the_store_would_refuse(fields):
     with pytest.raises(ValueError, match="precision"):
         meta(**fields)
     meta(price_precision=8, qty_precision=0)  # the bounds themselves are fine
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"price_exp": 19}, {"qty_exp": 19}, {"price_exp": -1, "price_precision": 0},
+     {"qty_exp": -1, "qty_precision": 0}, {"price_exp": 127}, {"qty_exp": -128}],
+)  # fmt: skip
+def test_instrument_metadata_refuses_an_exponent_the_store_would_refuse(fields):
+    """Review D7 (ADR 0020): an exponent is 0 to 18, as in the schema; any other
+    int8 used to be accepted."""
+    with pytest.raises(ValueError, match="_exp"):
+        meta(**fields)
+    for exp in (0, 18):  # the bounds themselves are fine
+        meta(price_exp=exp, qty_exp=exp, price_precision=0, qty_precision=0)
 
 
 def test_enums_use_the_schemas_numbers():
@@ -417,6 +432,25 @@ def test_from_bytes_refuses_unknown_enum_values():
     raw = bytearray(_core.MarketEvent().to_bytes())
     raw[85] = 1  # was reserved; now the source
     assert _core.MarketEvent.from_bytes(bytes(raw)).source == 256
+
+
+def test_from_bytes_refuses_the_unassigned_flag_bit():
+    """Review D7 (ADR 0020): seven flags are defined; the eighth bit was accepted."""
+    known = (_core.MarketEvent.LAST_IN_MESSAGE | _core.MarketEvent.HAS_MONO
+             | _core.MarketEvent.HAS_VENUE_SEQ | _core.MarketEvent.HAS_CHECKSUM
+             | _core.MarketEvent.HAS_DEPTH | _core.MarketEvent.HAS_TRADE_ID
+             | _core.MarketEvent.EVENT_TS_FROM_RECEIPT)  # fmt: skip
+    assert known == _core.MarketEvent.KNOWN_FLAGS == 0x7F
+    event = _core.MarketEvent()
+    event.flags = known
+    assert _core.MarketEvent.from_bytes(event.to_bytes()).flags == known
+    raw = bytearray(_core.MarketEvent().to_bytes())
+    raw[80] = 0x80
+    with pytest.raises(ValueError, match="flag"):
+        _core.MarketEvent.from_bytes(bytes(raw))
+    raw[80] = 0xFF
+    with pytest.raises(ValueError, match="flag"):
+        _core.MarketEvent.from_bytes(bytes(raw))
 
 
 # --- clocks ----------------------------------------------------------------------------------

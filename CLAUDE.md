@@ -233,7 +233,8 @@ cpp/
 python/
   pyproject.toml
   src/quantagent/ Python package (plus the compiled _core module);
-                  the data core arrives in Phase 1 as quantagent/data/
+                  the data core is quantagent/data/; marketevents.py turns
+                  stored data into the C++ core's MarketEvents (ADR 0021)
   tests/          pytest
 docs/             architecture.md, roadmap.md, adr/
 scripts/check.ps1 build + all tests

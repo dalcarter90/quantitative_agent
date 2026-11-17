@@ -83,6 +83,15 @@ gated on room) is recorded for Phase 5 to build. D4 to D7 and T3 have a
 recommendation and a phase each in ADR 0020, not yet decided. Of T3's six
 tests, two were already resolved by Phases 3e and 3g.
 
+**Update, 2026-11-17 (Phase 4a, ADR 0021).** D7 and T3 are done. `from_bytes`
+refuses the unassigned flag bit, `InstrumentMeta` an exponent outside 0 to 18,
+and the converter (`quantagent.marketevents`) a depth `MarketEvent` cannot
+hold and an exponent outside 0 to 18 (`InstrumentId` was fixed in Phase 3g).
+`test_schema.py`'s "every dataset" tests cover `stream_events`, the `TRADES`
+exemption is gone, the identical-reload test is named for what it checks, and
+CLAUDE.md states the `SystemClock` exception (Phase 3h). Open: D4 (Phase 7),
+D5 and D6 (Phase 7a), and the minor notes.
+
 ## Ranked findings
 
 | # | Severity | Finding | Area (task item) |
