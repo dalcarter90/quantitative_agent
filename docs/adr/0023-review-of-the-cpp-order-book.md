@@ -1,6 +1,6 @@
 # 0023: Review of the C++ order book: an update unread until it takes effect, one stream per book, a recorded benchmark
 
-Status: Accepted (owner decisions, 2026-11-17); the implementation choices await the owner's review, see "Review"
+Status: Accepted (owner decisions, 2026-11-17); the implementation choices confirmed by the owner (2026-11-17, see "Review"), with one change (see "Owner's review": while the book is bound, another source's stale and reset events are ignored too); the choices made for that change await the owner's review
 Date: 2026-11-17
 Amends: 0022 (an update cannot be read until it takes effect; the book is bound to one stream; a tick or lot size below 1 is refused; its Review is confirmed here, item 11 amended), 0021 (two metadata versions at one record are emitted in the reference book's order). Data core: the Kraken adapter refuses a record with two versions of the instrument (`docs/data-core-spec.md` section 7)
 
@@ -93,7 +93,9 @@ The owner decided on 2026-11-17:
 - **Only updates are judged by their source.** A `StreamStale`, a
   `StreamReset`, an `InstrumentUpdate` or a snapshot frame of another source
   is taken as before. Phase 7's new criterion is what keeps a second stream
-  out of a book.
+  out of a book. *(Changed by the owner's review, below: while the book is
+  bound, a `StreamStale` or `StreamReset` of another source is ignored and
+  counted too.)*
 - **On converted data nothing changes.** Each log begins with its session
   start on its own stream source, which unbinds the book; the log's snapshot
   binds it to that source, and all its updates are of it. A test replays two
@@ -208,7 +210,8 @@ beginning) to Phase 7; N3 (the book records no time for freshness) to Phase 9.
   option). The owner chose to ignore and count it.
 - **Judging control events, metadata and frames by source too.** Not decided;
   a stream's control events are what make a book stale or reset it, and
-  Phase 7's criterion keeps a second stream out instead.
+  Phase 7's criterion keeps a second stream out instead. *(Decided by the
+  owner's review, below, for stale and reset events: ignored while bound.)*
 - **Counting every ignored event.** A 500-level update would count 500.
 
 **Finding 3**
@@ -247,7 +250,8 @@ beginning) to Phase 7; N3 (the book records no time for freshness) to Phase 9.
 ## Consequences
 
 - `OrderBook` gains `bound_source()` and `other_source_updates()` (Python:
-  `bound_source`, `other_source_updates`). `has_book()` is false while an
+  `bound_source`, `other_source_updates`), and with the owner's review
+  `other_source_controls()`. `has_book()` is false while an
   update or a stream snapshot is being applied, and `checksum()` is 0 when the
   book cannot be read. `MarketEvent`'s layout is unchanged; `from_bytes`
   refuses more.
@@ -265,7 +269,8 @@ beginning) to Phase 7; N3 (the book records no time for freshness) to Phase 9.
 
 ## Review
 
-Choices made while building it, awaiting the owner:
+Choices made while building it. **Confirmed by the owner, 2026-11-17: all
+twelve, with item 5 changed** (see "Owner's review"):
 
 1. **`Recovered` is a result a consumer acts on**, with `Applied`: both say a
    message took effect.
@@ -294,3 +299,68 @@ Choices made while building it, awaiting the owner:
 12. **Existing tests:** none changed but the review's file (markers removed,
     its docstring updated, the marker helper deleted). The C++ test helper
     `update()` gained an optional source.
+
+## Owner's review (2026-11-17)
+
+**Decision.** The Review above is confirmed, with one change to item 5:
+**while the book is bound, a `StreamStale` or `StreamReset` of another source
+is ignored and counted, as an update of another source is.** Only a snapshot
+of another source rebinds the book. When the book is unbound, every event
+applies as before. An `InstrumentUpdate` still applies from any source.
+
+**Why.** In a reconnect that opens the new connection before closing the old
+(make-before-break), the new connection's snapshot rebinds the book; the old
+connection's disconnect then arrives, and taken as before it would empty the
+new stream's book with no snapshot to follow, leaving the book empty until
+the next resync.
+
+**How it is built.**
+
+- An event of another source than the bound one that is an update, a
+  `StreamStale` or a `StreamReset` is `Ignored`: it is not applied, does not
+  interrupt a message in progress, and neither makes the book stale nor
+  empties it. A stale or reset is counted as it comes in
+  `other_source_controls()` (Python: `other_source_controls`); updates stay
+  counted once each in `other_source_updates()`.
+- The binding is unchanged: from a stream snapshot's first level until a
+  reset of the bound stream or a failure empties the book, or a snapshot of
+  another source rebinds it. Unbound (at the start, after a reset or failure),
+  a stale or reset of any source applies as before.
+- **The test of the owner's sequence**
+  (`InAMakeBeforeBreakReconnectTheOldConnectionsDisconnectLeavesTheNewBook`,
+  and the same through the binding in `test_order_book.py`): the old
+  connection opens and its snapshot binds the book; the new connection's
+  connect is ignored and the old book stands; the new connection's snapshot
+  rebinds the book; the old connection's late update, a gap it reports and
+  its disconnect are all ignored; the book is the new stream's, readable and
+  fresh, and the new stream's next update applies. Other tests: a stale or
+  reset of another source inside a message interrupts nothing; while unbound
+  they apply; an `InstrumentUpdate` of another source applies.
+
+**A consequence for logs replayed one after another.** The converter replays
+logs in `(log_id, seq)` order, each beginning with a `SessionStart` reset on
+its own source. A recorded log ends with its stream's disconnect, which
+empties and unbinds the book, so the next log's session start applies and the
+C++ book agrees with the reference after every step, as before. But a log that
+ends *without* its disconnect (a recorder that crashed) leaves the book bound
+to it, and the next log's session start is then another source's reset,
+ignored: the C++ book shows the old log's book until the next log's snapshot
+rebinds it, where the reference book is empty from that session start. From
+the snapshot on, the two agree again. `test_a_log_with_no_closing_disconnect_keeps_its_book_until_the_next_logs_snapshot`
+pins it. The golden files, the integrity cases and the fixtures are each one
+log, so no comparison with the reference over them changes; Phase 7's
+one-stream-per-book criterion is where a replay across logs is decided.
+Because of it, `test_two_logs_replayed_one_after_the_other_bind_the_book_to_each_in_turn`
+(added with this ADR) now gives its first log the closing disconnect a
+recorded log has.
+
+**Choices made for it, awaiting the owner:**
+
+1. **A counter of its own** for ignored stale and reset events
+   (`other_source_controls`), beside `other_source_updates`, rather than one
+   counter for both.
+2. **A stale or reset of another source is ignored whatever its reason**,
+   even one the book would refuse from its own stream (`InvalidEvent`): it is
+   not this book's stream to judge.
+3. **It interrupts no message in progress**, as an update of another source
+   does not.

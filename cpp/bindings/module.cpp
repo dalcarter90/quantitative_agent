@@ -601,6 +601,9 @@ PYBIND11_MODULE(_core, m) {
           "The source the book is bound to (ADR 0023), or None.")
       .def_property_readonly("other_source_updates", &OrderBook::other_source_updates,
                              "How many updates of another source were ignored (ADR 0023).")
+      .def_property_readonly(
+          "other_source_controls", &OrderBook::other_source_controls,
+          "How many StreamStale and StreamReset events of another source were ignored (ADR 0023).")
       .def("stale_count", &OrderBook::stale_count, py::arg("reason"))
       .def(
           "top",

@@ -2073,6 +2073,9 @@ found six things; the owner decided each on 2026-11-17 (ADR 0023):
       Phase 7, N3 in Phase 9.
 - [x] The review's eight tests pass with their markers removed; ADR 0022's
       Review items confirmed, item 11 amended by the first fix.
+- [x] *(The owner's review of ADR 0023, below.)* While the book is bound, a
+      `StreamStale` or `StreamReset` of another source is ignored and counted
+      too.
 
 **What was built:**
 
@@ -2150,6 +2153,53 @@ found six things; the owner decided each on 2026-11-17 (ADR 0023):
   `StaleReason` of its number, a counter and a binding name; the build and
   `test_every_reason_a_stream_stale_may_carry_is_a_named_and_counted_stale_reason`
   say so.
+
+#### Phase 4b: the owner's review of ADR 0023 (done)
+
+The owner confirmed ADR 0023's Review on 2026-11-17 with one change: while
+the book is bound, a `StreamStale` or `StreamReset` of another source is
+ignored and counted, as an update is; only a snapshot of another source
+rebinds the book; an unbound book takes every event as before; an
+`InstrumentUpdate` applies from any source. So in a make-before-break
+reconnect, the old connection's disconnect cannot empty the new stream's book.
+
+- [x] The rule, `OrderBook::other_source_controls()` (Python:
+      `other_source_controls`), and a test of the owner's sequence (C++ and
+      through the binding): old connection, its snapshot, the new
+      connection's connect (ignored), its snapshot (rebinds), the old
+      connection's late update, gap and disconnect (all ignored), the new
+      stream's next update (applied). Also tested: another source's stale or
+      reset interrupts no message; an unbound book takes them; an
+      `InstrumentUpdate` of another source applies.
+- [x] Recorded in ADR 0023 ("Owner's review"), its Review items confirmed;
+      its three choices for the change await the owner.
+
+**A consequence:** a log that ends without its disconnect leaves the book
+bound, so the next log's session start is ignored and the C++ book shows the
+old log's book until the new log's snapshot, where the reference is empty
+from the session start. A new test pins it, and
+`test_two_logs_replayed_one_after_the_other_bind_the_book_to_each_in_turn`
+now gives its first log the closing disconnect recorded logs have. The
+fixtures, golden files and integrity cases are each one log; nothing compared
+over them changed.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 91 C++ tests and 1,860 Python tests (87
+  and 1,858 before: 4 new C++ tests, 2 new Python tests). The Python suite
+  took 12 min 43 s against 9 min 40 s in both runs before it, so the machine
+  was slower, and the slow-test reminder listed eight existing tests none of
+  this work touches (Coinbase fixture and store tests in
+  `test_check_snapshots.py`, `test_book_resume.py`, `test_quality.py` and
+  `test_review_2026_11.py`) at 5.2 to 7.0 s. Run alone right after, they took
+  4.0 to 5.3 s. As borderline slow tests they stay unmarked (ADR 0022,
+  decision 4); neither earlier run today listed them.
+- **Breakage pass on the change:** 8 deliberate breakages (another source's
+  stale applied, its reset applied, its `InstrumentUpdate` ignored, its
+  snapshot's begin ignored, judging while unbound, the counter not counting,
+  counting into `other_source_updates`, an ignored event interrupting a
+  message): all 8 caught by the C++ tests. The mutated file was compared with
+  a copy taken before the pass: identical.
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -2242,8 +2292,9 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       overlap in time (a recorder restarted before the old one stopped, two
       recorders at once) are never merged into one book: each stream gets its
       own book, or the overlap is refused. A test with two overlapping logs
-      shows it. (The book ignores and counts another stream's updates, but
-      takes its control events, metadata and snapshots.)
+      shows it. (While bound, the book ignores and counts another stream's
+      updates, stale and reset events, but takes its metadata, and its
+      snapshot rebinds the book; ADR 0023 and its owner's review.)
 - [ ] *(Added in Phase 4b's review, ADR 0023, N2.)* An event that interrupts a
       message loses its own effect from the book's result: a `StreamReset`,
       an `InstrumentUpdate` or a frame's begin arriving inside a message is

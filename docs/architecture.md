@@ -74,7 +74,7 @@ thread.
 | Direction | Interface | Notes |
 |-----------|-----------|-------|
 | Python → C++ | `ReplayEngine(config).run(raw_log, strategy)` | Backtests. Runs the C++ core over a recorded log. `strategy` is called on decision-clock events (section 4.3). |
-| Python → C++ | `OrderBook(instrument, check, capacity)`, `apply(event)`, `top(side, n)`, `best_bid()`, `is_stale`, `stale_count(reason)`, `bound_source`, `other_source_updates` | For verification against the Python reference reconstructor and for research (ADRs 0022, 0023). Prices and quantities come back as integer mantissas. |
+| Python → C++ | `OrderBook(instrument, check, capacity)`, `apply(event)`, `top(side, n)`, `best_bid()`, `is_stale`, `stale_count(reason)`, `bound_source`, `other_source_updates`, `other_source_controls` | For verification against the Python reference reconstructor and for research (ADRs 0022, 0023). Prices and quantities come back as integer mantissas. |
 | Python → C++ | `Engine.submit_targets(TargetSet)` | Live/paper. Enqueues onto the control SPSC queue. Non-blocking. |
 | Python → C++ | `Engine.pause(scope, reason)`, `Engine.flatten(scope, reason)` | Risk-reducing commands only. There is no binding that raises a limit or resumes. |
 | C++ → Python | `Engine.snapshot()` | Positions, open orders, PnL, book tops, feature values, health counters. Read through a seqlock, never blocks the core. |
@@ -211,8 +211,9 @@ Tool calls only, listed exhaustively in section 8.
    next complete snapshot that passes the check. Each book's capacity is fixed
    at startup; a level that does not fit marks it stale too. While an update
    or a snapshot is being applied the book cannot be read; it is bound to the
-   stream of the snapshot it was built from, and an update of another stream
-   is ignored and counted (ADR 0023).
+   stream of the snapshot it was built from, and an update, stale or reset of
+   another stream is ignored and counted (ADR 0023), so in a make-before-break
+   reconnect the old connection's disconnect leaves the new stream's book.
 6. **Features.** Incremental features (order flow imbalance, spread,
    microprice, rolling volatility) update in place, from the book only when an
    event's result says a message took effect (`Applied` or `Recovered`, ADR
@@ -497,9 +498,11 @@ the last reset and the last failure and no update or stream snapshot is being
 applied (`has_book`, ADR 0023): a consumer reads the book after a result of
 `Applied` or `Recovered`. The book is bound (`bound_source`) to the source of
 the stream snapshot it is built from, from that snapshot's first level until a
-reset or a failure; a snapshot of another source rebinds it, and an update of
-another source is ignored, interrupts nothing and is counted
-(`other_source_updates`). Its metadata, at startup and in an
+reset or a failure; only a snapshot of another source rebinds it. While it is
+bound, an update, a `StreamStale` or a `StreamReset` of another source is
+ignored, interrupts nothing and is counted (`other_source_updates`,
+`other_source_controls`); an unbound book takes every event, and an
+`InstrumentUpdate` applies from any source. Its metadata, at startup and in an
 `InstrumentUpdate`, must be what the store could hold (`meta_fits`: the scales,
 and a tick and lot size of at least 1).
 

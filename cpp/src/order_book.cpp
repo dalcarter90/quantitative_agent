@@ -155,9 +155,14 @@ OrderBook::OrderBook(const InstrumentMeta& instrument, BookCheck check,
   set_divisors();
 }
 
-// An update of another stream than the one the book is built from (ADR 0023).
+// An update, stale or reset of another stream than the one the book is built
+// from (ADR 0023). A snapshot of another source rebinds the book and an
+// InstrumentUpdate applies from any source, so neither is one.
 bool OrderBook::of_another_stream(const MarketEvent& event) const noexcept {
-  return event.kind == EventKind::BookDelta && bound_ && event.source != bound_source_;
+  const bool judged = event.kind == EventKind::BookDelta ||
+                      event.kind == EventKind::StreamStale ||
+                      event.kind == EventKind::StreamReset;
+  return judged && bound_ && event.source != bound_source_;
 }
 
 BookResult OrderBook::apply(const MarketEvent& event) noexcept {
@@ -165,9 +170,11 @@ BookResult OrderBook::apply(const MarketEvent& event) noexcept {
     return {BookEffect::Ignored, StaleReason::NotStale};
   }
   if (of_another_stream(event)) {
-    // Nothing of it is applied, and it interrupts nothing: counted once, at its
-    // first level.
-    if (event.level_index == 0) {
+    // Nothing of it is applied, and it interrupts nothing: an update counted
+    // once, at its first level; a stale or reset counted as it comes.
+    if (event.kind != EventKind::BookDelta) {
+      ++other_source_controls_;
+    } else if (event.level_index == 0) {
       ++other_source_updates_;
     }
     return {BookEffect::Ignored, StaleReason::NotStale};

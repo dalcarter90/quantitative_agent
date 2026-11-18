@@ -1067,15 +1067,17 @@ TEST(OrderBook, AnUpdateOfAnotherSourceIsIgnoredAndCountedAndDoesNotMakeTheBookS
 
 TEST(OrderBook, ASnapshotOfAnotherSourceRebindsTheBook) {
   // Two logs of one instrument that overlap in time, merged by arrival
-  // (review 2026-11, finding 2): log b's session start resets the book and b's
-  // snapshot rebuilds it; then a late update of log a, numbered above b's
-  // last, is not applied to b's book.
+  // (review 2026-11, finding 2): log b's session start, of another source than
+  // the book is bound to, is ignored (the owner's review of ADR 0023), and b's
+  // snapshot rebinds the book and rebuilds it; then a late update of log a,
+  // numbered above b's last, is not applied to b's book.
   OrderBook book = coinbase();
   ASSERT_EQ(last(book, snapshot(1, kGood, numbered(1))), kApplied);
   ASSERT_EQ(last(book, update(2, {{kBuy, 98, 1}}, numbered(2))), kApplied);
   MarketEvent b_starts = control(EventKind::StreamReset, StreamReason::SessionStart, 0);
   b_starts.source = kOtherSource;
-  ASSERT_EQ(book.apply(b_starts).effect, BookEffect::Reset);
+  ASSERT_EQ(book.apply(b_starts).effect, BookEffect::Ignored);
+  ASSERT_EQ(side_of(book, kBuy), (Levels{{100, 5}, {99, 1}, {98, 1}}));  // a's book stands
   const std::vector<L> b_levels = {{kBuy, 200, 1}, {kSell, 201, 1}};
   ASSERT_EQ(
       last(book, snapshot(1, b_levels, numbered(1), EventKind::BookSnapshot, kOtherSource)),
@@ -1138,6 +1140,121 @@ TEST(OrderBook, AResetOrAFailureUnbindsTheBook) {
               kRecovered);
     EXPECT_EQ(book.bound_source(), kOtherSource);
   }
+}
+
+// --- the owner's review of ADR 0023: another stream's stale and reset events -----------------
+
+MarketEvent of_source(MarketEvent event, std::uint32_t source) {
+  event.source = source;
+  return event;
+}
+
+TEST(OrderBook, InAMakeBeforeBreakReconnectTheOldConnectionsDisconnectLeavesTheNewBook) {
+  // The handler opens the new connection (source 2) before it closes the old
+  // one (source 0). Without the rule, the old connection's disconnect would
+  // empty the new stream's book, and no snapshot would follow to rebuild it.
+  constexpr std::uint32_t kOld = qa::testkit::kStreamSource;
+  constexpr std::uint32_t kNew = kOtherSource;
+  OrderBook book = coinbase();
+  ASSERT_EQ(book.apply(control(EventKind::StreamReset, StreamReason::Connect, 0)).effect,
+            BookEffect::Reset);  // the old connection opens; unbound, it applies
+  ASSERT_EQ(last(book, snapshot(1, kGood, numbered(1))), kApplied);
+  ASSERT_EQ(book.bound_source(), kOld);
+  ASSERT_EQ(last(book, update(2, {{kBuy, 98, 1}}, numbered(2))), kApplied);
+
+  // The new connection opens while the old one still streams: its connect is
+  // another source's reset, ignored and counted. The old book stands.
+  EXPECT_EQ(book.apply(of_source(control(EventKind::StreamReset, StreamReason::Connect, 3), kNew)),
+            (BookResult{BookEffect::Ignored, StaleReason::NotStale}));
+  EXPECT_EQ(book.other_source_controls(), 1u);
+  EXPECT_EQ(last(book, update(4, {{kBuy, 97, 1}}, numbered(3))), kApplied);
+  EXPECT_EQ(side_of(book, kBuy), (Levels{{100, 5}, {99, 1}, {98, 1}, {97, 1}}));
+
+  // The new connection's snapshot rebinds the book.
+  const std::vector<L> fresh_levels = {{kBuy, 200, 1}, {kSell, 201, 1}};
+  EXPECT_EQ(last(book, snapshot(5, fresh_levels, numbered(1), EventKind::BookSnapshot, kNew)),
+            kApplied);
+  EXPECT_EQ(book.bound_source(), kNew);
+
+  // The old connection's last update, a gap it reports, then its disconnect:
+  // all of another source now, all ignored. The new book stands, fresh.
+  EXPECT_EQ(book.apply(update(6, {{kBuy, 96, 1}}, numbered(4))[0]).effect, BookEffect::Ignored);
+  EXPECT_EQ(book.apply(control(EventKind::StreamStale, StreamReason::SequenceGap, 7)),
+            (BookResult{BookEffect::Ignored, StaleReason::NotStale}));
+  EXPECT_EQ(book.apply(control(EventKind::StreamReset, StreamReason::Disconnect, 8)),
+            (BookResult{BookEffect::Ignored, StaleReason::NotStale}));
+  EXPECT_TRUE(book.has_book());
+  EXPECT_FALSE(book.is_stale());
+  EXPECT_EQ(book.bound_source(), kNew);
+  EXPECT_EQ(side_of(book, kBuy), (Levels{{200, 1}}));
+  EXPECT_EQ(side_of(book, kSell), (Levels{{201, 1}}));
+  EXPECT_EQ(book.other_source_controls(), 3u);
+  EXPECT_EQ(book.other_source_updates(), 1u);
+  EXPECT_EQ(failures(book), 0u);
+
+  // The new stream goes on.
+  EXPECT_EQ(last(book, update(9, {{kBuy, 199, 2}}, numbered(2), kNew)), kApplied);
+  EXPECT_EQ(side_of(book, kBuy), (Levels{{200, 1}, {199, 2}}));
+}
+
+TEST(OrderBook, AnotherSourcesStaleOrResetInsideAMessageInterruptsNothing) {
+  OrderBook book = fresh();
+  const auto two = update(2, {{kBuy, 98, 2}, {kSell, 102, 1}}, numbered(2));
+  ASSERT_EQ(book.apply(two[0]).effect, kPending);
+  EXPECT_EQ(book.apply(of_source(control(EventKind::StreamStale, StreamReason::SequenceGap, 9),
+                                 kOtherSource))
+                .effect,
+            BookEffect::Ignored);
+  EXPECT_EQ(book.apply(of_source(control(EventKind::StreamReset, StreamReason::Connect, 9),
+                                 kOtherSource))
+                .effect,
+            BookEffect::Ignored);
+  EXPECT_EQ(book.apply(two[1]).effect, kApplied);
+  EXPECT_EQ(failures(book), 0u);
+  EXPECT_EQ(book.other_source_controls(), 2u);
+  // Its own stream's stale and reset still apply.
+  EXPECT_EQ(book.apply(control(EventKind::StreamStale, StreamReason::SequenceGap, 3)).effect,
+            kWentStale);
+}
+
+TEST(OrderBook, WhileUnboundEveryStreamsStaleAndResetApply) {
+  {
+    OrderBook book = coinbase();  // nothing built yet
+    EXPECT_EQ(book.apply(of_source(control(EventKind::StreamReset, StreamReason::Connect, 1),
+                                   kOtherSource))
+                  .effect,
+              BookEffect::Reset);
+    EXPECT_EQ(book.apply(of_source(control(EventKind::StreamStale, StreamReason::SequenceGap, 2),
+                                   kOtherSource)),
+              (BookResult{kWentStale, StaleReason::SequenceGap}));
+    EXPECT_EQ(book.other_source_controls(), 0u);
+  }
+  {
+    OrderBook book = fresh();  // emptied by a reset of its own stream: unbound
+    ASSERT_EQ(book.apply(control(EventKind::StreamReset, StreamReason::Disconnect, 2)).effect,
+              BookEffect::Reset);
+    EXPECT_EQ(book.apply(of_source(control(EventKind::StreamStale, StreamReason::MessageRejected,
+                                           3),
+                                   kOtherSource))
+                  .effect,
+              kWentStale);
+    EXPECT_EQ(book.other_source_controls(), 0u);
+  }
+}
+
+TEST(OrderBook, AnInstrumentUpdateAppliesFromAnySource) {
+  const std::vector<L> levels = {{kBuy, 7'346'850'000'000, 20'416'909},
+                                 {kSell, 7'346'860'000'000, 89'472'056}};
+  OrderBook book = kraken(kKrakenBtc);
+  ASSERT_EQ(last(book, snapshot(1, levels, summed(qa::crc32("73468689472056" "73468520416909")))),
+            kApplied);
+  InstrumentMeta changed = kKrakenBtc;
+  changed.price_precision = 2;
+  EXPECT_EQ(book.apply(of_source(instrument_update(changed, 2), kOtherSource)).effect,
+            BookEffect::Instrument);
+  EXPECT_EQ(book.instrument().price_precision, 2);
+  EXPECT_EQ(book.other_source_controls(), 0u);
+  EXPECT_EQ(book.bound_source(), qa::testkit::kStreamSource);
 }
 
 // --- what is not the book's --------------------------------------------------------------------
