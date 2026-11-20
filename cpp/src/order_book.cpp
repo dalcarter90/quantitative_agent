@@ -157,11 +157,14 @@ OrderBook::OrderBook(const InstrumentMeta& instrument, BookCheck check,
 
 // An update, stale or reset of another stream than the one the book is built
 // from (ADR 0023). A snapshot of another source rebinds the book and an
-// InstrumentUpdate applies from any source, so neither is one.
+// InstrumentUpdate applies from any source, so neither is one. Nor is a
+// session start: a new session means every stream before it is over, so its
+// reset applies from any source (the owner's second review of ADR 0023).
 bool OrderBook::of_another_stream(const MarketEvent& event) const noexcept {
   const bool judged = event.kind == EventKind::BookDelta ||
                       event.kind == EventKind::StreamStale ||
-                      event.kind == EventKind::StreamReset;
+                      (event.kind == EventKind::StreamReset &&
+                       event.reason != StreamReason::SessionStart);
   return judged && bound_ && event.source != bound_source_;
 }
 

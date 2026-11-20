@@ -44,8 +44,9 @@ as the findings' regression tests. An update cannot be read until its last
 level, as a snapshot cannot, and consumers act only on results that say a
 message took effect (finding 1). The book is bound to the source of the
 snapshot it is built from; an update of another source is ignored and
-counted, and so, after the owner's review of ADR 0023, is another source's
-stale or reset event; Phase 7 replays one stream per book (finding 2).
+counted, and so, after the owner's reviews of ADR 0023, is another source's
+stale event, connect or disconnect, while a session start of any source
+applies; Phase 7 replays one stream per book (finding 2).
 `BM_ReplayCoinbaseFixture` replays the committed Coinbase fixture's converted
 events and reports p50, p99, the maximum and the mean per update; the Kraken
 benchmark's comment is fixed (finding 3). Every `StreamReason` is mapped at

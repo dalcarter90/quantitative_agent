@@ -1,6 +1,6 @@
 # 0023: Review of the C++ order book: an update unread until it takes effect, one stream per book, a recorded benchmark
 
-Status: Accepted (owner decisions, 2026-11-17); the implementation choices confirmed by the owner (2026-11-17, see "Review"), with one change (see "Owner's review": while the book is bound, another source's stale and reset events are ignored too); the choices made for that change await the owner's review
+Status: Accepted (owner decisions, 2026-11-17); the implementation choices confirmed by the owner (2026-11-17, see "Review"), with one change (see "Owner's review": while the book is bound, another source's stale and reset events are ignored too), whose own choices were confirmed on 2026-11-19 with one change (see "Owner's second review": a session start applies from any source)
 Date: 2026-11-17
 Amends: 0022 (an update cannot be read until it takes effect; the book is bound to one stream; a tick or lot size below 1 is refused; its Review is confirmed here, item 11 amended), 0021 (two metadata versions at one record are emitted in the reference book's order). Data core: the Kraken adapter refuses a record with two versions of the instrument (`docs/data-core-spec.md` section 7)
 
@@ -266,6 +266,9 @@ beginning) to Phase 7; N3 (the book records no time for freshness) to Phase 9.
 - Phase 5 cannot add `QueueOverflow` without mapping it and giving it a
   counter.
 - Phase 7 replays one stream per instrument book.
+- With the owner's reviews: while bound, another source's updates, stale
+  events and `Connect` and `Disconnect` resets are ignored and counted; a
+  `SessionStart` reset applies from any source.
 
 ## Review
 
@@ -317,7 +320,8 @@ the next resync.
 **How it is built.**
 
 - An event of another source than the bound one that is an update, a
-  `StreamStale` or a `StreamReset` is `Ignored`: it is not applied, does not
+  `StreamStale` or a `StreamReset` (since the second review, below, not a
+  `SessionStart` one) is `Ignored`: it is not applied, does not
   interrupt a message in progress, and neither makes the book stale nor
   empties it. A stale or reset is counted as it comes in
   `other_source_controls()` (Python: `other_source_controls`); updates stay
@@ -337,7 +341,9 @@ the next resync.
   reset of another source inside a message interrupts nothing; while unbound
   they apply; an `InstrumentUpdate` of another source applies.
 
-**A consequence for logs replayed one after another.** The converter replays
+**A consequence for logs replayed one after another** *(no longer so: the
+owner's second review, below, makes a session start apply from any source)*.
+The converter replays
 logs in `(log_id, seq)` order, each beginning with a `SessionStart` reset on
 its own source. A recorded log ends with its stream's disconnect, which
 empties and unbinds the book, so the next log's session start applies and the
@@ -354,7 +360,8 @@ Because of it, `test_two_logs_replayed_one_after_the_other_bind_the_book_to_each
 (added with this ADR) now gives its first log the closing disconnect a
 recorded log has.
 
-**Choices made for it, awaiting the owner:**
+**Choices made for it.** **Confirmed by the owner, 2026-11-19: all three**
+(see "Owner's second review"):
 
 1. **A counter of its own** for ignored stale and reset events
    (`other_source_controls`), beside `other_source_updates`, rather than one
@@ -364,3 +371,42 @@ recorded log has.
    not this book's stream to judge.
 3. **It interrupts no message in progress**, as an update of another source
    does not.
+
+## Owner's second review (2026-11-19)
+
+**Decision.** The three choices above are confirmed, with one change: **a
+`StreamReset` whose reason is `SessionStart` always applies, from any
+source, bound or not.** A `Connect` or `Disconnect` of another source stays
+ignored while the book is bound, and so does a `StreamStale`.
+
+**Why.** A new session means the old stream is over. Ignoring the next log's
+session start, as the first review's rule did when a log ended without its
+disconnect, kept a crashed log's book showing as fresh into the new session:
+a stale-data hazard.
+
+**How it is built.**
+
+- A session start is not an event of another stream (`of_another_stream`): it
+  is taken as the book's own reset, whatever its source. It empties the book
+  and unbinds it, neither causing nor ending staleness, and is not counted
+  in `other_source_controls`. The book's next binding is the new session's
+  first stream snapshot.
+- Nothing else changes. In a make-before-break reconnect, which happens
+  within one session, the new connection's `Connect` and the old one's
+  `Disconnect` are ignored while bound, as before; that test passes
+  unchanged, in C++ and through the binding.
+- **Tests.** `test_the_next_logs_session_start_empties_and_unbinds_the_book_of_a_log_with_no_disconnect`
+  replaces the test that pinned the first review's consequence: two logs, the
+  first with no closing disconnect; the second log's session start empties
+  and unbinds the book, and the C++ book matches the reference after every
+  step. `ASessionStartOfAnySourceEmptiesAndUnbindsTheBook` shows the same in
+  C++, with the new session's update before its snapshot being one with no
+  book, and another source's `Connect` and `Disconnect` still ignored. The C++
+  test `ASnapshotOfAnotherSourceRebindsTheBook`, whose log b begins with a
+  session start, now expects that session start to reset and unbind the book
+  before b's snapshot binds it.
+- **Logs replayed one after another** now agree with the reference after
+  every step whether or not a log ends with its disconnect: each log's
+  session start empties and unbinds the book.
+
+Nothing in this change was decided while building it.

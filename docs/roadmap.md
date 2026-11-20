@@ -2172,9 +2172,10 @@ reconnect, the old connection's disconnect cannot empty the new stream's book.
       reset interrupts no message; an unbound book takes them; an
       `InstrumentUpdate` of another source applies.
 - [x] Recorded in ADR 0023 ("Owner's review"), its Review items confirmed;
-      its three choices for the change await the owner.
+      its three choices for the change confirmed in the second review, below.
 
-**A consequence:** a log that ends without its disconnect leaves the book
+**A consequence** *(removed by the owner's second review, below)*: a log that
+ends without its disconnect leaves the book
 bound, so the next log's session start is ignored and the C++ book shows the
 old log's book until the new log's snapshot, where the reference is empty
 from the session start. A new test pins it, and
@@ -2200,6 +2201,41 @@ over them changed.
   counting into `other_source_updates`, an ignored event interrupting a
   message): all 8 caught by the C++ tests. The mutated file was compared with
   a copy taken before the pass: identical.
+
+#### Phase 4b: the owner's second review of ADR 0023 (done)
+
+The owner confirmed the first review's three choices on 2026-11-19 with one
+change: a `StreamReset` whose reason is `SessionStart` always applies, from any
+source, bound or not, because a new session means the old stream is over and a
+crashed log's book showing as fresh is a stale-data hazard. `Connect` and
+`Disconnect` of another source stay ignored while bound.
+
+- [x] A session start of any source empties and unbinds the book.
+- [x] The test that pinned the crashed-recorder consequence is replaced by
+      one showing the next log's session start empties and unbinds the book,
+      matching the reference after every step; a C++ test shows the same, and
+      another source's `Connect` and `Disconnect` still ignored.
+- [x] The make-before-break tests (C++ and through the binding) pass
+      unchanged.
+- [x] Recorded in ADR 0023 ("Owner's second review").
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 92 C++ tests and 1,860 Python tests (91
+  and 1,860 before: 1 new C++ test; one Python test replaced by another).
+  The Python suite took 12 min 25 s, and the slow-test reminder listed 16
+  existing tests none of this work touches (Coinbase fixture, golden-file and
+  store tests in `test_book.py`, `test_check_snapshots.py`,
+  `test_book_resume.py`, `test_fixtures.py` and `test_review_2026_11.py`) at
+  5.0 to 5.7 s. Run alone right after, they took 4.5 to 5.5 s. They stay
+  unmarked as borderline (ADR 0022, decision 4), but the list has grown from
+  eight to sixteen as the machine has slowed: for the owner.
+- **Breakage pass on the change:** 4 deliberate breakages (a session start of
+  another source ignored again; every reset of another source applied; a
+  disconnect, or a connect, exempt instead of a session start): all 4 caught
+  by the C++ tests. The replacement Python test was also run alone under the
+  first of them and fails at the second log's session start. The mutated file
+  was compared with a copy taken before the pass: identical.
 
 ### Phase 5: SPSC queue and threading primitives
 
@@ -2293,8 +2329,9 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       recorders at once) are never merged into one book: each stream gets its
       own book, or the overlap is refused. A test with two overlapping logs
       shows it. (While bound, the book ignores and counts another stream's
-      updates, stale and reset events, but takes its metadata, and its
-      snapshot rebinds the book; ADR 0023 and its owner's review.)
+      updates, stale events and connects and disconnects, but takes its
+      session start, which ends the old stream, and its metadata, and its
+      snapshot rebinds the book; ADR 0023 and the owner's reviews of it.)
 - [ ] *(Added in Phase 4b's review, ADR 0023, N2.)* An event that interrupts a
       message loses its own effect from the book's result: a `StreamReset`,
       an `InstrumentUpdate` or a frame's begin arriving inside a message is

@@ -211,9 +211,10 @@ Tool calls only, listed exhaustively in section 8.
    next complete snapshot that passes the check. Each book's capacity is fixed
    at startup; a level that does not fit marks it stale too. While an update
    or a snapshot is being applied the book cannot be read; it is bound to the
-   stream of the snapshot it was built from, and an update, stale or reset of
-   another stream is ignored and counted (ADR 0023), so in a make-before-break
-   reconnect the old connection's disconnect leaves the new stream's book.
+   stream of the snapshot it was built from, and an update, stale, connect or
+   disconnect of another stream is ignored and counted (ADR 0023), so in a
+   make-before-break reconnect the old connection's disconnect leaves the new
+   stream's book; a session start, of any stream, ends the old one.
 6. **Features.** Incremental features (order flow imbalance, spread,
    microprice, rolling volatility) update in place, from the book only when an
    event's result says a message took effect (`Applied` or `Recovered`, ADR
@@ -499,10 +500,12 @@ applied (`has_book`, ADR 0023): a consumer reads the book after a result of
 `Applied` or `Recovered`. The book is bound (`bound_source`) to the source of
 the stream snapshot it is built from, from that snapshot's first level until a
 reset or a failure; only a snapshot of another source rebinds it. While it is
-bound, an update, a `StreamStale` or a `StreamReset` of another source is
-ignored, interrupts nothing and is counted (`other_source_updates`,
-`other_source_controls`); an unbound book takes every event, and an
-`InstrumentUpdate` applies from any source. Its metadata, at startup and in an
+bound, an update, a `StreamStale` or a `Connect` or `Disconnect`
+`StreamReset` of another source is ignored, interrupts nothing and is counted
+(`other_source_updates`, `other_source_controls`); a `SessionStart` reset
+applies from any source, bound or not, since a new session ends the old
+stream; an unbound book takes every event, and an `InstrumentUpdate` applies
+from any source. Its metadata, at startup and in an
 `InstrumentUpdate`, must be what the store could hold (`meta_fits`: the scales,
 and a tick and lot size of at least 1).
 

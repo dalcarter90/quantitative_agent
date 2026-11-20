@@ -1067,17 +1067,18 @@ TEST(OrderBook, AnUpdateOfAnotherSourceIsIgnoredAndCountedAndDoesNotMakeTheBookS
 
 TEST(OrderBook, ASnapshotOfAnotherSourceRebindsTheBook) {
   // Two logs of one instrument that overlap in time, merged by arrival
-  // (review 2026-11, finding 2): log b's session start, of another source than
-  // the book is bound to, is ignored (the owner's review of ADR 0023), and b's
-  // snapshot rebinds the book and rebuilds it; then a late update of log a,
-  // numbered above b's last, is not applied to b's book.
+  // (review 2026-11, finding 2): log b's session start, though of another
+  // source than the book is bound to, empties and unbinds the book (a new
+  // session ends the old stream: the owner's second review of ADR 0023), and
+  // b's snapshot binds and rebuilds it; then a late update of log a, numbered
+  // above b's last, is not applied to b's book.
   OrderBook book = coinbase();
   ASSERT_EQ(last(book, snapshot(1, kGood, numbered(1))), kApplied);
   ASSERT_EQ(last(book, update(2, {{kBuy, 98, 1}}, numbered(2))), kApplied);
   MarketEvent b_starts = control(EventKind::StreamReset, StreamReason::SessionStart, 0);
   b_starts.source = kOtherSource;
-  ASSERT_EQ(book.apply(b_starts).effect, BookEffect::Ignored);
-  ASSERT_EQ(side_of(book, kBuy), (Levels{{100, 5}, {99, 1}, {98, 1}}));  // a's book stands
+  ASSERT_EQ(book.apply(b_starts).effect, BookEffect::Reset);
+  ASSERT_EQ(book.bound_source(), std::nullopt);
   const std::vector<L> b_levels = {{kBuy, 200, 1}, {kSell, 201, 1}};
   ASSERT_EQ(
       last(book, snapshot(1, b_levels, numbered(1), EventKind::BookSnapshot, kOtherSource)),
@@ -1240,6 +1241,36 @@ TEST(OrderBook, WhileUnboundEveryStreamsStaleAndResetApply) {
               kWentStale);
     EXPECT_EQ(book.other_source_controls(), 0u);
   }
+}
+
+TEST(OrderBook, ASessionStartOfAnySourceEmptiesAndUnbindsTheBook) {
+  // The owner's second review of ADR 0023: a new session means the old stream
+  // is over. A log that ended without its disconnect (a recorder that crashed)
+  // must not leave its book showing as fresh into the next session.
+  OrderBook book = fresh();  // bound to the stream source
+  const MarketEvent next_session =
+      of_source(control(EventKind::StreamReset, StreamReason::SessionStart, 0), kOtherSource);
+  EXPECT_EQ(book.apply(next_session), (BookResult{BookEffect::Reset, StaleReason::NotStale}));
+  EXPECT_FALSE(book.has_book());
+  EXPECT_FALSE(book.is_stale());
+  EXPECT_EQ(book.bound_source(), std::nullopt);
+  EXPECT_EQ(side_of(book, kBuy), (Levels{}));
+  EXPECT_EQ(book.other_source_controls(), 0u);
+  // The new session's own update before its snapshot is one with no book.
+  EXPECT_EQ(book.apply(update(1, {{kBuy, 98, 1}}, numbered(1), kOtherSource)[0]),
+            (BookResult{kWentStale, StaleReason::DeltaBeforeSnapshot}));
+  // Its connect and disconnect are judged as before: only a session start is.
+  OrderBook other = fresh();
+  EXPECT_EQ(other.apply(of_source(control(EventKind::StreamReset, StreamReason::Connect, 1),
+                                  kOtherSource))
+                .effect,
+            BookEffect::Ignored);
+  EXPECT_EQ(other.apply(of_source(control(EventKind::StreamReset, StreamReason::Disconnect, 1),
+                                  kOtherSource))
+                .effect,
+            BookEffect::Ignored);
+  EXPECT_TRUE(other.has_book());
+  EXPECT_EQ(other.other_source_controls(), 2u);
 }
 
 TEST(OrderBook, AnInstrumentUpdateAppliesFromAnySource) {

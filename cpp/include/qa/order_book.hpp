@@ -31,12 +31,14 @@
 // - The book is bound to one stream (ADR 0023): the source of the stream
 //   snapshot it is built from, from that snapshot's first level until a reset
 //   or a failure empties it. Only a snapshot of another source rebinds it. An
-//   update, a StreamStale or a StreamReset of any other source is ignored and
-//   counted (other_source_updates, other_source_controls): it does not
-//   interrupt a message, make the book stale or empty it. So in a reconnect
-//   that opens the new connection before closing the old, the old one's
-//   disconnect cannot empty the new stream's book. An InstrumentUpdate applies
-//   from any source, and an unbound book takes every event as it comes.
+//   update, a StreamStale or a Connect or Disconnect StreamReset of any other
+//   source is ignored and counted (other_source_updates,
+//   other_source_controls): it does not interrupt a message, make the book
+//   stale or empty it. So in a reconnect that opens the new connection before
+//   closing the old, the old one's disconnect cannot empty the new stream's
+//   book. A SessionStart reset applies from any source, bound or not: a new
+//   session means the old stream is over. An InstrumentUpdate applies from any
+//   source, and an unbound book takes every event as it comes.
 //
 // apply() never allocates, throws, locks or reads a clock: every level is held
 // in storage allocated when the book is built. The constructor throws on a
@@ -151,7 +153,8 @@ enum class BookEffect : std::uint8_t {
   Reset = 5,       // a StreamReset emptied the book
   Instrument = 6,  // an InstrumentUpdate replaced the metadata in force
   Ignored = 7,     // nothing for this book: a check snapshot, a trade, another instrument,
-                   // an update, stale or reset of a stream the book is not bound to
+                   // an update, stale, connect or disconnect of a stream the book is
+                   // not bound to
 };
 
 struct BookResult {
@@ -206,8 +209,8 @@ class OrderBook {
   [[nodiscard]] std::uint64_t other_source_updates() const noexcept {
     return other_source_updates_;
   }
-  // How many StreamStale and StreamReset events of another source than the
-  // bound one were ignored since the book was built.
+  // How many StreamStale and StreamReset events (Connect, Disconnect) of
+  // another source than the bound one were ignored since the book was built.
   [[nodiscard]] std::uint64_t other_source_controls() const noexcept {
     return other_source_controls_;
   }

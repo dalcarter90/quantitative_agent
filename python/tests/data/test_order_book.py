@@ -1063,39 +1063,32 @@ def test_two_logs_replayed_one_after_the_other_bind_the_book_to_each_in_turn():
     assert sides(book) == ([(200, 1), (199, 2)], [(201, 1)])
 
 
-def test_a_log_with_no_closing_disconnect_keeps_its_book_until_the_next_logs_snapshot():
-    """The owner's review of ADR 0023: while the book is bound, a reset of
-    another source is ignored. A log that ends without its disconnect (a
-    recorder that crashed) leaves the book bound to it, so the next log's
-    session start is ignored and counted: the C++ book shows the old log's book
-    until the next log's snapshot rebinds it, where the reference book is empty
-    from that session start. From the snapshot on, the two agree again."""
+def test_the_next_logs_session_start_empties_and_unbinds_the_book_of_a_log_with_no_disconnect():
+    """The owner's second review of ADR 0023: a session start applies from any
+    source, bound or not, because a new session means the old stream is over.
+    A log that ends without its disconnect (a recorder that crashed) leaves the
+    book bound to it; the next log's session start still empties and unbinds
+    it, so the crashed log's book never shows as fresh into the new session, and
+    the C++ book matches the reference after every step."""
     table, meta = two_logs()
-    messages = list(messages_from_table(table, meta))
-    reference = trace("coinbase", messages, TWO_LOGS_STARTS, mode="resume")
+    book, outcomes = assert_same_steps("coinbase", table, TWO_LOGS_STARTS, meta)
+    assert [(o.log_id == OTHER_LOG, o.step, o.effects[-1]) for o in outcomes] == [
+        (False, "reset", EFFECT.Reset), (False, "message", EFFECT.Applied),
+        (False, "message", EFFECT.Applied),
+        (True, "reset", EFFECT.Reset),  # the next session's start: applied, not ignored
+        (True, "message", EFFECT.Applied), (True, "message", EFFECT.Applied)]  # fmt: skip
+    assert (book.bound_source, book.other_source_controls, book.other_source_updates) == (1, 0, 0)
+
+    # Step by step: the session start leaves no book and no binding.
     book = new_book("coinbase", meta)
-    seen = []
     for group in convert(table, TWO_LOGS_STARTS, meta, instrument=INSTRUMENT_ID):
-        outcome = apply_group(book, group)
-        if group.step in NOT_STEPS:
-            continue
-        step, state = next(reference)
-        assert (group.log_id, group.seq, group.step) == (step.log_id, step.seq, step.step)
-        seen.append((group.log_id == OTHER_LOG, group.step, outcome.effects[-1], sides(book),
-                     reference_sides(state)))  # fmt: skip
-    assert next(reference, None) is None
-    nothing = ([], [])
-    snapshot_a, after_a = ([(100, 5)], [(101, 3)]), ([(100, 5), (99, 1)], [(101, 3)])
-    snapshot_b, after_b = ([(200, 1)], [(201, 1)]), ([(200, 1), (199, 2)], [(201, 1)])
-    assert seen == [
-        (False, "reset", EFFECT.Reset, nothing, nothing),
-        (False, "message", EFFECT.Applied, snapshot_a, snapshot_a),
-        (False, "message", EFFECT.Applied, after_a, after_a),
-        (True, "reset", EFFECT.Ignored, after_a, nothing),  # the one step that differs
-        (True, "message", EFFECT.Applied, snapshot_b, snapshot_b),
-        (True, "message", EFFECT.Applied, after_b, after_b),
-    ]
-    assert (book.bound_source, book.other_source_controls, book.other_source_updates) == (1, 1, 0)
+        apply_group(book, group)
+        if group.log_id == OTHER_LOG and group.step == "reset":
+            assert (book.has_book, book.is_stale, book.bound_source) == (False, False, None)
+            assert sides(book) == ([], [])
+            break
+    else:
+        raise AssertionError("the second log's session start was not converted")
 
 
 def check_snapshot_differences(venue, table, events, meta):

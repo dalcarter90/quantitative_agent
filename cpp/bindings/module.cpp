@@ -603,7 +603,8 @@ PYBIND11_MODULE(_core, m) {
                              "How many updates of another source were ignored (ADR 0023).")
       .def_property_readonly(
           "other_source_controls", &OrderBook::other_source_controls,
-          "How many StreamStale and StreamReset events of another source were ignored (ADR 0023).")
+          "How many StreamStale, Connect and Disconnect events of another source were ignored "
+          "(ADR 0023).")
       .def("stale_count", &OrderBook::stale_count, py::arg("reason"))
       .def(
           "top",
