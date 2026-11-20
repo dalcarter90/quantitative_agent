@@ -9,6 +9,7 @@ ADR 0014. What the reference cannot see (a capacity, events arriving one at a
 time, an instrument update in the stream) is tested on its own.
 """
 
+import dataclasses
 import functools
 import itertools
 
@@ -48,7 +49,7 @@ from test_book_resume import FAILURES
 from test_check_snapshots import BETWEEN_BATCHES
 from test_fixtures import FIXTURES, INSTRUMENT
 from test_instruments import PRECISION_CHANGE_LOG, kraken_book
-from test_marketevents import case_tables, fixture_tables, instruments, stored, tables
+from test_marketevents import OTHER_LOG, case_tables, fixture_tables, instruments, stored, tables
 
 from quantagent import _core
 from quantagent.data.book import (
@@ -61,7 +62,7 @@ from quantagent.data.book import (
 )
 from quantagent.data.rawlog import read_raw_log
 from quantagent.data.schema import BOOK_EVENTS, INSTRUMENTS, Side, table_from_rows
-from quantagent.marketevents import convert
+from quantagent.marketevents import SourceMap, convert
 
 SLOW = pytest.mark.slow  # over about 5 s (CLAUDE.md, "Working efficiently")
 REASON = _core.StreamReason
@@ -176,6 +177,81 @@ def test_the_books_enums_have_the_documented_numbers():
     }  # fmt: skip
     assert {name: int(v) for name, v in _core.BookCheck.__members__.items()} == {
         "KrakenChecksum": 0, "CoinbaseSequence": 1}  # fmt: skip
+
+
+def test_every_reason_a_stream_stale_may_carry_is_a_named_and_counted_stale_reason():
+    """Every one, not only today's five (review 2026-11, finding 4; ADR 0023):
+    a reason ``StreamReason`` gains that a ``StreamStale`` may carry is reported
+    by the book under the same name and number, and counted. In C++ the build
+    checks the same (``stale_reason_of``); this checks the binding names it."""
+    carried = []
+    for name, reason in REASON.__members__.items():
+        event = control_event(KIND.StreamStale, 2, reason=reason)
+        try:
+            EV.from_bytes(event.to_bytes())
+        except ValueError:
+            continue  # a reason no StreamStale carries
+        carried.append(name)
+        book = coinbase_book()
+        apply_all(book, snapshot_events(1, [(BUY, 100, 5), (SELL, 101, 3)], venue_seq=1))
+        result = book.apply(event)
+        assert (result.effect, result.reason.name, int(result.reason)) == (
+            EFFECT.WentStale, name, int(reason))  # fmt: skip
+        assert book.stale_reason == getattr(STALE, name)
+        assert book.stale_count(getattr(STALE, name)) == 1
+    assert set(carried) >= {"SequenceGap", "SequenceRepeat", "SequenceOutOfOrder",
+                            "ChecksumMismatch", "MessageRejected"}  # fmt: skip
+
+
+def test_the_book_is_bound_to_its_snapshots_stream_and_ignores_another_streams_updates():
+    """ADR 0023: an update of another source than the stream snapshot that
+    built the book is ignored and counted, and makes nothing stale; a snapshot
+    of another source rebinds the book; a reset unbinds it."""
+    book = coinbase_book()
+    assert (book.bound_source, book.other_source_updates) == (None, 0)
+    apply_all(book, snapshot_events(1, [(BUY, 100, 5), (SELL, 101, 3)], venue_seq=1, source=4))
+    assert book.bound_source == 4
+    other = update_events(2, [(BUY, 99, 1), (SELL, 102, 1)], venue_seq=2, source=5)
+    assert apply_all(book, other) == [EFFECT.Ignored, EFFECT.Ignored]
+    assert (book.other_source_updates, book.is_stale) == (1, False)
+    assert sides(book) == ([(100, 5)], [(101, 3)])
+    effects = apply_all(book, snapshot_events(3, [(BUY, 90, 1), (SELL, 91, 1)], venue_seq=1,
+                                              source=5))  # fmt: skip
+    assert (effects[-1], book.bound_source) == (EFFECT.Applied, 5)
+    assert apply_all(book, update_events(4, [(BUY, 89, 1)], venue_seq=9, source=4)) == [
+        EFFECT.Ignored]  # fmt: skip
+    assert apply_all(book, update_events(4, [(BUY, 89, 1)], venue_seq=2, source=5)) == [
+        EFFECT.Applied]  # fmt: skip
+    reset = control_event(KIND.StreamReset, 5, reason=REASON.Connect, source=5)
+    assert (book.apply(reset).effect, book.bound_source) == (EFFECT.Reset, None)
+    assert (book.other_source_updates, book.other_source_controls) == (2, 0)
+
+
+def test_in_a_make_before_break_reconnect_the_old_connections_disconnect_leaves_the_new_book():
+    """The owner's review of ADR 0023. A handler opens the new connection
+    (source 2) before closing the old (source 0). While the book is bound, a
+    stale or reset of another source is ignored and counted, so neither the new
+    connection's connect nor the old one's disconnect empties a book; only the
+    new connection's snapshot rebinds it."""
+    old, new = 0, 2
+    book = coinbase_book()
+    assert book.apply(control_event(KIND.StreamReset, 0, reason=REASON.Connect,
+                                    source=old)).effect == EFFECT.Reset  # fmt: skip
+    apply_all(book, snapshot_events(1, [(BUY, 100, 5), (SELL, 101, 3)], venue_seq=1, source=old))
+    connect = control_event(KIND.StreamReset, 2, reason=REASON.Connect, source=new)
+    assert book.apply(connect).effect == EFFECT.Ignored  # the old book stands
+    assert sides(book) == ([(100, 5)], [(101, 3)])
+    effects = apply_all(book, snapshot_events(3, [(BUY, 200, 1), (SELL, 201, 1)], venue_seq=1,
+                                              source=new))  # fmt: skip
+    assert (effects[-1], book.bound_source) == (EFFECT.Applied, new)
+    gap = control_event(KIND.StreamStale, 4, reason=REASON.SequenceGap, source=old)
+    disconnect = control_event(KIND.StreamReset, 5, reason=REASON.Disconnect, source=old)
+    assert [book.apply(e).effect for e in (gap, disconnect)] == [EFFECT.Ignored] * 2
+    assert (book.has_book, book.is_stale, book.bound_source) == (True, False, new)
+    assert sides(book) == ([(200, 1)], [(201, 1)])
+    assert (book.other_source_controls, book.other_source_updates) == (3, 0)
+    assert apply_all(book, update_events(6, [(BUY, 199, 2)], venue_seq=2, source=new)) == [
+        EFFECT.Applied]  # fmt: skip
 
 
 def test_queries_return_integer_mantissas_best_first():
@@ -913,6 +989,106 @@ def test_the_book_equals_the_reference_at_every_depth_after_every_step(venue):
     assert not any(o.stale for o in outcomes)
     assert sum(o.step == "message" for o in outcomes) > 2_000
     assert book.size(BUY) + book.size(SELL) == 0  # the session's disconnect emptied it
+
+
+@pytest.mark.parametrize("venue", VENUES)
+def test_on_a_fixture_nothing_can_be_read_inside_a_message_and_no_update_is_ignored(venue):
+    """ADR 0023, on recorded data. After every event that leaves a message in
+    progress (``Pending``), the book shows the book before the message or
+    nothing, never a half-applied update or a half-built snapshot (review
+    2026-11, T1): nothing from an update's or a stream snapshot's first level,
+    and the book as it was during a check snapshot's frame, which changes
+    nothing, and at a frame's begin. And the book is bound to the log's stream:
+    no update of the converted stream is of another source."""
+    table, events, meta = fixture_tables(venue)
+    sources = SourceMap()
+    book = new_book(venue, meta, depth=depth_of(table))
+
+    def shown():
+        return (book.has_book, book.best_bid(), book.best_ask(), book.size(BUY), book.size(SELL),
+                book.checksum())  # fmt: skip
+
+    nothing = (False, None, None, 0, 0, 0)
+    hidden = kept = 0
+    bound = set()
+    for group in convert(table, events, meta, instrument=INSTRUMENT_ID, sources=sources):
+        before = shown()
+        for one in group.events:
+            result = book.apply(one)
+            if result.effect == EFFECT.Applied:
+                bound.add(book.bound_source)
+            if result.effect != EFFECT.Pending:
+                continue
+            where = (group.seq, group.step, one.kind)
+            if one.kind in (KIND.BookDelta, KIND.BookSnapshot):  # the book is being changed
+                hidden += 1
+                assert shown() == nothing and sides(book) == ([], []), where
+            else:  # a frame's begin, or a check snapshot's level
+                kept += 1
+                assert shown() == before, where
+    assert hidden > (30_000 if venue == "coinbase" else 4_000) and kept > 50
+    (log_id,) = set(table.column("log_id").to_pylist())
+    assert bound == {sources.source(log_id, "ws")}
+    assert (book.other_source_updates, book.other_source_controls) == (0, 0)
+    assert book.bound_source is None  # the session's disconnect emptied the book
+
+
+TWO_LOGS_FIRST = [msg(0, SNAP, (BUY, 100, 5), (SELL, 101, 3), venue_seq=1),
+                  msg(1, DELTA, (BUY, 99, 1), venue_seq=2)]  # fmt: skip
+TWO_LOGS_SECOND = [dataclasses.replace(m, log_id=OTHER_LOG) for m in
+                   [msg(0, SNAP, (BUY, 200, 1), (SELL, 201, 1), venue_seq=1),
+                    msg(1, DELTA, (BUY, 199, 2), venue_seq=2)]]  # fmt: skip
+TWO_LOGS_STARTS = [{**event(0, K.SESSION_START, connection=None), "log_id": log_id}
+                   for log_id in (LOG, OTHER_LOG)]  # fmt: skip
+
+
+def two_logs():
+    table = table_from_rows(BOOK_EVENTS, rows_of(TWO_LOGS_FIRST + TWO_LOGS_SECOND))
+    return table, instruments(LOG, OTHER_LOG, **PLAIN)
+
+
+def test_two_logs_replayed_one_after_the_other_bind_the_book_to_each_in_turn():
+    """The converter replays logs in (log_id, seq) order, each beginning with
+    its session start on its own source. A recorded log ends with its stream's
+    disconnect, which empties the book and unbinds it, so the next log's
+    session start applies: the book is bound to each log's stream in turn,
+    ignores nothing, and agrees with the reference after every step."""
+    disconnect = event(2, K.DISCONNECT, connection="ws")
+    table, meta = two_logs()
+    book, outcomes = assert_same_steps("coinbase", table, [*TWO_LOGS_STARTS, disconnect], meta)
+    assert [o.step for o in outcomes] == ["reset", "message", "message", "reset",
+                                          "reset", "message", "message"]  # fmt: skip
+    assert not any(o.stale for o in outcomes)
+    assert (book.bound_source, book.other_source_updates, book.other_source_controls) == (1, 0, 0)
+    assert sides(book) == ([(200, 1), (199, 2)], [(201, 1)])
+
+
+def test_the_next_logs_session_start_empties_and_unbinds_the_book_of_a_log_with_no_disconnect():
+    """The owner's second review of ADR 0023: a session start applies from any
+    source, bound or not, because a new session means the old stream is over.
+    A log that ends without its disconnect (a recorder that crashed) leaves the
+    book bound to it; the next log's session start still empties and unbinds
+    it, so the crashed log's book never shows as fresh into the new session, and
+    the C++ book matches the reference after every step."""
+    table, meta = two_logs()
+    book, outcomes = assert_same_steps("coinbase", table, TWO_LOGS_STARTS, meta)
+    assert [(o.log_id == OTHER_LOG, o.step, o.effects[-1]) for o in outcomes] == [
+        (False, "reset", EFFECT.Reset), (False, "message", EFFECT.Applied),
+        (False, "message", EFFECT.Applied),
+        (True, "reset", EFFECT.Reset),  # the next session's start: applied, not ignored
+        (True, "message", EFFECT.Applied), (True, "message", EFFECT.Applied)]  # fmt: skip
+    assert (book.bound_source, book.other_source_controls, book.other_source_updates) == (1, 0, 0)
+
+    # Step by step: the session start leaves no book and no binding.
+    book = new_book("coinbase", meta)
+    for group in convert(table, TWO_LOGS_STARTS, meta, instrument=INSTRUMENT_ID):
+        apply_group(book, group)
+        if group.log_id == OTHER_LOG and group.step == "reset":
+            assert (book.has_book, book.is_stale, book.bound_source) == (False, False, None)
+            assert sides(book) == ([], [])
+            break
+    else:
+        raise AssertionError("the second log's session start was not converted")
 
 
 def check_snapshot_differences(venue, table, events, meta):

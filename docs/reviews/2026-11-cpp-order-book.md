@@ -38,6 +38,26 @@ Reviewer: a session that did not write the code. Nothing was fixed.
   everything else worth fixing.
 - Line numbers refer to commit `1804679`.
 
+**Update, 2026-11-17 (Phase 4b's review fixes, ADR 0023).** The owner decided
+all six findings, and they are fixed; the eight tests are unmarked and pass,
+as the findings' regression tests. An update cannot be read until its last
+level, as a snapshot cannot, and consumers act only on results that say a
+message took effect (finding 1). The book is bound to the source of the
+snapshot it is built from; an update of another source is ignored and
+counted, and so, after the owner's reviews of ADR 0023, is another source's
+stale event, connect or disconnect, while a session start of any source
+applies; Phase 7 replays one stream per book (finding 2).
+`BM_ReplayCoinbaseFixture` replays the committed Coinbase fixture's converted
+events and reports p50, p99, the maximum and the mean per update; the Kraken
+benchmark's comment is fixed (finding 3). Every `StreamReason` is mapped at
+build time (finding 4). The Kraken adapter refuses a record listing the
+instrument twice, and the converter emits two versions at one record in the
+reference book's order (finding 5). A tick or lot size below 1 is refused
+(finding 6). N1 is in Phase 5's criteria, N2 and N4 in Phase 7's, N3 in Phase
+9's. ADR 0022's Review items are confirmed, item 11 amended. T1's check is
+made by a new test on both fixtures; T2, T3 and the two nits are open. The
+findings below are left as they were written.
+
 ```powershell
 .venv\Scripts\python -m pytest python\tests\data\test_review_2026_11_order_book.py -rxX
 # each failure itself:

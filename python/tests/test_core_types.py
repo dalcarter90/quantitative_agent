@@ -541,6 +541,17 @@ def test_from_bytes_refuses_an_instrument_update_whose_scales_do_not_fit(scales)
         event.instrument_meta()
 
 
+@pytest.mark.parametrize(("tick", "lot"), [(0, 1), (-1, 1), (1, 0), (1, -5), (-(2**63), 1)])
+def test_from_bytes_refuses_an_instrument_update_whose_tick_or_lot_is_below_one(tick, lot):
+    """As the store's schema does (ADR 0023): a tick of 0 would divide by zero
+    when a price is rounded to it, and a negative one would invert a collar."""
+    event = instrument_update(price=_core.Price(tick), qty=_core.Qty(lot))
+    with pytest.raises(ValueError, match="tick size .* lot size .* at least 1"):
+        _core.MarketEvent.from_bytes(event.to_bytes())
+    ones = instrument_update(price=_core.Price(1), qty=_core.Qty(1))
+    assert _core.MarketEvent.from_bytes(ones.to_bytes()).instrument_meta().tick_size.value == 1
+
+
 @pytest.mark.parametrize(
     "fields",
     [{"side": _core.Side.Buy}, {"venue_seq": 1}, {"trade_id": 1}, {"checksum": 1}, {"depth": 25},

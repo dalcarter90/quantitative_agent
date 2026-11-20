@@ -40,7 +40,7 @@ before making it.
 | 3g | Fixed exponents, per-severity limits, the data core spec (ADR 0019) | Done |
 | 3h | Stream control events, a resuming reference book, the snapshot queue policy (ADR 0020) | Done |
 | 4a | The MarketEvent converter, D7, T3 (ADR 0021) | Done |
-| 4b | C++ order book, verified (ADR 0022) | Done |
+| 4b | C++ order book, verified (ADR 0022; review fixes, ADR 0023) | Done |
 | 5 | SPSC queue and threading primitives | Not started |
 | 6 | C++ feed handlers (offline) | Not started |
 | 7 | Deterministic replay engine | Not started |
@@ -2047,6 +2047,196 @@ The phase's criteria:
   CRC byte by byte). The Kraken fixture has about 90 book messages a second
   (13,782 in 150 s), so it is not worth optimizing yet.
 
+#### Phase 4b: the review's fixes (done, ADR 0023)
+
+The adversarial review (`docs/reviews/2026-11-cpp-order-book.md`, PR #24)
+found six things; the owner decided each on 2026-11-17 (ADR 0023):
+
+- [x] An update cannot be read until its last level, as a snapshot cannot be
+      until its end; consumers act only on results that say a message took
+      effect (`Applied`, `Recovered`). (Finding 1.)
+- [x] The book is bound to the source of the stream snapshot it is built
+      from; a snapshot of another source rebinds it; an update of another
+      source is ignored and counted and does not make the book stale.
+      Phase 7's criteria gain one stream per instrument book. (Finding 2.)
+- [x] A benchmark driven by the committed Coinbase fixture's converted events,
+      reporting p50 and p99 as well as the mean; the Kraken checksum
+      benchmark's comment fixed; no optimization. (Finding 3.)
+- [x] A compile-time check that every `StreamReason` maps to a named stale
+      reason: a new reason fails the build until it is mapped. (Finding 4.)
+- [x] The Kraken adapter rejects a record carrying two metadata versions of
+      the instrument (`MESSAGE_REJECTED`, reason `two_metadata_versions`).
+      (Finding 5.)
+- [x] A tick or lot size below 1 is refused by the constructor, `from_bytes`
+      and an `InstrumentUpdate`. (Finding 6.)
+- [x] The notes in later phases' criteria: N1 in Phase 5, N2 and N4 in
+      Phase 7, N3 in Phase 9.
+- [x] The review's eight tests pass with their markers removed; ADR 0022's
+      Review items confirmed, item 11 amended by the first fix.
+- [x] *(The owner's review of ADR 0023, below.)* While the book is bound, a
+      `StreamStale` or `StreamReset` of another source is ignored and counted
+      too.
+
+**What was built:**
+
+- `qa::OrderBook`: `has_book()` false from an update's first level until it
+  takes effect; `checksum()` 0 when the book cannot be read;
+  `bound_source()`, `other_source_updates()`; `qa::stale_reason_of` and
+  `detail::every_stale_reason_is_mapped` (`qa/order_book.hpp`), the counters
+  an exhaustive switch; `qa::meta_fits` (`qa/types.hpp`). Bindings:
+  `OrderBook.bound_source`, `OrderBook.other_source_updates`; `from_bytes`
+  refuses an `InstrumentUpdate` with a tick or lot below 1.
+- `BM_ReplayCoinbaseFixture` (`cpp/bench/bench_order_book.cpp`) and
+  `cpp/bench/export_events.py`, which writes its stream to
+  `data/bench/coinbase-BTC-USD.events`.
+- The Kraken adapter's `two_metadata_versions`; the converter emits a
+  record's versions in the reference book's order.
+- Tests: 10 C++ tests and new `static_assert`s in `test_order_book.cpp`;
+  Python: the review's 8 unmarked, `test_bench_events.py`, and new tests in
+  `test_order_book.py`, `test_core_types.py`, `test_marketevents.py`,
+  `test_instruments.py` and `test_adapters.py`.
+- ADR 0023; ADR 0021's and 0022's statuses; architecture sections 3.1, 4.1
+  and 6.3; data core spec section 7 and appendix A; Phases 5, 7 and 9's
+  criteria; the review's update note; CLAUDE.md's benchmark command.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 87 C++ tests and 1,858 Python tests (77
+  and 1,834 plus the review's 8 `XFAIL` before: 10 new C++ tests, 16 new
+  Python tests, the 8 unmarked). The Python suite took 9 min 40 s. The first
+  run listed one unmarked test over 5 s, the benchmark stream's replay test
+  (5.1 s); it is now marked `slow`, and a second run printed ALL GREEN with
+  the same counts and listed no unmarked test over 5 s.
+- **The review's tests:** all eight pass unmarked.
+- **The fixtures:** on both, after every event that leaves a message in
+  progress the book shows nothing (inside an update or a stream snapshot) or
+  the book as it was (a frame's begin, a check snapshot); every message that
+  takes effect has the book bound to the log's stream source; no update is
+  ignored. The golden-file, every-depth, check-snapshot and integrity tests
+  pass unchanged.
+- **No recorded Kraken message lists BTC/USD twice** (the fixture: one
+  instrument message; the one-hour recording: seven, two of them listing it,
+  once each), so the adapter's new refusal changes no stored data.
+- **Benchmark baseline** (the same machine as Phase 4b's, Release, three
+  repetitions; `BM_ReplayCoinbaseFixture` over the committed fixture's
+  110,986 events, 2,701 updates of 12.6 levels on average): per update, mean
+  2.55 µs, p50 1.63 µs, p99 11.4 µs, maximum 75 µs (median of three; it
+  varies from run to run); the snapshot 1.70 ms. The synthetic benchmarks in
+  the same run: 801 ns Kraken-like, 354 ns Coinbase-sized, 139 ns near the top
+  only, 4.1 ns best bid and ask, 21 ns top 20, 712 ns Kraken's checksum,
+  1.70 ms a snapshot (all lower than Phase 4b's run; nothing in this change
+  makes them faster, so the difference is the machine's state).
+- **Breakage pass:** 24 deliberate breakages, each rebuilt and run: 3 of the
+  hidden update and the checksum query, 7 of the binding (never, always,
+  unbound, counting, a reset keeping it, a snapshot not rebinding, an ignored
+  update interrupting), 5 of the reason mapping and counters (a reason mapped
+  to another number, a stale reason listed as none, `StreamReason` gaining an
+  unmapped reason, `StaleReason` gaining one with no counter, two reasons
+  sharing a counter), 5 of the tick and lot rule (`meta_fits` twice, the
+  update, the constructor, `from_bytes`), 2 of the adapter and 2 of the
+  converter's order. All 24 caught: 14 by the C++ tests, 5 by the build (C4062
+  in the two exhaustive switches, the `static_assert`s), 5 by pytest. One
+  breakage first failed to compile for an unrelated reason (an unused
+  parameter); it was rewritten and then caught by a test. Every mutated file
+  was compared with a copy taken before the pass: identical.
+- **Not verified:** the `local_data` and `network` tests were not run; the
+  Debug configuration was not built; Linux is still unbuilt, so the
+  `-Wswitch` half of the compile-time check is untested.
+
+**Notes for the next phases:**
+
+- **The review's T2, T3 and two nits stay open:** the random streams still
+  have one log and one source; `test_an_instrument_update_is_taken_while_the_book_is_stale`'s
+  docstring still overstates it; `capacity_for_depth` takes 32 bits; a
+  moved-from book is unusable.
+- **Phase 5:** `QueueOverflow` needs a case in `stale_reason_of`, a
+  `StaleReason` of its number, a counter and a binding name; the build and
+  `test_every_reason_a_stream_stale_may_carry_is_a_named_and_counted_stale_reason`
+  say so.
+
+#### Phase 4b: the owner's review of ADR 0023 (done)
+
+The owner confirmed ADR 0023's Review on 2026-11-17 with one change: while
+the book is bound, a `StreamStale` or `StreamReset` of another source is
+ignored and counted, as an update is; only a snapshot of another source
+rebinds the book; an unbound book takes every event as before; an
+`InstrumentUpdate` applies from any source. So in a make-before-break
+reconnect, the old connection's disconnect cannot empty the new stream's book.
+
+- [x] The rule, `OrderBook::other_source_controls()` (Python:
+      `other_source_controls`), and a test of the owner's sequence (C++ and
+      through the binding): old connection, its snapshot, the new
+      connection's connect (ignored), its snapshot (rebinds), the old
+      connection's late update, gap and disconnect (all ignored), the new
+      stream's next update (applied). Also tested: another source's stale or
+      reset interrupts no message; an unbound book takes them; an
+      `InstrumentUpdate` of another source applies.
+- [x] Recorded in ADR 0023 ("Owner's review"), its Review items confirmed;
+      its three choices for the change confirmed in the second review, below.
+
+**A consequence** *(removed by the owner's second review, below)*: a log that
+ends without its disconnect leaves the book
+bound, so the next log's session start is ignored and the C++ book shows the
+old log's book until the new log's snapshot, where the reference is empty
+from the session start. A new test pins it, and
+`test_two_logs_replayed_one_after_the_other_bind_the_book_to_each_in_turn`
+now gives its first log the closing disconnect recorded logs have. The
+fixtures, golden files and integrity cases are each one log; nothing compared
+over them changed.
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 91 C++ tests and 1,860 Python tests (87
+  and 1,858 before: 4 new C++ tests, 2 new Python tests). The Python suite
+  took 12 min 43 s against 9 min 40 s in both runs before it, so the machine
+  was slower, and the slow-test reminder listed eight existing tests none of
+  this work touches (Coinbase fixture and store tests in
+  `test_check_snapshots.py`, `test_book_resume.py`, `test_quality.py` and
+  `test_review_2026_11.py`) at 5.2 to 7.0 s. Run alone right after, they took
+  4.0 to 5.3 s. As borderline slow tests they stay unmarked (ADR 0022,
+  decision 4); neither earlier run today listed them.
+- **Breakage pass on the change:** 8 deliberate breakages (another source's
+  stale applied, its reset applied, its `InstrumentUpdate` ignored, its
+  snapshot's begin ignored, judging while unbound, the counter not counting,
+  counting into `other_source_updates`, an ignored event interrupting a
+  message): all 8 caught by the C++ tests. The mutated file was compared with
+  a copy taken before the pass: identical.
+
+#### Phase 4b: the owner's second review of ADR 0023 (done)
+
+The owner confirmed the first review's three choices on 2026-11-19 with one
+change: a `StreamReset` whose reason is `SessionStart` always applies, from any
+source, bound or not, because a new session means the old stream is over and a
+crashed log's book showing as fresh is a stale-data hazard. `Connect` and
+`Disconnect` of another source stay ignored while bound.
+
+- [x] A session start of any source empties and unbinds the book.
+- [x] The test that pinned the crashed-recorder consequence is replaced by
+      one showing the next log's session start empties and unbinds the book,
+      matching the reference after every step; a C++ test shows the same, and
+      another source's `Connect` and `Disconnect` still ignored.
+- [x] The make-before-break tests (C++ and through the binding) pass
+      unchanged.
+- [x] Recorded in ADR 0023 ("Owner's second review").
+
+**Verified:**
+
+- `scripts/check.ps1`: ALL GREEN, 92 C++ tests and 1,860 Python tests (91
+  and 1,860 before: 1 new C++ test; one Python test replaced by another).
+  The Python suite took 12 min 25 s, and the slow-test reminder listed 16
+  existing tests none of this work touches (Coinbase fixture, golden-file and
+  store tests in `test_book.py`, `test_check_snapshots.py`,
+  `test_book_resume.py`, `test_fixtures.py` and `test_review_2026_11.py`) at
+  5.0 to 5.7 s. Run alone right after, they took 4.5 to 5.5 s. They stay
+  unmarked as borderline (ADR 0022, decision 4), but the list has grown from
+  eight to sixteen as the machine has slowed: for the owner.
+- **Breakage pass on the change:** 4 deliberate breakages (a session start of
+  another source ignored again; every reset of another source applied; a
+  disconnect, or a connect, exempt instead of a session start): all 4 caught
+  by the C++ tests. The replacement Python test was also run alone under the
+  first of them and fails at the second log's session start. The mutated file
+  was compared with a copy taken before the pass: identical.
+
 ### Phase 5: SPSC queue and threading primitives
 
 - [ ] SPSC ring buffer per ADR 0004; single-thread unit tests for wrap,
@@ -2069,6 +2259,12 @@ The phase's criteria:
       `QueueOverflow`, with the Python mirror and its test.
 - [ ] *(Added in Phase 3h.)* The benchmark includes pushing and draining one
       framed Coinbase-sized snapshot.
+- [ ] *(Added in Phase 4b's review, ADR 0023, N1.)* The latency benchmark
+      includes a resync: a Coinbase-sized snapshot (38,543 `MarketEvent`s,
+      3.4 MB, about 1.7 ms of core time on the book) among single events,
+      and reports how long events on the other queues wait behind it. The
+      queue for it holds at least 77,086 slots (2^17 with the capacity
+      helper, 11.5 MB).
 
 ### Phase 6: C++ feed handlers (offline)
 
@@ -2127,6 +2323,26 @@ Parsing and sequencing only, driven by recorded bytes. No sockets yet.
       item 7.)* `quantagent.marketevents.convert` handles trades (`Trade`
       events on the stream source) before the replay engine needs them: it
       is done before the engine's trade events are built or compared.
+- [ ] *(Added in Phase 4b's review, ADR 0023, decision 2.)* The replay engine
+      replays one stream per instrument book. Logs of one instrument that
+      overlap in time (a recorder restarted before the old one stopped, two
+      recorders at once) are never merged into one book: each stream gets its
+      own book, or the overlap is refused. A test with two overlapping logs
+      shows it. (While bound, the book ignores and counts another stream's
+      updates, stale events and connects and disconnects, but takes its
+      session start, which ends the old stream, and its metadata, and its
+      snapshot rebinds the book; ADR 0023 and the owner's reviews of it.)
+- [ ] *(Added in Phase 4b's review, ADR 0023, N2.)* An event that interrupts a
+      message loses its own effect from the book's result: a `StreamReset`,
+      an `InstrumentUpdate` or a frame's begin arriving inside a message is
+      reported as `WentStale` (`IncompleteMessage`) only. Before the journal
+      of input events is built, either the result gains a second effect or
+      the journal records every input event independently of the result,
+      with a test of an interrupting reset.
+- [ ] *(Added in Phase 4b's review, ADR 0023, N4.)* A book's replay starts at
+      its log's beginning: the book cannot be copied or checkpointed, and each
+      recording has one stream snapshot, at its subscribe. The engine replays
+      a book from its log's first record, or refuses a start inside a log.
 
 ### Phase 7a: Recorder fidelity
 
@@ -2185,6 +2401,12 @@ and the quality checks, and needs an ADR and a spec edit.
 - [ ] Kill switch, once tripped, cannot be cleared from code paths reachable
       by bindings.
 - [ ] Per-order check cost benchmarked.
+- [ ] *(Added in Phase 4b's review, ADR 0023, N3.)* The stale-book check
+      reads the receipt time (and monotonic stamp) of the last message that
+      took effect on the book, which the book records, as `is_stale()` is the
+      book's (the review's preference; the core tracking it from `BookResult`
+      is the alternative). A test shows a book that is fresh but has had no
+      message for longer than the limit is refused.
 
 ### Phase 10: Order state machine and paper gateway
 

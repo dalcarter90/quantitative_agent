@@ -1,6 +1,6 @@
 # 0021: The converter from stored data to MarketEvents
 
-Status: Accepted; implementation choices confirmed by the owner (2026-11-17, see "Review"); amended by 0022 (the converter also emits instrument updates)
+Status: Accepted; implementation choices confirmed by the owner (2026-11-17, see "Review"); amended by 0022 (the converter also emits instrument updates) and 0023 (two versions at one record in the reference book's order)
 Date: 2026-11-17
 Amends: none (builds ADR 0020's converter rules; closes review D7 and T3)
 

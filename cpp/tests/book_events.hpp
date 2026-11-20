@@ -115,12 +115,14 @@ struct L {
 // An update's levels, the last flagged.
 [[nodiscard]] inline std::vector<MarketEvent> update(std::uint64_t seq,
                                                      const std::vector<L>& levels,
-                                                     const Header& header = {}) {
+                                                     const Header& header = {},
+                                                     std::uint32_t source = kStreamSource) {
   const auto count = static_cast<std::uint32_t>(levels.size());
   std::vector<MarketEvent> events;
   events.reserve(levels.size());
   for (std::uint32_t i = 0; i < count; ++i) {
-    events.push_back(level(EventKind::BookDelta, seq, i, levels[i], i + 1 == count, header));
+    events.push_back(
+        level(EventKind::BookDelta, seq, i, levels[i], i + 1 == count, header, source));
   }
   return events;
 }

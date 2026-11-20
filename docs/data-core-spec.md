@@ -321,7 +321,8 @@ partial record); with `--store DIR` it loads it.
   `unknown_channel`, `unknown_venue`, `venue_error`, `unexpected_symbol`,
   `no_log_start` (a record before any `seq` 0), `no_session_start`,
   `no_instrument_metadata` (market data before metadata), `no_fixed_exponent`,
-  `precision_exceeds_exponent`, `schema_refused`.
+  `precision_exceeds_exponent`, `two_metadata_versions` (a record carrying the
+  instrument's metadata twice, ADR 0023), `schema_refused`.
 - **One log at a time, in `seq` order.** A record does not say which log it is
   from; the normalizer takes the `log_id` from each `seq` 0 record. A record
   whose `seq` is neither 0 nor the previous plus one raises `InterleavedLogs`
@@ -331,7 +332,10 @@ partial record); with `--store DIR` it loads it.
   to one normalizer.
 - **Metadata** rows are built by `VenueAdapter.metadata` at the fixed
   exponents (section 2), and refused as `no_fixed_exponent` or
-  `precision_exceeds_exponent`.
+  `precision_exceeds_exponent`. A record carries at most one version of the
+  instrument: one carrying two is refused whole (`two_metadata_versions`, ADR
+  0023), identical or not, since nothing would say which is in force, and the
+  version before it stays in force.
 - **Clock steps:** a change in `recv_ts - recv_mono_ns` above 25 ms between
   consecutive records of a log is a `CLOCK_STEP` event.
 - **Trades seen again**, within one normalizer: each trade is compared with
@@ -368,7 +372,9 @@ partial record); with `--store DIR` it loads it.
   twice changes nothing.
 - **Trades:** `side` is the taker's. `trade_id` is an integer, stored as text.
 - **Metadata:** the `instrument` channel lists every pair; only the recorded
-  one is stored. `price_precision` and `qty_precision` are Kraken's;
+  one is stored, and a message listing it more than once is refused
+  (`two_metadata_versions`; no recorded message does). `price_precision` and
+  `qty_precision` are Kraken's;
   `price_increment` and `qty_increment` are the tick and lot sizes. A pair's
   precision can change mid-session (an `update`); prices keep their mantissas
   and the checksum follows the new digits.
@@ -770,6 +776,9 @@ refused).
 | 0018 | Loads; one observation per trade shown; refused input; interleaved logs | 5, 7, 8, 9, 10 | Superseded |
 | 0019 | Fixed exponents; metadata from a session's first row; limits per severity; every day a session spans; conflicts between logs; incomplete loads reported; this document | 2, 4, 7, 9, 10 | Restated here; implementation choices confirmed |
 | 0020 | The stream events a book acts on; the reference book's resume mode, steps and golden points (and, outside the data core, `MarketEvent`'s control kinds and the queue policy) | 6, 11, 12 | Restated here; implementation choices confirmed |
+| 0023 | A record with two metadata versions of the instrument is refused (and, outside the data core, the C++ book's review fixes) | 7 | Restated here; implementation choices awaiting the owner's review |
 
-ADRs 0001 to 0004 and 0007 are not about the data core. ADR 0020 is in part:
-its `MarketEvent` and queue decisions are in architecture sections 5 and 6.3.
+ADRs 0001 to 0004 and 0007 are not about the data core. ADRs 0020 and 0023
+are in part: 0020's `MarketEvent` and queue decisions are in architecture
+sections 5 and 6.3, and so are 0023's decisions about the C++ book, its
+benchmark and the converter.

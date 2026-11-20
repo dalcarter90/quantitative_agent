@@ -198,7 +198,14 @@ void require_well_formed(const qa::MarketEvent& event) {
         "a control event carries no price, quantity, side, trade id, checksum or depth");
   }
   if (event.kind == qa::EventKind::InstrumentUpdate) {  // ADR 0022
-    require_scales(qa::instrument_meta(event), "an instrument update's");
+    const qa::InstrumentMeta meta = qa::instrument_meta(event);
+    require_scales(meta, "an instrument update's");
+    if (meta.tick_size.mantissa() < 1 || meta.lot_size.mantissa() < 1) {  // ADR 0023
+      throw py::value_error("an instrument update's tick size " +
+                            std::to_string(meta.tick_size.mantissa()) + " and lot size " +
+                            std::to_string(meta.lot_size.mantissa()) +
+                            " must each be at least 1, as the store's schema requires");
+    }
     if (event.side != qa::Side::Unknown || event.venue_seq != 0 || event.trade_id != 0 ||
         event.checksum != 0 || event.depth != 0 ||
         (event.flags & ~qa::MarketEvent::kInstrumentUpdateFlags) != 0) {
@@ -582,6 +589,22 @@ PYBIND11_MODULE(_core, m) {
                              [](const OrderBook& self) { return self.instrument(); })
       .def_property_readonly("check", &OrderBook::check)
       .def_property_readonly("capacity", &OrderBook::capacity)
+      .def_property_readonly(
+          "bound_source",
+          [](const OrderBook& self) -> py::object {
+            const std::optional<std::uint32_t> source = self.bound_source();
+            if (!source) {
+              return py::none();
+            }
+            return py::int_(*source);
+          },
+          "The source the book is bound to (ADR 0023), or None.")
+      .def_property_readonly("other_source_updates", &OrderBook::other_source_updates,
+                             "How many updates of another source were ignored (ADR 0023).")
+      .def_property_readonly(
+          "other_source_controls", &OrderBook::other_source_controls,
+          "How many StreamStale, Connect and Disconnect events of another source were ignored "
+          "(ADR 0023).")
       .def("stale_count", &OrderBook::stale_count, py::arg("reason"))
       .def(
           "top",

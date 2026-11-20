@@ -20,7 +20,25 @@
 //   complete stream snapshot that passes its check recovers it. A StreamReset
 //   empties the book and neither causes nor ends staleness.
 // - An InstrumentUpdate replaces the metadata in force, stale or not, if its
-//   exponents are the book's.
+//   exponents are the book's and its tick and lot sizes at least 1.
+// - Nothing can be read while the book is being changed (ADR 0023): from an
+//   update's first level, as from a stream snapshot's, the queries show nothing
+//   until the message takes effect. (A check snapshot's frame changes nothing,
+//   and leaves the book readable.) A consumer of the book (a feature, pre-trade
+//   risk, a published snapshot) acts on it only after an event whose result is
+//   Applied, or Recovered, the same for a snapshot that also ended a stale
+//   period.
+// - The book is bound to one stream (ADR 0023): the source of the stream
+//   snapshot it is built from, from that snapshot's first level until a reset
+//   or a failure empties it. Only a snapshot of another source rebinds it. An
+//   update, a StreamStale or a Connect or Disconnect StreamReset of any other
+//   source is ignored and counted (other_source_updates,
+//   other_source_controls): it does not interrupt a message, make the book
+//   stale or empty it. So in a reconnect that opens the new connection before
+//   closing the old, the old one's disconnect cannot empty the new stream's
+//   book. A SessionStart reset applies from any source, bound or not: a new
+//   session means the old stream is over. An InstrumentUpdate applies from any
+//   source, and an unbound book takes every event as it comes.
 //
 // apply() never allocates, throws, locks or reads a clock: every level is held
 // in storage allocated when the book is built. The constructor throws on a
@@ -61,16 +79,82 @@ enum class StaleReason : std::uint8_t {
   InvalidEvent = 67,         // an event the book cannot act on
 };
 
-// What one event did.
+// The book's reason for a StreamStale's reason (ADR 0023): the StaleReason of
+// the same name and number, or NotStale for a reason no StreamStale carries.
+// Every StreamReason has a case and there is no default, and a reason the
+// switch does not handle is a build error (MSVC's C4062, made an error here;
+// -Wswitch elsewhere). So a reason StreamReason gains fails the build here
+// until it is mapped; the static_assert below holds the mapping to reason_fits.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)  // an enumerator of the switched enum has no case
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#endif
+[[nodiscard]] constexpr StaleReason stale_reason_of(StreamReason reason) noexcept {
+  switch (reason) {
+    case StreamReason::SequenceGap:
+      return StaleReason::SequenceGap;
+    case StreamReason::SequenceRepeat:
+      return StaleReason::SequenceRepeat;
+    case StreamReason::SequenceOutOfOrder:
+      return StaleReason::SequenceOutOfOrder;
+    case StreamReason::ChecksumMismatch:
+      return StaleReason::ChecksumMismatch;
+    case StreamReason::MessageRejected:
+      return StaleReason::MessageRejected;
+    case StreamReason::NoReason:
+    case StreamReason::SessionStart:
+    case StreamReason::Connect:
+    case StreamReason::Disconnect:
+      return StaleReason::NotStale;  // no StreamStale carries it
+  }
+  return StaleReason::NotStale;  // a byte that is no StreamReason
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+namespace detail {
+
+// Every reason a StreamStale may carry (reason_fits) has a StaleReason, of the
+// same number (ADR 0022), and no other reason has one.
+[[nodiscard]] constexpr bool every_stale_reason_is_mapped() noexcept {
+  for (unsigned value = 0; value <= 0xFFu; ++value) {
+    const auto reason = static_cast<StreamReason>(value);
+    const StaleReason mapped = stale_reason_of(reason);
+    if (reason_fits(EventKind::StreamStale, reason) != (mapped != StaleReason::NotStale)) {
+      return false;
+    }
+    if (mapped != StaleReason::NotStale && static_cast<unsigned>(mapped) != value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace detail
+
+static_assert(detail::every_stale_reason_is_mapped(),
+              "a reason a StreamStale may carry has no StaleReason of its own number "
+              "(stale_reason_of), or one it may not carry has one");
+
+// What one event did. Only Applied and Recovered say a message took effect:
+// they are the results a consumer acts on (ADR 0023).
 enum class BookEffect : std::uint8_t {
-  Pending = 0,     // part of a message that has not taken effect yet
+  Pending = 0,     // part of a message that has not taken effect yet: nothing can be read
   Applied = 1,     // a message took effect and the book is fresh
   Recovered = 2,   // a snapshot took effect and ended a stale period
   Skipped = 3,     // not applied: an update while stale, or the rest of a failed message
   WentStale = 4,   // the event made the book stale, or found a new failure while it was
   Reset = 5,       // a StreamReset emptied the book
   Instrument = 6,  // an InstrumentUpdate replaced the metadata in force
-  Ignored = 7,     // nothing for this book: a check snapshot, a trade, another instrument
+  Ignored = 7,     // nothing for this book: a check snapshot, a trade, another instrument,
+                   // an update, stale, connect or disconnect of a stream the book is
+                   // not bound to
 };
 
 struct BookResult {
@@ -94,7 +178,8 @@ class OrderBook {
   }
 
   // Throws std::invalid_argument for a capacity outside 1 to kMaxCapacity, a
-  // check that is not a BookCheck, or scales that do not fit (scales_fit).
+  // check that is not a BookCheck, or metadata the store could not hold
+  // (meta_fits: scales that do not fit, a tick or lot size below 1).
   OrderBook(const InstrumentMeta& instrument, BookCheck check,
             std::uint32_t capacity_per_side = kDefaultCapacity);
 
@@ -108,13 +193,27 @@ class OrderBook {
 
   // Stale: the book cannot be trusted until a snapshot recovers it.
   [[nodiscard]] bool is_stale() const noexcept { return stale_; }
-  // A snapshot has taken effect since the start, the last reset and the last
-  // failure: the book can be read. The queries below show nothing otherwise.
+  // The book can be read: a snapshot has taken effect since the start, the
+  // last reset and the last failure, and no update or stream snapshot is being
+  // applied (ADR 0023). The queries below show nothing otherwise.
   [[nodiscard]] bool has_book() const noexcept { return has_book_; }
   // What began the current stale period; NotStale when the book is not stale.
   [[nodiscard]] StaleReason stale_reason() const noexcept { return stale_reason_; }
   // How many failures of `reason` since the book was built.
   [[nodiscard]] std::uint64_t stale_count(StaleReason reason) const noexcept;
+  // The source the book is bound to, if any: that of the stream snapshot it is
+  // built from, from the snapshot's first level until a reset or a failure.
+  [[nodiscard]] std::optional<std::uint32_t> bound_source() const noexcept;
+  // How many updates of another source than the bound one were ignored since
+  // the book was built, counted at their first level.
+  [[nodiscard]] std::uint64_t other_source_updates() const noexcept {
+    return other_source_updates_;
+  }
+  // How many StreamStale and StreamReset events (Connect, Disconnect) of
+  // another source than the bound one were ignored since the book was built.
+  [[nodiscard]] std::uint64_t other_source_controls() const noexcept {
+    return other_source_controls_;
+  }
 
   // The best levels of one side, best first, into `out`; returns how many.
   [[nodiscard]] std::uint32_t top(Side side, std::span<BookLevel> out) const noexcept;
@@ -122,7 +221,8 @@ class OrderBook {
   [[nodiscard]] std::optional<BookLevel> best_ask() const noexcept;
   [[nodiscard]] std::uint32_t size(Side side) const noexcept;
   [[nodiscard]] std::optional<Qty> quantity_at(Side side, Price price) const noexcept;
-  // Kraken's checksum of the book as it is, at the precisions in force.
+  // Kraken's checksum of the book, at the precisions in force; when the book
+  // cannot be read, that of an empty book (0), like every query.
   [[nodiscard]] std::uint32_t checksum() const noexcept;
 
   [[nodiscard]] const InstrumentMeta& instrument() const noexcept { return meta_; }
@@ -142,6 +242,7 @@ class OrderBook {
 
   static constexpr std::size_t kReasonSlots = 9;
 
+  [[nodiscard]] bool of_another_stream(const MarketEvent& event) const noexcept;
   [[nodiscard]] BookResult begin(const MarketEvent& event) noexcept;
   [[nodiscard]] BookResult begin_update(const MarketEvent& event) noexcept;
   [[nodiscard]] bool continues(const MarketEvent& event) const noexcept;
@@ -155,6 +256,7 @@ class OrderBook {
   [[nodiscard]] StaleReason apply_level(const MarketEvent& event) noexcept;
   [[nodiscard]] BookResult finish(bool snapshot) noexcept;
   [[nodiscard]] StaleReason verify() noexcept;
+  [[nodiscard]] std::uint32_t book_checksum() const noexcept;
   BookResult fail(StaleReason reason) noexcept;
   void clear_book() noexcept;
   void take_header(const MarketEvent& event) noexcept;
@@ -175,6 +277,12 @@ class OrderBook {
   std::array<std::uint64_t, kReasonSlots> counts_{};
   bool has_last_venue_seq_ = false;
   std::int64_t last_venue_seq_ = 0;
+
+  // The stream the book is built from (ADR 0023).
+  bool bound_ = false;
+  std::uint32_t bound_source_ = 0;
+  std::uint64_t other_source_updates_ = 0;
+  std::uint64_t other_source_controls_ = 0;
 
   // The message in progress, and the header of its last level.
   Progress progress_ = Progress::Idle;

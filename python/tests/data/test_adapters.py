@@ -575,6 +575,12 @@ KRAKEN_BAD = {
         b'{"channel":"instrument","type":"snapshot","data":{"pairs":[{"symbol":"BTC/USD",'
         b'"price_precision":40,"qty_precision":8,"price_increment":0.1,"qty_increment":0.1}]}}',
     ],
+    "two_metadata_versions": [  # ADR 0023: the recorded pair listed twice in one message
+        b'{"channel":"instrument","type":"update","data":{"pairs":[{"symbol":"BTC/USD",'
+        b'"price_precision":1,"qty_precision":8,"price_increment":0.1,"qty_increment":0.00000001},'
+        b'{"symbol":"BTC/USD","price_precision":2,"qty_precision":8,"price_increment":0.01,'
+        b'"qty_increment":0.00000001}]}}',
+    ],
     "unexpected_symbol": [
         b'{"channel":"book","type":"update","data":[{"symbol":"DOGE/USD","bids":[],'
         b'"asks":[{"price":1.0,"qty":1.0}],"checksum":1,"timestamp":"2026-11-11T03:06:47Z"}]}',

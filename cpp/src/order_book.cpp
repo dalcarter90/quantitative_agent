@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace qa {
 
@@ -49,29 +50,87 @@ char* write_digits(char* out, std::int64_t value) noexcept {
   return out;
 }
 
-constexpr std::size_t slot_of(StaleReason reason) noexcept {
-  const auto value = static_cast<std::size_t>(reason);
-  if (value >= 1 && value <= 5) {
-    return value - 1;
-  }
-  if (value >= 64 && value <= 67) {
-    return value - 64 + 5;
-  }
-  return std::size_t{9};  // NotStale and anything else: no slot
-}
+constexpr std::size_t kNoSlot = ~std::size_t{0};
 
-constexpr bool is_stale_reason(StreamReason reason) noexcept {
-  return reason_fits(EventKind::StreamStale, reason);
+// Each StaleReason's counter (ADR 0023). As in stale_reason_of, every reason
+// has a case and there is no default, so a reason StaleReason gains fails the
+// build here until it has a counter.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)  // an enumerator of the switched enum has no case
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#endif
+constexpr std::size_t slot_of(StaleReason reason) noexcept {
+  switch (reason) {
+    case StaleReason::SequenceGap:
+      return 0;
+    case StaleReason::SequenceRepeat:
+      return 1;
+    case StaleReason::SequenceOutOfOrder:
+      return 2;
+    case StaleReason::ChecksumMismatch:
+      return 3;
+    case StaleReason::MessageRejected:
+      return 4;
+    case StaleReason::DeltaBeforeSnapshot:
+      return 5;
+    case StaleReason::IncompleteMessage:
+      return 6;
+    case StaleReason::CapacityExceeded:
+      return 7;
+    case StaleReason::InvalidEvent:
+      return 8;
+    case StaleReason::NotStale:
+      return kNoSlot;
+  }
+  return kNoSlot;  // a byte that is no StaleReason
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+// The counters are 0 to slots - 1, one reason each, and every reason a
+// StreamStale may carry has one.
+constexpr bool every_reason_has_a_counter(std::size_t slots) noexcept {
+  std::size_t seen = 0;
+  for (unsigned value = 0; value <= 0xFFu; ++value) {
+    const std::size_t slot = slot_of(static_cast<StaleReason>(value));
+    if (slot == kNoSlot) {
+      continue;
+    }
+    if (slot >= slots) {
+      return false;
+    }
+    for (unsigned other = 0; other < value; ++other) {
+      if (slot_of(static_cast<StaleReason>(other)) == slot) {
+        return false;
+      }
+    }
+    ++seen;
+  }
+  for (unsigned value = 0; value <= 0xFFu; ++value) {
+    const StaleReason mapped = stale_reason_of(static_cast<StreamReason>(value));
+    if (mapped != StaleReason::NotStale && slot_of(mapped) == kNoSlot) {
+      return false;
+    }
+  }
+  return seen == slots;
 }
 
 const InstrumentMeta& checked(const InstrumentMeta& meta) {
-  if (!scales_fit(meta)) {
+  if (!meta_fits(meta)) {
     throw std::invalid_argument(
-        "an order book's instrument needs exponents 0 to 18 and precisions 0 to their "
-        "exponents, not price " +
+        "an order book's instrument needs exponents 0 to 18, precisions 0 to their "
+        "exponents, and a tick and lot size of at least 1, not price " +
         std::to_string(meta.price_exp) + "/" + std::to_string(meta.price_precision) +
         " and quantity " + std::to_string(meta.qty_exp) + "/" +
-        std::to_string(meta.qty_precision));
+        std::to_string(meta.qty_precision) + ", tick " +
+        std::to_string(meta.tick_size.mantissa()) + " and lot " +
+        std::to_string(meta.lot_size.mantissa()));
   }
   return meta;
 }
@@ -91,12 +150,36 @@ OrderBook::OrderBook(const InstrumentMeta& instrument, BookCheck check,
       check_(checked(check)),
       bids_(Side::Buy, capacity_per_side),
       asks_(Side::Sell, capacity_per_side) {
-  static_assert(slot_of(StaleReason::InvalidEvent) + 1 == kReasonSlots);
+  static_assert(every_reason_has_a_counter(kReasonSlots),
+                "every StaleReason needs a counter of its own (slot_of, kReasonSlots)");
   set_divisors();
+}
+
+// An update, stale or reset of another stream than the one the book is built
+// from (ADR 0023). A snapshot of another source rebinds the book and an
+// InstrumentUpdate applies from any source, so neither is one. Nor is a
+// session start: a new session means every stream before it is over, so its
+// reset applies from any source (the owner's second review of ADR 0023).
+bool OrderBook::of_another_stream(const MarketEvent& event) const noexcept {
+  const bool judged = event.kind == EventKind::BookDelta ||
+                      event.kind == EventKind::StreamStale ||
+                      (event.kind == EventKind::StreamReset &&
+                       event.reason != StreamReason::SessionStart);
+  return judged && bound_ && event.source != bound_source_;
 }
 
 BookResult OrderBook::apply(const MarketEvent& event) noexcept {
   if (event.instrument != meta_.id) {
+    return {BookEffect::Ignored, StaleReason::NotStale};
+  }
+  if (of_another_stream(event)) {
+    // Nothing of it is applied, and it interrupts nothing: an update counted
+    // once, at its first level; a stale or reset counted as it comes.
+    if (event.kind != EventKind::BookDelta) {
+      ++other_source_controls_;
+    } else if (event.level_index == 0) {
+      ++other_source_updates_;
+    }
     return {BookEffect::Ignored, StaleReason::NotStale};
   }
   if (progress_ == Progress::Idle) {
@@ -118,10 +201,10 @@ BookResult OrderBook::apply(const MarketEvent& event) noexcept {
 BookResult OrderBook::begin(const MarketEvent& event) noexcept {
   switch (event.kind) {
     case EventKind::StreamStale:
-      if (!is_stale_reason(event.reason)) {
+      if (!reason_fits(EventKind::StreamStale, event.reason)) {
         return fail(StaleReason::InvalidEvent);
       }
-      return fail(static_cast<StaleReason>(event.reason));
+      return fail(stale_reason_of(event.reason));
     case EventKind::StreamReset:
       if (!reason_fits(EventKind::StreamReset, event.reason)) {
         return fail(StaleReason::InvalidEvent);
@@ -166,14 +249,19 @@ BookResult OrderBook::begin_update(const MarketEvent& event) noexcept {
     return fail(StaleReason::DeltaBeforeSnapshot);
   }
   start_message(Progress::Update, event);
+  // As while a snapshot is built, nothing can be read until the update takes
+  // effect at its last level (ADR 0023): its levels apply to the live sides
+  // one by one, and in between the book is one no venue had.
+  has_book_ = false;
   return update_level(event);
 }
 
 BookResult OrderBook::take_instrument(const MarketEvent& event) noexcept {
   const InstrumentMeta next = instrument_meta(event);
   // Other exponents would give every mantissa in the book another meaning
-  // (ADR 0019); the metadata in force stays.
-  if (!scales_fit(next) || next.price_exp != meta_.price_exp || next.qty_exp != meta_.qty_exp) {
+  // (ADR 0019), and a tick or lot below 1 is no increment (ADR 0023); the
+  // metadata in force stays.
+  if (!meta_fits(next) || next.price_exp != meta_.price_exp || next.qty_exp != meta_.qty_exp) {
     return fail(StaleReason::InvalidEvent);
   }
   meta_ = next;
@@ -236,11 +324,14 @@ BookResult OrderBook::continue_message(const MarketEvent& event) noexcept {
         return check_level(event);
       }
       // A stream snapshot: the book is rebuilt from its levels, and cannot be
-      // read until the frame ends.
+      // read until the frame ends. From here it is bound to the snapshot's
+      // stream (ADR 0023).
       progress_ = Progress::StreamFrame;
       bids_.clear();
       asks_.clear();
       has_book_ = false;
+      bound_ = true;
+      bound_source_ = message_source_;
       return stream_level(event);
     case Progress::StreamFrame:
       return stream_level(event);
@@ -345,7 +436,8 @@ StaleReason OrderBook::verify() noexcept {
     if ((header_flags_ & MarketEvent::kHasChecksum) == 0) {
       return StaleReason::InvalidEvent;  // nothing to verify the book by
     }
-    return checksum() == header_checksum_ ? StaleReason::NotStale : StaleReason::ChecksumMismatch;
+    return book_checksum() == header_checksum_ ? StaleReason::NotStale
+                                               : StaleReason::ChecksumMismatch;
   }
   if ((header_flags_ & MarketEvent::kHasVenueSeq) == 0) {
     return StaleReason::InvalidEvent;
@@ -380,6 +472,7 @@ void OrderBook::clear_book() noexcept {
   asks_.clear();
   has_book_ = false;
   has_last_venue_seq_ = false;
+  bound_ = false;  // no snapshot built what the book holds now: nothing
 }
 
 // --- queries ---------------------------------------------------------------------------------
@@ -387,6 +480,13 @@ void OrderBook::clear_book() noexcept {
 std::uint64_t OrderBook::stale_count(StaleReason reason) const noexcept {
   const std::size_t slot = slot_of(reason);
   return slot < counts_.size() ? counts_[slot] : 0;
+}
+
+std::optional<std::uint32_t> OrderBook::bound_source() const noexcept {
+  if (!bound_) {
+    return std::nullopt;
+  }
+  return bound_source_;
 }
 
 const BookSide* OrderBook::side_of(Side side) const noexcept {
@@ -443,10 +543,16 @@ std::optional<Qty> OrderBook::quantity_at(Side side, Price price) const noexcept
   return level->qty;
 }
 
+std::uint32_t OrderBook::checksum() const noexcept {
+  return has_book_ ? book_checksum() : crc32(std::string_view{});  // an empty book's: 0
+}
+
 // Kraken's recipe (quantagent.data.book.kraken_checksum): the ten best asks,
 // best first, then the ten best bids, best first; each level as the digits of
-// its price then of its quantity, at the precision Kraken prints them.
-std::uint32_t OrderBook::checksum() const noexcept {
+// its price then of its quantity, at the precision Kraken prints them. Of the
+// sides as they are, readable or not: verify() runs it before the message
+// takes effect.
+std::uint32_t OrderBook::book_checksum() const noexcept {
   char text[2 * kChecksumLevels * 2 * 20];  // two sides, two numbers a level, 20 characters each
   char* out = text;
   for (const BookSide* side : {&asks_, &bids_}) {
